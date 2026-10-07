@@ -212,7 +212,7 @@ class Run:
 
     def register_secrets(self) -> None:
         REDACT.add(self.session_key, "session-api-key")
-        for name in ("secret_key", "previous_session_api_key"):
+        for name in ("secret_key", "previous_session_api_key", "previous_secret_key"):
             path = self.private / name
             if path.exists():
                 REDACT.add(path.read_text().strip(), name.replace("_", "-"))
@@ -763,6 +763,11 @@ def cmd_restart(args: argparse.Namespace) -> dict[str, Any]:
         (run.private / "previous_session_api_key").write_text(old)
         (run.private / "session_api_key").write_text(secrets.token_urlsafe(24))
         run.register_secrets()
+    if args.rotate_secret_key:
+        old_secret = (run.private / "secret_key").read_text()
+        (run.private / "previous_secret_key").write_text(old_secret)
+        (run.private / "secret_key").write_text(secrets.token_urlsafe(32))
+        run.register_secrets()
     if args.env:
         run.data.setdefault("extra_env", {}).update(parse_kv(args.env, "--env"))
     if args.config_json:
@@ -779,6 +784,7 @@ def cmd_restart(args: argparse.Namespace) -> dict[str, Any]:
         "url": run.url,
         "rotated_key": bool(args.rotate_key),
         "hard": bool(args.hard),
+        "rotated_secret_key": bool(args.rotate_secret_key),
         **readiness,
     }
 
@@ -2300,6 +2306,31 @@ def cmd_state_cat(args: argparse.Namespace) -> dict[str, Any]:
     return result
 
 
+def cmd_state_grep(args: argparse.Namespace) -> dict[str, Any]:
+    run = resolve_run(args.run, require_alive=False)
+    needle = os.environ.get(args.env_value, "") if args.env_value else args.text
+    if not needle:
+        usage_error("state grep needs TEXT or --env-value NAME (a non-empty variable)")
+    REDACT.add(needle, "searched-value")
+    hits = []
+    for path in sorted(run.dir.glob(args.glob)):
+        if (
+            path.is_file()
+            and not path.is_relative_to(run.private)
+            and not path.is_relative_to(run.evidence)
+        ):
+            with contextlib.suppress(OSError):
+                if needle.encode() in path.read_bytes():
+                    hits.append(str(path.relative_to(run.dir)))
+    ok = not hits if args.expect_none else bool(hits)
+    return {
+        "ok": ok,
+        "glob": args.glob,
+        "files_with_match": hits[:100],
+        "matches": len(hits),
+    }
+
+
 def cmd_config(args: argparse.Namespace) -> dict[str, Any]:
     run = resolve_run(args.run, require_alive=False)
     config_path = run.private / "config.json"
@@ -3538,7 +3569,7 @@ Driving:
   conversation  start | wait | send | events: the essential agent pathways
   fixture       git-repo | skill | mcp-server | http-sink | llm-stub | list: run-owned fixtures
   sink          read: what an HTTP sink (webhooks, telemetry, credentials) received
-  state         ls | cat: files the server persisted (settings, secrets, conversations)
+  state         ls | cat | grep: files the server persisted (settings, secrets, conversations)
   config        the run's config file and server environment, secrets masked
   capabilities  what this machine can drive (keys, binaries) and which families are blocked
   exec          Run an SDK/TypeScript-client program against the run (env injected)
@@ -3700,10 +3731,16 @@ secret key all private to the run. Without --new, an already-live run
   {CLI} restart                    # persistence and reconnection checks
   {CLI} restart --rotate-key       # the old session key must now be rejected
   {CLI} restart --hard             # SIGKILL: running conversations come back as error
+  {CLI} restart --rotate-secret-key  # new cipher key: are stored secrets still readable?
   {CLI} restart --env OH_MAX_CONCURRENT_RUNS=1""",
         cmd_restart,
     )
     p.add_argument("--rotate-key", action="store_true")
+    p.add_argument(
+        "--rotate-secret-key",
+        action="store_true",
+        help="new OH_SECRET_KEY (cipher): what happens to secrets stored under the old one",
+    )
     p.add_argument(
         "--hard",
         action="store_true",
@@ -4128,7 +4165,7 @@ readable with `sink read --name <stub>`.""",
     st = commands.add_parser(
         "state",
         help="inspect files the server persisted for this run",
-        description="Run state on disk: ls | cat",
+        description="Run state on disk: ls | cat | grep",
         formatter_class=Formatter,
         epilog=f"""Examples:
   {CLI} state ls 'home/.openhands/*'
@@ -4140,7 +4177,7 @@ home/.openhands = OH_PERSISTENCE_DIR), server/workspace/ (conversations,
 bash_events, default project), fixtures/, worktrees/. Output is redacted.""",
     )
     add_run_flag(st)
-    st_sub = st.add_subparsers(dest="state_command", metavar="<ls|cat>")
+    st_sub = st.add_subparsers(dest="state_command", metavar="<ls|cat|grep>")
     stl = st_sub.add_parser(
         "ls",
         help="list files matching a glob",
@@ -4150,6 +4187,27 @@ bash_events, default project), fixtures/, worktrees/. Output is redacted.""",
     add_run_flag(stl)
     stl.set_defaults(func=cmd_state_ls)
     stl.add_argument("pattern", nargs="?", default="home/.openhands/*")
+    stg = st_sub.add_parser(
+        "grep",
+        help="find files under the run that contain a value (secrets at rest)",
+        formatter_class=Formatter,
+        epilog=f"""Examples:
+  {CLI} state grep --env-value QA_SECRET --glob 'home/**/*' --expect-none     # never stored in plaintext
+  {CLI} state grep qa-marker --glob 'server/workspace/conversations/**/*'
+
+The searched value is redacted from the output; private/ and evidence/ are
+never searched.""",
+    )
+    add_run_flag(stg)
+    stg.set_defaults(func=cmd_state_grep)
+    stg.add_argument("text", nargs="?")
+    stg.add_argument(
+        "--env-value", metavar="NAME", help="search for the value of this variable"
+    )
+    stg.add_argument("--glob", default="**/*")
+    stg.add_argument(
+        "--expect-none", action="store_true", help="pass only when nothing matches"
+    )
     stc = st_sub.add_parser(
         "cat",
         help="print one file (JSON parsed when possible)",

@@ -20,6 +20,7 @@ import json
 import os
 import re
 import secrets
+import shlex
 import shutil
 import signal
 import socket
@@ -29,8 +30,15 @@ import time
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, NoReturn
+from urllib.parse import urlencode
+
+import httpx
+import psutil
+from websockets.exceptions import ConnectionClosed, InvalidStatus
+from websockets.sync.client import connect
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -295,8 +303,6 @@ def port_open(host: str, port: int) -> bool:
 
 
 def http_client(timeout: float = 60.0) -> Any:
-    import httpx
-
     return httpx.Client(timeout=timeout, follow_redirects=False, trust_env=False)
 
 
@@ -539,7 +545,7 @@ def start_server(run: Run, timeout: float) -> dict[str, Any]:
                         "ready_path": ready_path,
                     }
                 last_error = f"{ready_path} -> {response.status_code}"
-            except Exception as exc:  # noqa: BLE001 - startup polling
+            except Exception as exc:
                 last_error = type(exc).__name__
             time.sleep(0.25)
     raise CliError(
@@ -595,13 +601,8 @@ def cmd_launch(args: argparse.Namespace) -> dict[str, Any]:
     checkout = Path(args.checkout).resolve() if args.checkout else REPO_ROOT
     if not (checkout / "openhands-agent-server").is_dir():
         usage_error(f"{checkout} is not an agent-sdk checkout")
-    try:
-        import psutil
-
-        available = psutil.virtual_memory().available
-    except ImportError:
-        available = None
-    if available is not None and available < 1_000_000_000 and not args.force:
+    available = psutil.virtual_memory().available
+    if available < 1_000_000_000 and not args.force:
         env_error(
             f"Only {available // 1_000_000} MB of memory free; a run needs ~1 GB.",
             hint=f"Stop runs you are done with (`{CLI} runs`), or pass --force.",
@@ -821,10 +822,6 @@ def cmd_logs(args: argparse.Namespace) -> dict[str, Any]:
 
 
 def listening_pids(port: int) -> set[int]:
-    try:
-        import psutil
-    except ImportError:
-        return set()
     pids: set[int] = set()
     with contextlib.suppress(Exception):
         for conn in psutil.net_connections(kind="tcp"):
@@ -842,9 +839,6 @@ def ws_url(run: Run, path: str) -> str:
 
 def ws_probe(run: Run, path: str, auth: str) -> dict[str, Any]:
     """Open a socket, authenticate, and report whether it stayed open."""
-    from websockets.exceptions import ConnectionClosed
-    from websockets.sync.client import connect
-
     result: dict[str, Any] = {"path": path, "auth": auth}
     try:
         with connect(ws_url(run, path), open_timeout=5, close_timeout=2) as ws:
@@ -860,7 +854,7 @@ def ws_probe(run: Run, path: str, auth: str) -> dict[str, Any]:
     except ConnectionClosed as exc:
         result["open"] = False
         result["close_code"] = exc.rcvd.code if exc.rcvd else None
-    except Exception as exc:  # noqa: BLE001 - report any transport failure
+    except Exception as exc:
         result["open"] = False
         result["error"] = f"{type(exc).__name__}: {exc}"
     return result
@@ -894,7 +888,7 @@ def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
                     {"status": response.status_code},
                     required=path != "/ready" or not run.data.get("deferred_init"),
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 check(path, False, f"{type(exc).__name__}: {exc}")
         try:
             info = client.get(run.url + "/server_info").json()
@@ -911,7 +905,7 @@ def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
                     "usable_tools": info.get("usable_tools"),
                 },
             )
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             check("server-info", False, f"{type(exc).__name__}: {exc}")
         probe = "/api/conversations/count"
         if run.data.get("auth"):
@@ -937,7 +931,7 @@ def cmd_doctor(args: argparse.Namespace) -> dict[str, Any]:
             spec = client.get(run.url + "/openapi.json").json()
             operations = sum(len(v) for v in spec.get("paths", {}).values())
             check("openapi", operations > 0, {"operations": operations})
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             check("openapi", False, f"{type(exc).__name__}: {exc}")
     if run.data.get("auth"):
         check(
@@ -1204,11 +1198,6 @@ def ws_session(
     count: int | None,
     sink: Callable[[dict[str, Any]], None],
 ) -> dict[str, Any]:
-    from urllib.parse import urlencode
-
-    from websockets.exceptions import ConnectionClosed
-    from websockets.sync.client import connect
-
     params = dict(query)
     headers: dict[str, str] = {}
     key = run.session_key
@@ -1274,11 +1263,10 @@ def ws_session(
             "reason": exc.rcvd.reason if exc.rcvd else None,
         }
         reason = "closed"
-    except Exception as exc:  # noqa: BLE001 - handshake or transport failure
+    except Exception as exc:
         close = {"error": f"{type(exc).__name__}: {exc}"}
-        status = getattr(getattr(exc, "response", None), "status_code", None)
-        if status:
-            close["http_status"] = status
+        if isinstance(exc, InvalidStatus):
+            close["http_status"] = exc.response.status_code
         reason = "error"
     return {"frames": frames, "kinds": kinds, "stopped": reason, "close": close}
 
@@ -1495,10 +1483,10 @@ PRESETS: dict[str, dict[str, Any]] = {
 
 
 def read_api_key(args: argparse.Namespace, default_env: str) -> str:
-    if getattr(args, "api_key_file", None):
+    if args.api_key_file:
         key = Path(args.api_key_file).read_text().strip()
     else:
-        env_name = getattr(args, "api_key_env", None) or default_env
+        env_name = args.api_key_env or default_env
         key = os.environ.get(env_name, "")
         if not key:
             env_error(
@@ -1944,7 +1932,6 @@ def fixture_mcp_server(run: Run, name: str) -> dict[str, Any]:
 
 def serve_http_sink(port: int, out: Path) -> None:
     """Hidden helper process: record every request as one JSONL line."""
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
     class Handler(BaseHTTPRequestHandler):
         def _record(self) -> None:
@@ -2086,8 +2073,6 @@ def stub_stream(completion: dict[str, Any]) -> bytes:
 
 def serve_llm_stub(port: int, script: Path, out: Path) -> None:
     """Hidden helper process: an OpenAI-compatible provider that replays a script."""
-    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-
     calls = {"n": 0}
 
     class Handler(BaseHTTPRequestHandler):
@@ -2755,8 +2740,6 @@ def driven_routes(path: Path, routes: Sequence[dict[str, Any]]) -> set[tuple[str
 
 def validate_command(command: str) -> str | None:
     """Parse one recipe command with the real parser, without executing it."""
-    import shlex
-
     text = command.strip()
     if text.endswith("`"):
         text = text[:-1]
@@ -3249,8 +3232,6 @@ def append_ledger(
 
 
 def shlex_quote(value: str) -> str:
-    import shlex
-
     return shlex.quote(value)
 
 
@@ -3422,6 +3403,7 @@ def build_parser() -> argparse.ArgumentParser:
         prog=CLI, description=TOP_HELP, formatter_class=Formatter, add_help=True
     )
     parser.add_argument("--run", default=None, help=argparse.SUPPRESS)
+    parser.set_defaults(func=None)
     commands = parser.add_subparsers(dest="command", metavar="<command>")
 
     p = sub(
@@ -4205,7 +4187,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     args = parser.parse_args(head + tail)
     args.run = run_flag
-    func = getattr(args, "func", None)
+    func = args.func
     if func is None:
         # A group like `ws` or `map` without a subcommand: show its help.
         parser.parse_args([*head, "--help"])
@@ -4230,7 +4212,7 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     except KeyboardInterrupt:
         return 130
-    except Exception as exc:  # noqa: BLE001 - one JSON object, always
+    except Exception as exc:
         if type(exc).__module__.startswith("httpx"):
             emit(
                 {

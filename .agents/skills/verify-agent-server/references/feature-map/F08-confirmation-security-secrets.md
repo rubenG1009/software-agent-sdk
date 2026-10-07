@@ -17,8 +17,6 @@ Source: `openhands-agent-server/openhands/agent_server/conversation_router.py`, 
 
 Needs: `llm`, `tmux`
 
-Launch: `--env TMUX_TMPDIR=/tmp/qa-f08-tmux`
-
 Routes: `POST /api/conversations/{conversation_id}/events/respond_to_confirmation`,
 `POST /api/conversations/{conversation_id}/secrets`,
 `POST /api/conversations/{conversation_id}/confirmation_policy`,
@@ -100,10 +98,8 @@ Routes: `POST /api/conversations/{conversation_id}/events/respond_to_confirmatio
 
 Preconditions:
 
-- A run launched with this family's `Launch:` flag (`--env
-  TMUX_TMPDIR=/tmp/qa-f08-tmux`), `doctor` ok, `$DEEPSEEK_API_KEY` set; the
-  block below saves the DeepSeek profiles. The flag keeps tmux socket paths
-  under the 107-byte Unix socket limit (see Gotchas).
+- A run of this checkout, `doctor` ok, `$DEEPSEEK_API_KEY` set; the block
+  below saves the DeepSeek profiles.
 - `tmux` is installed: every scripted agent here has the `terminal` tool and
   nothing else (plus the built-in `finish` and `think`).
 - The block below creates, in order: the workspace root `$W` with one folder
@@ -273,7 +269,7 @@ KID=$(control-agent-server api POST /api/conversations \
   confirmation (a parked conversation holds no run slot), a conversation on
   a hanging stub takes the only slot, then `X` is accepted.
   ```sh
-  B=$(control-agent-server launch --new --name f08-cap --print-run --config-json '{"max_concurrent_runs": 1}' --env TMUX_TMPDIR=/tmp/qa-f08-tmux)
+  B=$(control-agent-server launch --new --name f08-cap --print-run --config-json '{"max_concurrent_runs": 1}')
   trap 'control-agent-server stop --run "$B" >/dev/null' EXIT
   CAP_STUB=$(control-agent-server fixture llm-stub --run "$B" --name qa-f08-cap \
     --step 'tool:terminal:{"command":"echo qa-cap > qa-f08-cap.txt"}' --step "$FINISH" --print-path)
@@ -561,7 +557,7 @@ KID=$(control-agent-server api POST /api/conversations \
   otherwise end in `error` (`LLMAuthenticationError`) before any command.
   ```sh
   NC=$(control-agent-server launch --new --no-auth --no-secret-key --name f08-nocipher --print-run \
-    --env TMUX_TMPDIR=/tmp/qa-f08-tmux --env OPENAI_API_KEY=qa-stub-key)
+    --env OPENAI_API_KEY=qa-stub-key)
   trap 'control-agent-server stop --run "$NC" >/dev/null' EXIT
   NC_STEP='tool:terminal:{"command":"printf %s \"$QA_F08_NC\" > qa-f08-nc.txt"}'
   NC_STUB=$(control-agent-server fixture llm-stub --run "$NC" --name qa-f08-nocipher \
@@ -693,13 +689,6 @@ KID=$(control-agent-server api POST /api/conversations \
 
 ## Gotchas
 
-- Tmux socket paths: with the default `TMUX_TMPDIR` (`<run>/tmux`) a run
-  directory such as `.../20261007-013126-8262-map-f08` makes the socket path
-  108 bytes, over the Unix limit, and creating any conversation with the
-  `terminal` tool fails with 500 `error connecting to ... (File name too
-  long)`. The `Launch:` flag points tmux at `/tmp/qa-f08-tmux` (sockets have
-  random names, so concurrent runs do not collide). A bullet that launches a
-  second server passes the same `--env`.
 - `respond_to_confirmation` with `accept: true` is exactly a run request: it
   needs a run slot (429 when full), it is a no-op on a running conversation,
   and with nothing pending it simply resumes the agent. `accept: false` with

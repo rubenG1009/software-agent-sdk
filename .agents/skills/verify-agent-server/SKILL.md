@@ -99,16 +99,22 @@ control-agent-server stop                       # stops only this run; evidence 
   accepted, that a rotated-out key is rejected, the OpenAPI document, WebSocket
   first-frame auth (bad key closes with 4001), and tracebacks in the log. Run it
   first, after every surprising failure, and before blaming the product.
-- **Drive** with `api METHOD PATH` (any REST route; `--auth none|bad|previous`
-  for auth cases, `--expect` for the status, `--check FIELD OP VALUE` for the
-  body, `--field` to chain values into shell variables, `--save FEATURE/NAME`
-  for evidence), `ws listen|start|read|stop`
-  (any WebSocket; `--auth first-frame|query|header|none|bad`, replay with
-  `--query resend_mode=all`, background captures that span other commands),
+- **Drive** with `api METHOD PATH` (any REST route, `OPTIONS` and `HEAD`
+  included; `--auth none|bad|previous|bearer|bearer-bad|init` for auth cases,
+  `--expect` for the status, `--check FIELD OP VALUE` and `--check-header` for
+  the body and headers, `--field` to chain values into shell variables, `--jar`
+  for cookies, `--until-ok` to poll, `--save FEATURE/NAME` for evidence),
+  `ws listen|start|read|stop` (any WebSocket;
+  `--auth first-frame|query|header|none|bad|bad-query|bad-header|previous|key`,
+  `--expect-reject` for close codes, replay with `--query resend_mode=all`,
+  background captures that span other commands, `--wait` on `read|stop` to
+  poll until the expectations hold),
   `conversation start|wait|send|events` (the essential agent pathways),
-  `sink read`, and `exec -- <program>` (an SDK or TypeScript-client program
-  with `AGENT_SERVER_URL` and `SESSION_API_KEY` injected). `logs --grep` reads
-  the server log with secrets redacted.
+  `sink read` (what a webhook, telemetry or credential sink received),
+  `state ls|cat|grep` (what the server persisted, and that secrets are not in
+  it), `config` and `capabilities`, and `exec -- <program>` (an SDK or
+  TypeScript-client program with `AGENT_SERVER_URL` and `SESSION_API_KEY`
+  injected). `logs --grep` reads the server log with secrets redacted.
 - **Arrange, don't fake.** `llm`, `fixture` and setup calls through `api` exist
   to reach preconditions (a configured profile, a git repository, a skill, a
   stdio MCP server, an HTTP sink). They never count as proof of the feature

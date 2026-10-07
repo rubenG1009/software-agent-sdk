@@ -1110,20 +1110,29 @@ def cmd_api(args: argparse.Namespace) -> dict[str, Any]:
     if args.cookie:
         headers["Cookie"] = args.cookie
     started = time.monotonic()
-    response = api_call(
-        run,
-        args.method,
-        args.path,
-        body=body,
-        params=parse_kv(args.query, "--query"),
-        auth=args.auth,
-        headers=headers,
-        files=files or None,
-        form=form or None,
-        timeout=args.timeout,
-    )
+    attempts = 0
+    while True:
+        attempts += 1
+        response = api_call(
+            run,
+            args.method,
+            args.path,
+            body=body,
+            params=parse_kv(args.query, "--query"),
+            auth=args.auth,
+            headers=headers,
+            files=files or None,
+            form=form or None,
+            timeout=args.timeout,
+        )
+        decoded, truncated = decode_body(response, args.max_chars)
+        settled = status_matches(response.status_code, args.expect) and all(
+            evaluate_check(decoded, spec)["ok"] for spec in args.check or []
+        )
+        if settled or time.monotonic() - started >= args.until_ok:
+            break
+        time.sleep(0.5)
     elapsed = int((time.monotonic() - started) * 1000)
-    decoded, truncated = decode_body(response, args.max_chars)
     exchange = {
         "request": {
             "method": args.method.upper(),
@@ -1159,6 +1168,8 @@ def cmd_api(args: argparse.Namespace) -> dict[str, Any]:
     result: dict[str, Any] = {"ok": ok, "status": response.status_code, **exchange}
     if checks:
         result["checks"] = checks
+    if args.until_ok:
+        result["attempts"] = attempts
     if args.raw_out:
         Path(args.raw_out).write_bytes(response.content)
         result["raw_out"] = args.raw_out
@@ -1902,14 +1913,179 @@ def fixture_git_repo(run: Run, name: str) -> dict[str, Any]:
 
 
 def fixture_skill(run: Run, name: str) -> dict[str, Any]:
-    skill_dir = run.fixtures / "skills" / name
-    skill_dir.mkdir(parents=True, exist_ok=True)
-    (skill_dir / "SKILL.md").write_text(
-        f"---\nname: {name}\ndescription: QA fixture skill that answers with the phrase "
-        f"QA_SKILL_MARKER when asked about {name}.\ntriggers:\n- {name}\n---\n\n"
-        f"# {name}\n\nWhen this skill is active, include the exact phrase QA_SKILL_MARKER.\n"
-    )
+    skill_dir = write_skill(run.fixtures / "skills" / name, name)
     return {"path": str(skill_dir), "name": name}
+
+
+def write_skill(folder: Path, name: str) -> Path:
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "SKILL.md").write_text(
+        f"---\nname: {name}\ndescription: QA fixture skill {name}; mention QA_SKILL_MARKER "
+        f"when asked about {name}.\ntriggers:\n- {name}\n---\n\n# {name}\n\n"
+        "When this skill is active, include the exact phrase QA_SKILL_MARKER.\n"
+    )
+    return folder
+
+
+def write_plugin(folder: Path, name: str) -> Path:
+    (folder / ".plugin").mkdir(parents=True, exist_ok=True)
+    (folder / ".plugin" / "plugin.json").write_text(
+        json.dumps(
+            {
+                "name": name,
+                "version": "0.1.0",
+                "description": f"QA fixture plugin {name}",
+                "entry_command": "qa-hello",
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    (folder / "commands").mkdir(exist_ok=True)
+    (folder / "commands" / "qa-hello.md").write_text(
+        "---\ndescription: Say hello from the QA plugin\n---\n\nReply with QA_PLUGIN_HELLO.\n"
+    )
+    write_skill(folder / "skills" / f"{name}-skill", f"{name}-skill")
+    (folder / "hooks").mkdir(exist_ok=True)
+    (folder / "hooks" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "UserPromptSubmit": [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {"type": "command", "command": "echo QA_PLUGIN_HOOK"}
+                            ],
+                        }
+                    ]
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return folder
+
+
+def fixture_plugin(run: Run, name: str) -> dict[str, Any]:
+    folder = write_plugin(run.fixtures / "plugins" / name, name)
+    return {
+        "path": str(folder),
+        "name": name,
+        "skill": f"{name}-skill",
+        "command": f"/{name}:qa-hello",
+    }
+
+
+def git_commit_all(repo: Path, run: Run, message: str) -> str:
+    env = {"GIT_CONFIG_GLOBAL": str(run.dir / "home" / ".gitconfig")}
+    run_cmd(["git", "add", "-A"], repo, env)
+    run_cmd(["git", "commit", "-q", "-m", message], repo, env)
+    return git("rev-parse", "HEAD", cwd=repo)
+
+
+def fixture_git_source(run: Run, name: str) -> dict[str, Any]:
+    """A local git repository holding a skill and a plugin (install from git)."""
+    repo = run.fixtures / "git" / name
+    env = {"GIT_CONFIG_GLOBAL": str(run.dir / "home" / ".gitconfig")}
+    if (repo / ".git").exists():
+        marker = repo / "skills" / f"{name}-skill" / "SKILL.md"
+        marker.write_text(marker.read_text() + f"\nRevision {now_iso()}.\n")
+        head = git_commit_all(repo, run, "Bump the QA skill")
+        bumped = True
+    else:
+        repo.mkdir(parents=True)
+        run_cmd(["git", "init", "-q", "-b", "main"], repo, env)
+        write_skill(repo / "skills" / f"{name}-skill", f"{name}-skill")
+        write_plugin(repo / "plugins" / f"{name}-plugin", f"{name}-plugin")
+        head = git_commit_all(repo, run, "QA skill and plugin")
+        bumped = False
+    return {
+        "path": str(repo),
+        "url": f"file://{repo}",
+        "head": head,
+        "bumped": bumped,
+        "skill": f"{name}-skill",
+        "skill_repo_path": f"skills/{name}-skill",
+        "plugin": f"{name}-plugin",
+        "plugin_repo_path": f"plugins/{name}-plugin",
+    }
+
+
+def fixture_marketplace(run: Run, name: str) -> dict[str, Any]:
+    root = run.fixtures / "marketplaces" / name
+    write_plugin(root / "plugins" / f"{name}-plugin", f"{name}-plugin")
+    write_skill(root / "skills" / f"{name}-skill", f"{name}-skill")
+    (root / ".plugin").mkdir(parents=True, exist_ok=True)
+    (root / ".plugin" / "marketplace.json").write_text(
+        json.dumps(
+            {
+                "name": name,
+                "owner": {"name": "QA"},
+                "plugins": [
+                    {"name": f"{name}-plugin", "source": f"./plugins/{name}-plugin"}
+                ],
+                "skills": [
+                    {"name": f"{name}-skill", "source": f"./skills/{name}-skill"}
+                ],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return {
+        "path": str(root),
+        "name": name,
+        "plugin": f"{name}-plugin",
+        "skill": f"{name}-skill",
+        "registration": {"name": name, "source": str(root), "auto_load": True},
+    }
+
+
+def fixture_project(run: Run, name: str) -> dict[str, Any]:
+    """A git project with project skills, AGENTS.md, a sub-agent and hooks."""
+    root = run.fixtures / "projects" / name
+    env = {"GIT_CONFIG_GLOBAL": str(run.dir / "home" / ".gitconfig")}
+    if not root.exists():
+        root.mkdir(parents=True)
+        run_cmd(["git", "init", "-q", "-b", "main"], root, env)
+    write_skill(root / ".agents" / "skills" / f"{name}-skill", f"{name}-skill")
+    (root / ".openhands" / "skills").mkdir(parents=True, exist_ok=True)
+    (root / ".openhands" / "skills" / "qa-legacy.md").write_text(
+        "---\nname: qa-legacy\ntriggers:\n- qa-legacy\n---\n\nLegacy QA microagent.\n"
+    )
+    (root / "AGENTS.md").write_text("# QA project\n\nAlways mention QA_AGENTS_MD.\n")
+    (root / ".agents" / "agents").mkdir(parents=True, exist_ok=True)
+    (root / ".agents" / "agents" / "qa-helper.md").write_text(
+        "---\nname: qa-helper\ndescription: QA fixture sub-agent that answers briefly.\n---\n\n"
+        "You are a QA helper. Reply with QA_SUBAGENT.\n"
+    )
+    (root / ".openhands" / "hooks.json").write_text(
+        json.dumps(
+            {
+                "hooks": {
+                    "PreToolUse": [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {"type": "command", "command": "echo QA_PROJECT_HOOK"}
+                            ],
+                        }
+                    ]
+                }
+            },
+            indent=2,
+        )
+        + "\n"
+    )
+    return {
+        "path": str(root),
+        "name": name,
+        "skill": f"{name}-skill",
+        "legacy_skill": "qa-legacy",
+        "sub_agent": "qa-helper",
+    }
 
 
 def fixture_mcp_server(run: Run, name: str) -> dict[str, Any]:
@@ -2359,6 +2535,10 @@ FIXTURES: dict[str, Callable[[Run, str], dict[str, Any]]] = {
     "git-repo": fixture_git_repo,
     "skill": fixture_skill,
     "mcp-server": fixture_mcp_server,
+    "plugin": fixture_plugin,
+    "git-source": fixture_git_source,
+    "marketplace": fixture_marketplace,
+    "project": fixture_project,
     "http-sink": fixture_http_sink,
 }
 
@@ -2391,6 +2571,10 @@ def cmd_fixture(args: argparse.Namespace) -> dict[str, Any]:
         "git-repo": "qa-repo",
         "skill": "qa-skill",
         "mcp-server": "qa-mcp",
+        "plugin": "qa-plugin",
+        "git-source": "qa-src",
+        "marketplace": "qa-market",
+        "project": "qa-project",
         "http-sink": "sink",
     }.get(args.kind, "qa")
     info = maker(run, name)
@@ -3567,7 +3751,8 @@ Driving:
   ws            listen | start | read | stop: WebSocket capture with auth modes
   llm           preset deepseek | set | show: LLM profiles from an env key
   conversation  start | wait | send | events: the essential agent pathways
-  fixture       git-repo | skill | mcp-server | http-sink | llm-stub | list: run-owned fixtures
+  fixture       git-repo | project | skill | plugin | git-source | marketplace |
+                mcp-server | http-sink | llm-stub | list: run-owned fixtures
   sink          read: what an HTTP sink (webhooks, telemetry, credentials) received
   state         ls | cat | grep: files the server persisted (settings, secrets, conversations)
   config        the run's config file and server environment, secrets masked
@@ -3790,6 +3975,7 @@ secret key all private to the run. Without --new, an already-live run
   ID=$({CLI} api POST /api/conversations --json-file start.json --field id)
   {CLI} api GET /api/conversations/<id> --check execution_status eq finished --check title exists
   {CLI} api GET /server_info --auth none --check uptime lt "$U1" --check capabilities contains tool_catalog_v1
+  {CLI} api GET /api/mcp/oauth/status/$JOB --check status eq callback_ready --until-ok 30
 
 --auth: header (default), none, bad (wrong key). --expect accepts 200, 2xx,
 or a list like 404,422. --check FIELD OP [VALUE] asserts on the JSON body
@@ -3825,6 +4011,13 @@ under <run>/evidence/FEATURE/NAME.json.""",
         nargs="+",
         metavar="FIELD OP [VALUE]",
         help=f"assert on the JSON body (repeatable); OP: {', '.join(CHECK_OPS)}",
+    )
+    p.add_argument(
+        "--until-ok",
+        type=float,
+        default=0,
+        metavar="SECONDS",
+        help="repeat the request every 0.5 s until --expect/--check hold (or time runs out)",
     )
     p.add_argument("--field", help="print only this dotted field of the JSON body")
     p.add_argument("--save", metavar="FEATURE/NAME")
@@ -4108,6 +4301,11 @@ Without --body-json agent fields, the agent comes from GET /api/settings
   REPO=$({CLI} fixture git-repo --print-path)       # 2 commits, 1 modified, 1 untracked
   {CLI} fixture skill --name qa-skill
   {CLI} fixture mcp-server --name qa-mcp            # stdio FastMCP server with a qa_echo tool
+  {CLI} fixture plugin --name qa-plugin             # .plugin/plugin.json, a command, a skill, hooks
+  {CLI} fixture git-source --name qa-src            # git repo with skills/qa-src-skill and plugins/qa-src-plugin; file:// url
+  {CLI} fixture git-source --name qa-src            # again: commits a change (refresh tests)
+  {CLI} fixture marketplace --name qa-market        # .plugin/marketplace.json listing a plugin and a skill
+  {CLI} fixture project --name qa-project           # git project: .agents/skills, .openhands/skills, AGENTS.md, .agents/agents, hooks.json
   {CLI} fixture http-sink --name telemetry          # records every request; `sink read --name telemetry`
   {CLI} fixture http-sink --name creds --body '{{"token": "qa"}}' --status 200
   {CLI} fixture llm-stub --name qa-stub --step 'tool:finish:{{"message":"done"}}'

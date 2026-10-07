@@ -20,7 +20,7 @@ document.
 
 Source: `openhands-agent-server/openhands/agent_server/credential_binding.py`, `openhands-agent-server/openhands/agent_server/conversation_router.py`, `openhands-agent-server/openhands/agent_server/conversation_registry.py`, `openhands-agent-server/openhands/agent_server/conversation_service.py`, `openhands-agent-server/openhands/agent_server/event_service.py`, `openhands-agent-server/openhands/agent_server/conversation_lease.py`, `openhands-agent-server/openhands/agent_server/models.py`, `openhands-sdk/openhands/sdk/credential.py`, `openhands-sdk/openhands/sdk/agent/acp_file_credentials.py`
 
-Needs: `llm`
+Needs: `llm`, `node`
 
 Routes: `GET /api/conversations/{conversation_id}/runtime`,
 `POST /api/conversations/{conversation_id}/runtime/reprovision`,
@@ -33,13 +33,14 @@ Routes: `GET /api/conversations/{conversation_id}/runtime`,
 - `F12.runtime-info`: `GET .../runtime` returns 200 `{"runtime_status": "available", "can_resume": true, "runtime_error": null}` for a local conversation, and the conversation's GET, search and batch-get rows embed the same object as `runtime_info`.
 - `F12.runtime-reprovision`: `POST .../runtime/reprovision` returns the same runtime info, ignores a body, and changes nothing (status, event count and lease generation stay the same).
 - `F12.runtime-errors`: both runtime routes answer 404 for an unknown id, 422 for a non-UUID id and 401 without a session key.
+- `F12.ts-client`: the built TypeScript client's `ConversationClient.getRuntime` and `reprovisionRuntime` return the local runtime info, `getConversation()` embeds it as `runtime_info`, and both methods reject an unknown id with a 404 `HttpError` and a client without a key with 401.
 - `F12.sandbox-pause-releases`: `prepare-for-sandbox-pause` answers 204 with an empty body, deletes every `owner_lease.json`, keeps every conversation listed and readable with its status, is idempotent, and is refused with 401 (leaving the leases) without a key.
 - `F12.runtime-cold`: runtime info answers for a conversation that is not loaded, before and after a restart, without loading it (no lease file appears).
-- `F12.sandbox-pause-rehydrate`: after a pause, the next event access loads the conversation again (a new lease at generation 1, the same events), and a new message runs to `finished` on a real model.
+- `F12.sandbox-pause-rehydrate`: after a pause (no restart in between), the next event access loads the conversation again (a new lease, the same events), and a new message runs to `finished` on a real model, which acts again.
 - `F12.sandbox-pause-running`: a conversation whose model call is in flight is cancelled to `paused` within the server's 10 s bound, with a `PauseEvent` and an `InterruptEvent`, and the status change is pushed on its events socket.
-- `F12.sandbox-pause-websocket`: an events socket that was open before the pause is either closed by the server or keeps receiving the conversation's new events; it is never left open and silent.
+- `F12.sandbox-pause-websocket`: an events socket or a session socket that was open before the pause is either closed by the server or keeps receiving the conversation's new events; it is never left open and silent.
 - `F12.binding-unsupported-secret`: only file credentials can be bound: any other secret name gets 404 without the source being contacted.
-- `F12.binding-validation`: a body with extra keys, no `url`, an empty `url`, an empty header value or more than 16 headers, or a non-UUID id, gets 422 without the source being contacted; no key gets 401.
+- `F12.binding-validation`: a body with extra keys, no `url`, an empty or over-long (4097+ characters) `url`, an empty or over-long (8193+ characters) header value or more than 16 headers, or a non-UUID id, gets 422 without the source being contacted, also for an unsupported secret name (the body is validated first); no key gets 401.
 - `F12.binding-validation-redaction`: a 422 for invalid binding headers does not echo the header values back.
 - `F12.binding-pending`: a binding for a conversation id the server does not know answers 204 after exactly one probe `GET` that carries the given headers; the id stays unknown (404).
 - `F12.binding-source-statuses`: the source's answer maps to the activation status: 401/403 to 403, 400/404/422 to 422, 409 to 409, 501 to 501, a 200 that is not `{"value": str, "version": non-empty str}` to 422, and a URL that is not http(s) to 422, each after a single probe (none for the bad URL).
@@ -77,7 +78,8 @@ Routes: `GET /api/conversations/{conversation_id}/runtime`,
   `credential_binding_activation_required` for a conversation that needs a
   binding.
 - TypeScript client: `ConversationClient.getRuntime(conversationId)` and
-  `reprovisionRuntime(conversationId)`; `ConversationInfo.runtime_info`. No
+  `reprovisionRuntime(conversationId)`; `ConversationInfo.runtime_info`
+  (`F12.ts-client` runs them with `node` against the built client). No
   client method for the hidden routes.
 - SDK: no Python consumer of these routes in this repository;
   `RemoteWorkspace` calls the Docker-only `.../runtime` lifecycle routes
@@ -188,6 +190,33 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
   ```
   404 `Not Found`, 422 `uuid_parsing` and 401 `Unauthorized`, for both
   routes.
+- **TypeScript client (`F12.ts-client`).** `ConversationClient` from the
+  built client in `clients/typescript/dist` (built here when missing).
+  ```sh
+  test -f clients/typescript/dist/clients.js || (cd clients/typescript && npm ci && npm run build)
+  F="$AGENT_SERVER_VERIFY_RUN/fixtures"
+  cat > "$F/qa-f12-ts.mjs" <<'JS'
+  import assert from 'node:assert/strict';
+  import { resolve } from 'node:path';
+  import { pathToFileURL } from 'node:url';
+
+  const { ConversationClient } = await import(pathToFileURL(resolve('clients/typescript/dist/clients.js')).href);
+  const [cid, nope] = process.argv.slice(2);
+  const host = process.env.AGENT_SERVER_URL;
+  const client = new ConversationClient({ host, apiKey: process.env.SESSION_API_KEY });
+  const available = { runtime_status: 'available', can_resume: true, runtime_error: null };
+  assert.deepEqual(await client.getRuntime(cid), available);
+  assert.deepEqual(await client.reprovisionRuntime(cid), available);
+  assert.deepEqual((await client.getConversation(cid)).runtime_info, available);
+  await assert.rejects(client.getRuntime(nope), (e) => e.status === 404);
+  await assert.rejects(client.reprovisionRuntime(nope), (e) => e.status === 404);
+  await assert.rejects(new ConversationClient({ host }).getRuntime(cid), (e) => e.status === 401);
+  console.log('TS_RUNTIME_OK');
+  JS
+  control-agent-server exec --expect-output TS_RUNTIME_OK --save F12.ts-client/program -- node "$F/qa-f12-ts.mjs" "$N" "$NOPE"
+  ```
+  Every assertion holds: the same `available` object three ways, a 404
+  `HttpError` for the unknown id from both methods, and 401 without a key.
 - **Pause releases everything (`F12.sandbox-pause-releases`).** Both `N` and
   `R` are loaded and hold leases; a refused call first, then the real one.
   ```sh
@@ -220,18 +249,26 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
   ```
   The runtime routes read the catalog: no lease file appears, before or after
   the restart.
-- **Rehydrate after a pause (`F12.sandbox-pause-rehydrate`).** Read `R`'s
-  events, then run it again on DeepSeek flash.
+- **Rehydrate after a pause (`F12.sandbox-pause-rehydrate`).** Load `R`,
+  pause (the previous bullet's restart is not in between), read its events,
+  then run it again on DeepSeek flash.
   ```sh
+  ER=$(control-agent-server api GET "/api/conversations/$R/events/count" --field .)
+  AR=$(control-agent-server conversation events "$R" --kinds ActionEvent,MessageEvent --contains '"source": "agent"' --expect-min 1 | jq -e '.matching')
+  control-agent-server api POST /api/conversations/prepare-for-sandbox-pause --expect 204
+  control-agent-server state ls --conversation "$R" owner_lease.json --expect-count 0
   control-agent-server api GET "/api/conversations/$R/events/count" --expect 200 --check . eq "$ER" --save F12.sandbox-pause-rehydrate/events
   control-agent-server state cat owner_lease.json --conversation "$R" --check generation eq 1 --check owner_instance_id exists
   control-agent-server conversation send "$R" --text 'Reply with the single word again, then finish.' --wait --until finished --timeout 180
   control-agent-server api GET "/api/conversations/$R" --check execution_status eq finished --save F12.sandbox-pause-rehydrate/after-run
   control-agent-server api GET "/api/conversations/$R/events/count" --check . gt "$ER"
+  control-agent-server conversation events "$R" --kinds ActionEvent,MessageEvent --contains '"source": "agent"' \
+    | jq -e --argjson before "$AR" '.matching > $before'
   ```
-  The event log is intact, the new lease starts again at generation 1 (the
-  old one was released, not left to expire), and the conversation runs to
-  `finished` again.
+  The pause removes `R`'s lease; the first event read loads it again (a new
+  lease file) with the event log intact, and the conversation runs to
+  `finished` again with at least one new agent action or message, so the
+  model really ran on the reloaded conversation.
 - **Pause a running conversation (`F12.sandbox-pause-running`).** `H`'s
   model call hangs, so the run is in flight when the pause arrives.
   ```sh
@@ -240,6 +277,7 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
   control-agent-server ws read f12-running --expect-kind ConversationStateUpdateEvent --wait 15
   control-agent-server conversation send "$H" --text 'QA_F12_RUNNING'
   control-agent-server conversation wait "$H" --until running --timeout 30
+  for _ in $(seq 30); do control-agent-server sink read --name qa-f12-hang --expect-min 1 > /dev/null && break; sleep 0.5; done
   control-agent-server sink read --name qa-f12-hang --expect-min 1
   control-agent-server api POST /api/conversations/prepare-for-sandbox-pause --expect 204 --expect-max-ms 10000 --save F12.sandbox-pause-running/pause
   control-agent-server api GET "/api/conversations/$H" --check execution_status eq paused --save F12.sandbox-pause-running/after
@@ -252,29 +290,39 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
   for 300 s; the conversation is `paused`, its log has one `PauseEvent` and
   one `InterruptEvent`, and the socket received both and the `paused` status.
 - **Open sockets across a pause (`F12.sandbox-pause-websocket`), known bug.**
-  A socket opened before the pause, a message posted after it, and a fresh
-  socket as the positive control.
+  An events socket and a session socket opened before the pause, a message
+  posted after it, and fresh sockets of both kinds as the positive control.
   ```sh
   control-agent-server api GET "/api/conversations/$N/events/count" --expect 200
   control-agent-server ws start "/sockets/events/$N" --name f12-before --duration 300
+  control-agent-server ws start "/sockets/session/$N" --name f12-before-session --duration 300
   control-agent-server ws read f12-before --expect-kind ConversationStateUpdateEvent --wait 15
+  control-agent-server ws read f12-before-session --kinds sync --expect-min 1 --wait 15
   control-agent-server api POST /api/conversations/prepare-for-sandbox-pause --expect 204
   control-agent-server ws start "/sockets/events/$N" --name f12-after --duration 300
+  control-agent-server ws start "/sockets/session/$N" --name f12-after-session --duration 300
   control-agent-server ws read f12-after --expect-kind ConversationStateUpdateEvent --wait 15
+  control-agent-server ws read f12-after-session --kinds sync --expect-min 1 --wait 15
   control-agent-server conversation send "$N" --text 'QA_F12_AFTER_PAUSE' --no-run
   control-agent-server ws stop f12-after --contains QA_F12_AFTER_PAUSE --expect-min 1 --wait 15 --save F12.sandbox-pause-websocket/fresh-socket
-  control-agent-server ws stop f12-before --wait 5 --save F12.sandbox-pause-websocket/old-socket \
-    | jq -e '.close != null or ((.kinds.MessageEvent // 0) >= 1)'
+  control-agent-server ws stop f12-after-session --contains QA_F12_AFTER_PAUSE --expect-min 1 --wait 15 --save F12.sandbox-pause-websocket/fresh-session-socket
+  OLD=$(control-agent-server ws stop f12-before --wait 5 --save F12.sandbox-pause-websocket/old-socket)
+  OLD_SESSION=$(control-agent-server ws stop f12-before-session --wait 5 --save F12.sandbox-pause-websocket/old-session-socket)
+  echo "$OLD" | jq -e '.close != null or ((.kinds.MessageEvent // 0) >= 1)'
+  echo "$OLD_SESSION" | jq -e '.close != null or ((.kinds["durable:MessageEvent"] // 0) >= 1)'
   ```
-  Correct behavior: the socket that was open before the pause is closed by
-  the server (so the client reconnects) or keeps streaming. Today it stays
-  open and silent: `close` is `null` and it never receives the
-  `QA_F12_AFTER_PAUSE` message that the fresh socket gets, because the pause
-  closes the conversation's pub/sub without closing its WebSocket subscribers
-  (`_WebSocketSubscriber` inherits a no-op `close()`), leaving the client
-  attached to a discarded `EventService`. Idle eviction avoids this by never
-  evicting a conversation with an external subscriber; the pause has no such
-  guard.
+  Correct behavior: a socket that was open before the pause is closed by
+  the server (so the client reconnects) or keeps streaming. Today both stay
+  open and silent: `close` is `null` and neither receives the
+  `QA_F12_AFTER_PAUSE` message that the fresh sockets get (the events socket
+  keeps its one initial `ConversationStateUpdateEvent`, the session socket
+  its `sync` frame and initial state; still the same 20 s later). The pause
+  closes the conversation's pub/sub without closing the socket subscribers
+  (`_WebSocketSubscriber` and the session socket's `_SessionSubscriber`
+  inherit the no-op `Subscriber.close()`), leaving the clients attached to a
+  discarded `EventService`. Idle eviction avoids this by never evicting a
+  conversation with an external subscriber; the pause has no such guard.
+  Both captures are saved before the assertions, so the evidence holds both.
 - **Unsupported secret names (`F12.binding-unsupported-secret`).** Only
   `CODEX_AUTH_JSON` is a file credential.
   ```sh
@@ -296,11 +344,18 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
     --check detail.0.msg contains 'Invalid credential binding headers' --save F12.binding-validation/empty-header
   H17=$(python3 -c 'import json; print(json.dumps({f"X-Qa-{i}": "v" for i in range(17)}))')
   control-agent-server api PUT "$B" --json "{\"url\": \"$NEVER/cred\", \"headers\": $H17}" --expect 422 --check detail.0.msg contains 'Invalid credential binding headers'
+  LONG_VALUE=$(python3 -c 'print("v" * 8193)')
+  control-agent-server api PUT "$B" --json "{\"url\": \"$NEVER/cred\", \"headers\": {\"X-Qa\": \"$LONG_VALUE\"}}" --expect 422 --quiet \
+    --check detail.0.msg contains 'Invalid credential binding headers'
+  LONG_URL="$NEVER/$(python3 -c 'print("x" * 4096)')"
+  control-agent-server api PUT "$B" --json "{\"url\": \"$LONG_URL\"}" --expect 422 --quiet --check detail.0.type eq string_too_long
+  control-agent-server api PUT "/api/conversations/$NOPE/credential-bindings/GITHUB_TOKEN" --json '{}' --expect 422 --check detail.0.type eq missing
   control-agent-server api PUT /api/conversations/not-a-uuid/credential-bindings/CODEX_AUTH_JSON --json "{\"url\": \"$NEVER/cred\"}" --expect 422 --check detail.0.type eq uuid_parsing
   control-agent-server api PUT "$B" --auth none --json "{\"url\": \"$NEVER/cred\"}" --expect 401 --check detail eq Unauthorized
   control-agent-server sink read --name qa-f12-never --expect-max 0
   ```
-  Each malformed body or id is a 422 with the pydantic error type, no key is
+  Each malformed body or id is a 422 with the pydantic error type (a bad
+  body under the unsupported `GITHUB_TOKEN` name is 422, not 404), no key is
   401, and the source still has no request.
 - **Header values in the 422 (`F12.binding-validation-redaction`), known bug.**
   Send 17 headers, one of them a token under a header name that does not look
@@ -328,7 +383,8 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
     --json "{\"url\": \"$SRC/cred\", \"headers\": {\"Authorization\": \"Bearer qa-f12-pending\"}}" --expect 204 --save F12.binding-pending/put \
     | jq -e '.response.body == ""'
   control-agent-server sink read --name qa-f12-cred --contains 'Bearer qa-f12-pending' --expect-min 1 --expect-max 1 --save F12.binding-pending/probe
-  control-agent-server sink read --name qa-f12-cred --path /cred --expect-min 1 --expect-max 1
+  control-agent-server sink read --name qa-f12-cred --path /cred --contains '"method": "GET"' --expect-min 1 --expect-max 1
+  control-agent-server sink read --name qa-f12-cred --expect-max 1
   control-agent-server api GET "/api/conversations/$U1" --expect 404
   ```
   204 with an empty body after one `GET /cred` carrying
@@ -379,10 +435,12 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
     --save F12.binding-source-unavailable/source-503 | jq -e '.elapsed_ms >= 750'
   control-agent-server sink read --name qa-f12-src-503 --expect-min 3 --expect-max 3 --save F12.binding-source-unavailable/probes
   control-agent-server api PUT "/api/conversations/$NOPE/credential-bindings/CODEX_AUTH_JSON" --json '{"url": "http://127.0.0.1:9/cred"}' \
-    --expect 502 --check exception eq '502: Credential binding source is unavailable' --expect-max-ms 5000 --save F12.binding-source-unavailable/closed-port
+    --expect 502 --check exception eq '502: Credential binding source is unavailable' --expect-max-ms 5000 \
+    --save F12.binding-source-unavailable/closed-port | jq -e '.elapsed_ms >= 750'
   ```
   Three probes (sleeping 0.25 s, then 0.5 s, between them), then 502 within
-  5 s; a refused connection is retried the same way.
+  5 s; a refused connection is retried the same way (it also takes at least
+  0.75 s).
 - **Regular conversation, loaded (`F12.binding-native-too-late`).** Load `N`,
   then try to bind it.
   ```sh
@@ -411,9 +469,14 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
   `required_runtime_credential_bindings: ["CODEX_AUTH_JSON"]`: after the
   pause every event read is 409 `credential_binding_activation_required` and
   the sockets close with 1013, for a conversation that never uses Codex.
-  `_resolve_credential_bindings` filters pending bindings by profile only,
-  not by agent kind. Low severity: only an orchestrator that binds
-  conversations without knowing their agent kind hits it.
+  The same happens when a regular conversation is created with an id that
+  has a pending binding, and then its own `CODEX_AUTH_JSON` secret is also
+  dropped from `meta.json` (`secrets: {}`), although the create path strips
+  that secret only for Codex sources. `_resolve_credential_bindings` filters
+  pending bindings by profile only, not by agent kind, and
+  `EventService.start` records every HTTP binding as required. Low severity:
+  only an orchestrator that binds conversations without knowing their agent
+  kind hits it.
 - **Bind a loaded ACP Codex conversation (`F12.binding-live-acp`).** `A` has
   never run, so its ACP agent is not initialized yet.
   ```sh
@@ -542,7 +605,12 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
 - `prepare-for-sandbox-pause` unloads every conversation of the server at
   once, under an exclusive lifecycle lock; it waits up to 10 s per in-flight
   run. A failure closing one conversation surfaces as a 500 after the others
-  closed, and pending bindings are then kept.
+  closed, and pending bindings are then kept. Sockets that were open stay
+  attached to the closed service (`F12.sandbox-pause-websocket`), so a client
+  must reconnect on its own after a pause.
+- `sink read` is a one-shot read with no `--wait`; the in-flight model call
+  in `F12.sandbox-pause-running` is awaited with a short bounded loop around
+  it.
 - The binding route probes the source before it looks at the conversation,
   so even a 403 (profile scope) or 409 (too late) costs one source request.
   It validates the body before the secret name (a bad body with an

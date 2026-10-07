@@ -511,20 +511,23 @@ printf -- '---\nname: qa-f21-skill\ndescription: QA F21 user skill\n---\nQA_F21_
     --json '{"llm_profile_ref": "deepseek-flash", "tools": [], "mcp_server_refs": [], "secret_refs": ["QA_F21_ALLOWED"]}'
   SCID=$(control-agent-server conversation start --agent-profile qa-f21-scoped --no-autotitle \
     --secret QA_F21_ALLOWED=qa-f21-allowed-value --secret QA_F21_OTHER=qa-f21-other-value --print-id)
+  UCID=$(control-agent-server conversation start --agent-profile qa-f21-runner --no-autotitle \
+    --secret QA_F21_ALLOWED=qa-f21-allowed-value --secret QA_F21_OTHER=qa-f21-other-value --print-id)
+  control-agent-server api PATCH "/api/conversations/$SCID" --json '{"tags": {"qa": "f21-scope"}}' --expect 200 --quiet
+  control-agent-server api PATCH "/api/conversations/$UCID" --json '{"tags": {"qa": "f21-scope"}}' --expect 200 --quiet
   control-agent-server api GET "/api/conversations/$SCID" --quiet --check launched_agent_profile.secret_refs len-eq 1 \
     --check launched_agent_profile.secret_refs contains QA_F21_ALLOWED \
     --check secret_registry.secret_sources.QA_F21_ALLOWED.kind eq StaticSecret \
     --check secret_registry.secret_sources.QA_F21_OTHER missing --save F21.secret-scope/scoped
-  UCID=$(control-agent-server conversation start --agent-profile qa-f21-runner --no-autotitle \
-    --secret QA_F21_ALLOWED=qa-f21-allowed-value --secret QA_F21_OTHER=qa-f21-other-value --print-id)
   control-agent-server api GET "/api/conversations/$UCID" --quiet --check launched_agent_profile.secret_refs missing \
     --check secret_registry.secret_sources.QA_F21_ALLOWED.kind eq StaticSecret \
     --check secret_registry.secret_sources.QA_F21_OTHER.kind eq StaticSecret --save F21.secret-scope/unscoped
   control-agent-server state grep qa-f21-other-value --glob 'server/**/*' --expect-none
   ```
-  Both creates succeed. The scoped conversation records the allow-list and
-  keeps only `QA_F21_ALLOWED`; the unscoped one keeps both, so the filter
-  comes from `secret_refs`. No plaintext secret value is stored.
+  Both creates succeed. After a tag edit saves each conversation's state,
+  the scoped one records the allow-list and keeps only `QA_F21_ALLOWED`,
+  while the unscoped one keeps both, so the filter comes from
+  `secret_refs`. No plaintext secret value is stored.
 - **Restart (`F21.restart`).**
   ```sh
   control-agent-server restart
@@ -538,45 +541,46 @@ printf -- '---\nname: qa-f21-skill\ndescription: QA F21 user skill\n---\nQA_F21_
   ```
   Every profile keeps its id and revision and the pointer still names
   `qa-f21-coder`; `doctor` is ok after the restart.
-- **Store busy (`F21.store-busy`).** Another process holds the store's
-  file lock (`flock` on the same lock file the server uses).
+- **Store busy (`F21.store-busy`).** The bullet's own shell takes the
+  store's file lock (`flock` on file descriptor 9, opened on the lock file
+  the server uses), as another process sharing the persistence directory
+  would.
   ```sh
   LOCK="$AGENT_SERVER_VERIFY_RUN/home/.openhands/agent-profiles/.agent-profiles.lock"
-  flock "$LOCK" sleep 90 &
-  HOLDER=$!
-  trap 'kill "$HOLDER" 2>/dev/null || true' EXIT
-  until ! flock -n "$LOCK" true; do sleep 0.1; done
+  exec 9>>"$LOCK"
+  flock -w 5 9
   T0=$SECONDS
   control-agent-server api GET /api/agent-profiles/qa-f21-coder --timeout 90 --expect 503 \
     --check exception contains 'Profile store is busy' --save F21.store-busy/busy
   test $((SECONDS - T0)) -ge 25
   test $((SECONDS - T0)) -le 45
-  kill "$HOLDER"
+  flock -u 9
   control-agent-server api GET /api/agent-profiles/qa-f21-coder --expect 200 --check profile.id eq "$CODER"
   ```
   The request waits out the 30-second lock timeout and answers 503 (the
   5xx body is `{"detail": "Internal Server Error", "exception": "503:
-  Profile store is busy. Please retry."}`); with the lock released the same
-  GET is 200.
+  Profile store is busy. Please retry."}`); once the lock is released the
+  same GET is 200. The lock also goes away when the bullet's shell exits.
 - **Lock wait stalls the server (`F21.busy-blocks-server`), known bug.**
   The handlers are `async` but take the store's file lock synchronously, so
   the event loop waits with them.
   ```sh
   control-agent-server api GET /alive --auth none --expect 200 --expect-max-ms 2000
   LOCK="$AGENT_SERVER_VERIFY_RUN/home/.openhands/agent-profiles/.agent-profiles.lock"
-  flock "$LOCK" sleep 90 &
-  HOLDER=$!
-  trap 'kill "$HOLDER" 2>/dev/null || true' EXIT
-  until ! flock -n "$LOCK" true; do sleep 0.1; done
-  (control-agent-server api GET /api/agent-profiles/qa-f21-coder --timeout 90 --quiet >/dev/null) &
+  exec 9>>"$LOCK"
+  flock -w 5 9
+  (exec 9>&- >/dev/null 2>&1; control-agent-server api GET /api/agent-profiles/qa-f21-coder --timeout 90 --quiet) &
   sleep 2
   control-agent-server api GET /alive --auth none --expect 200 --timeout 60 --expect-max-ms 2000 --save F21.busy-blocks-server/alive
+  flock -u 9
+  wait
   ```
   Correct behavior: `/alive` answers within two seconds while the profile
-  request waits (the bare `sleep 2` only lets that request reach the
-  server). Today `/alive` (and every other route and socket) hangs for the
-  rest of the 30-second lock wait, so orchestrator probes fail while any
-  other process holds the lock.
+  request waits for the lock (the bare `sleep 2` only lets that request
+  reach the server). Today `/alive`, like every other route and socket,
+  hangs until the 30-second lock wait ends, so orchestrator probes fail
+  while any other process holds the lock. The background request does not
+  inherit the lock, so the server recovers as soon as the shell exits.
 - **`.json` names lose their identity (`F21.json-suffix-identity`), known bug.**
   The store strips a trailing `.json` from the file name but keeps it in the
   profile's `name`.
@@ -624,6 +628,10 @@ printf -- '---\nname: qa-f21-skill\ndescription: QA F21 user skill\n---\nQA_F21_
 - A profile always launches its LLM with streaming on; the meta-profile
   reference is only checked when `enable_classify_and_switch_llm_tool` is
   true.
+- Secrets given at conversation start are kept in memory and survive a
+  restart, but `GET /api/conversations/{id}` shows an empty
+  `secret_registry` until the conversation's state is saved again (a run,
+  a tag edit); the secret-scope bullet edits a tag first, as F08 does.
 - 5xx responses (the busy 503) carry `detail: "Internal Server Error"` and
   the real message in `exception`; 4xx carry `detail` directly.
 - `--check` has no list projection, so recipes that look for a name in the

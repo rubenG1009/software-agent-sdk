@@ -25,17 +25,18 @@ Routes: `WS /sockets/session/{conversation_id}`
 
 - `F07.sync-first`: the first server frame is `{"type": "sync"}`; `from_seq` echoes `after_seq` (absent when live-only) and `through_seq` is the last on-disk `seq` (absent for an empty log).
 - `F07.snapshot-transient`: every connection gets one `transient` frame with a `full_state` `ConversationStateUpdateEvent` and no `seq`, after `sync` (and after the replay when one ran); it is never persisted.
-- `F07.full-replay`: `after_seq=-1` replays every persisted event as `durable` frames with `seq` 0..`through_seq`, in order, once each, with the same ids REST returns.
+- `F07.full-replay`: `after_seq=-1` (or any value below it) replays every persisted event as `durable` frames with `seq` 0..`through_seq`, in order, once each, with the same ids REST returns.
 - `F07.seq-on-disk`: a durable frame's `seq` is the event's on-disk index, the `NNNNN` in `events/event-NNNNN-<event id>.json`.
 - `F07.resume-cursor`: `after_seq=k` replays exactly the events with `seq > k`; `after_seq=through_seq` replays nothing.
 - `F07.live-durable`: on a live-only connection, an event appended later (a REST message with `run: false`) arrives as a `durable` frame with the next `seq`.
 - `F07.live-order`: live `durable` frames on one connection arrive in ascending `seq` order.
+- `F07.replay-then-live`: a connection opened with `after_seq=-1` while events are being appended receives every persisted event exactly once across the replay and the live tail: its durable `seq` values are exactly 0..N-1 for the N events REST counts.
 - `F07.send-message`: a `Message` JSON sent on the socket is persisted as a user `MessageEvent` (echoed as a `durable` frame) and runs the agent to `finished`.
 - `F07.error-frame`: JSON that is not a valid `Message` gets an `error` frame (`code` `ValidationError`); the connection stays open and nothing is persisted.
 - `F07.error-non-json`: a text frame that is not JSON gets an `error` frame with `code` `JSONDecodeError`, and a binary frame gets an `error` frame too; the connection stays open.
 - `F07.reject-non-user`: a `Message` whose `role` is not `user` gets an `error` frame (`Only user messages are allowed to be sent to the agent.`) and is not persisted.
 - `F07.auth-frame-ignored`: a redundant `{"type": "auth", ...}` frame after authentication is ignored: no `error` frame, nothing persisted.
-- `F07.auth`: a first-frame key opens the socket; a wrong key or a message sent before authenticating closes it with 4001 (nothing persisted); a wrong deprecated query key fails the handshake with HTTP 403.
+- `F07.auth`: a first-frame key opens the socket; a wrong key or a message sent before authenticating closes it with 4001 (nothing persisted); the run's key in the deprecated query parameter opens it, and a wrong one fails the handshake with HTTP 403.
 - `F07.unknown-conversation`: a well-formed id that names no conversation closes with 4004 `Conversation not found` after authentication.
 - `F07.bad-handshake`: a conversation id that is not a UUID, or an `after_seq` that is not an integer, fails the handshake with HTTP 403.
 - `F07.restart-resume`: `seq` survives a server restart: reconnecting with the same cursor replays the same event ids at the same `seq` values.
@@ -70,9 +71,10 @@ Routes: `WS /sockets/session/{conversation_id}`
   and `tests/agent_server/test_agent_server_wsproto.py` reference it.
 - REST second views used here: `POST /api/conversations/{id}/events`
   (append a message without running), `GET .../events/search` and
-  `GET .../events/count` (what was persisted), `GET`/`DELETE
-  /api/conversations/{id}`, and `PATCH /api/settings`
-  (`agent_settings_diff.llm.stream`, which new conversations inherit).
+  `GET .../events/count` (what was persisted), and `GET`/`DELETE
+  /api/conversations/{id}` (`agent.llm.stream` shows whether a conversation
+  streams; `conversation start --llm-json '{"stream": true}'` sets it for one
+  conversation).
 
 ## Driving it with control-agent-server
 
@@ -133,8 +135,8 @@ Preconditions:
   the snapshot is not persisted.
 - **Full replay (`F07.full-replay`).** Connect with `after_seq=-1`.
   ```sh
-  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=-1 --duration 3 --save "F07.full-replay/all-$CID"
-  control-agent-server state cat "evidence/F07.full-replay/all-$CID.json" --check frames len-eq 7 \
+  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=-1 --duration 3 --expect-frames 7 --save "F07.full-replay/all-$CID"
+  control-agent-server state cat "evidence/F07.full-replay/all-$CID.json" \
     --check frames.0.frame.from_seq eq -1 --check frames.0.frame.through_seq eq 4 \
     --check frames.1.frame.type eq durable --check frames.1.frame.seq eq 0 --check frames.1.frame.event.id eq "$E0" \
     --check frames.2.frame.seq eq 1 --check frames.2.frame.event.id eq "$E1" \
@@ -142,10 +144,13 @@ Preconditions:
     --check frames.4.frame.seq eq 3 --check frames.4.frame.event.id eq "$E3" \
     --check frames.5.frame.seq eq 4 --check frames.5.frame.event.id eq "$E4" \
     --check frames.6.frame.type eq transient
+  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=-7 --duration 3 --expect-frames 7 --save "F07.full-replay/below-$CID"
+  control-agent-server state cat "evidence/F07.full-replay/below-$CID.json" --check frames.0.frame.from_seq eq -7 \
+    --check frames.1.frame.seq eq 0 --check frames.1.frame.event.id eq "$E0" --check frames.5.frame.seq eq 4
   ```
   Exactly seven frames: `sync {from_seq: -1, through_seq: 4}`, five durable
   frames with `seq` 0 to 4 carrying the REST ids in REST order, then the
-  snapshot.
+  snapshot. `after_seq=-7` echoes `-7` and replays the same history.
 - **Seq is the on-disk index (`F07.seq-on-disk`).** Read the event files by
   the name the `seq` predicts.
   ```sh
@@ -156,12 +161,12 @@ Preconditions:
 - **Resume from a cursor (`F07.resume-cursor`).** Reconnect after `seq` 2,
   then after the last `seq`.
   ```sh
-  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=2 --duration 3 --save "F07.resume-cursor/after2-$CID"
-  control-agent-server state cat "evidence/F07.resume-cursor/after2-$CID.json" --check frames len-eq 4 \
+  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=2 --duration 3 --expect-frames 4 --save "F07.resume-cursor/after2-$CID"
+  control-agent-server state cat "evidence/F07.resume-cursor/after2-$CID.json" \
     --check frames.0.frame.from_seq eq 2 --check frames.1.frame.seq eq 3 --check frames.1.frame.event.id eq "$E3" \
-    --check frames.2.frame.seq eq 4 --check frames.3.frame.type eq transient
-  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=4 --duration 3 --save "F07.resume-cursor/after4-$CID"
-  control-agent-server state cat "evidence/F07.resume-cursor/after4-$CID.json" --check frames len-eq 2 \
+    --check frames.2.frame.seq eq 4 --check frames.2.frame.event.id eq "$E4" --check frames.3.frame.type eq transient
+  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=4 --duration 3 --expect-frames 2 --save "F07.resume-cursor/after4-$CID"
+  control-agent-server state cat "evidence/F07.resume-cursor/after4-$CID.json" \
     --check frames.0.frame.from_seq eq 4 --check frames.0.frame.through_seq eq 4 --check frames.1.frame.type eq transient
   ```
   `after_seq=2` replays `seq` 3 and 4 only; `after_seq=4` replays nothing and
@@ -170,15 +175,18 @@ Preconditions:
   a `Message`.
   ```sh
   control-agent-server ws listen "/sockets/session/$CID" --send '{"content":"QA_F07_BAD"}' --send '[1, 2]' \
-    --count 4 --duration 10 --expect-open --save "F07.error-frame/invalid-$CID"
-  control-agent-server state cat "evidence/F07.error-frame/invalid-$CID.json" --check frames len-eq 6 \
+    --duration 5 --expect-frames 4 --expect-open --save "F07.error-frame/invalid-$CID"
+  control-agent-server state cat "evidence/F07.error-frame/invalid-$CID.json" \
+    --check frames.0.direction eq sent --check frames.1.direction eq sent \
     --check frames.4.frame.type eq error --check frames.4.frame.code eq ValidationError --check frames.4.frame.detail contains role \
     --check frames.5.frame.type eq error --check frames.5.frame.code eq ValidationError
   control-agent-server api GET "/api/conversations/$CID/events/count" --check . eq 5
   ```
-  After `sync` and the snapshot come two `error` frames (`ValidationError`,
-  the first naming the missing `role`); the socket is still open and nothing
-  was persisted.
+  Exactly four frames in five seconds: after `sync` and the snapshot come two
+  `error` frames (`ValidationError`, the first naming the missing `role`),
+  and nothing else; the second `error` shows the socket survived the first,
+  it is still open at the end, and nothing was persisted. The saved capture
+  lists the two sent frames first (`frames.0` and `frames.1`).
 - **Non-JSON and binary frames (`F07.error-non-json`).** The CLI's `--send`
   only takes JSON, so a short `websockets` program sends the raw frames.
   ```sh
@@ -210,64 +218,77 @@ Preconditions:
 - **Non-user role (`F07.reject-non-user`).** Send an `assistant` message.
   ```sh
   control-agent-server ws listen "/sockets/session/$CID" --send '{"role":"assistant","content":[{"type":"text","text":"QA_F07_ROLE"}]}' \
-    --count 3 --duration 10 --expect-open --save "F07.reject-non-user/assistant-$CID"
+    --duration 5 --expect-frames 3 --expect-open --save "F07.reject-non-user/assistant-$CID"
   control-agent-server state cat "evidence/F07.reject-non-user/assistant-$CID.json" \
     --check frames.3.frame.type eq error --check frames.3.frame.detail contains 'Only user messages are allowed'
   control-agent-server api GET "/api/conversations/$CID/events/count" --check . eq 5
+  control-agent-server api GET "/api/conversations/$CID" --check execution_status eq idle
   ```
-  An `error` frame (code `AssertionError` today) and no new event; the agent
-  does not run.
+  `sync`, the snapshot and one `error` frame (code `AssertionError` today),
+  nothing more; no new event, and the agent does not run (the conversation
+  is still `idle`).
 - **Redundant auth frame (`F07.auth-frame-ignored`).** Authenticate with the
   header, then also send an auth frame, as a client that does both would.
   ```sh
   control-agent-server ws listen "/sockets/session/$CID" --auth header --send '{"type":"auth","session_api_key":"qa-redundant"}' \
-    --duration 3 --expect-open --save "F07.auth-frame-ignored/redundant-$CID"
-  control-agent-server state cat "evidence/F07.auth-frame-ignored/redundant-$CID.json" --check frames len-eq 3 --check summary.kinds.error missing
+    --duration 3 --expect-frames 2 --expect-no-kind error --expect-open --save "F07.auth-frame-ignored/redundant-$CID"
   control-agent-server api GET "/api/conversations/$CID/events/count" --check . eq 5
   ```
-  Only `sync` and the snapshot arrive: no `error` frame, no new event. The key
-  inside a redundant frame is not checked again.
+  Only `sync` and the snapshot arrive: no `error` frame (the same frame is a
+  `ValidationError` if it reaches `Message` validation, as in
+  `F07.error-frame`), no new event. The key inside a redundant frame is not
+  checked again.
 - **Authentication (`F07.auth`).** The session-socket view of F02's matrix.
   ```sh
   control-agent-server ws listen "/sockets/session/$CID" --count 1 --expect-open --save "F07.auth/first-frame-$CID"
   control-agent-server ws listen "/sockets/session/$CID" --auth bad --expect-close 4001 --save "F07.auth/bad-key-$CID"
   control-agent-server ws listen "/sockets/session/$CID" --auth none --send '{"role":"user","content":[{"type":"text","text":"QA_F07_NOAUTH"}]}' --expect-close 4001
-  control-agent-server ws listen "/sockets/session/$CID" --auth none --query session_api_key=qa-wrong-key --duration 3 | grep -qF '"http_status": 403'
+  control-agent-server ws listen "/sockets/session/$CID" --auth query --count 1 --expect-kind sync --expect-open
+  control-agent-server ws listen "/sockets/session/$CID" --auth bad-query --duration 3 --expect-reject 403 --save "F07.auth/bad-query-$CID"
   control-agent-server api GET "/api/conversations/$CID/events/count" --check . eq 5
   ```
   The run's key opens the socket (`sync` arrives); a wrong key and a message
   sent instead of an auth frame both close with 4001 `Authentication failed`,
-  and the unauthenticated message is not persisted; a wrong key in the
-  deprecated query parameter is refused at the handshake (HTTP 403, no close
-  code).
+  and the unauthenticated message is not persisted; the run's key in the
+  deprecated query parameter opens it too, and a wrong one is refused at the
+  handshake (HTTP 403, no close code).
 - **Unknown conversation (`F07.unknown-conversation`).** A valid UUID that
   names nothing.
   ```sh
-  control-agent-server ws listen /sockets/session/00000000-0000-4000-8000-0000000000f7 --query after_seq=-1 --expect-close 4004 --save F07.unknown-conversation/unknown
+  control-agent-server ws listen /sockets/session/00000000-0000-4000-8000-0000000000f7 --query after_seq=-1 --expect-close 4004 --expect-frames 0 \
+    --save "F07.unknown-conversation/unknown-$CID"
+  control-agent-server state cat "evidence/F07.unknown-conversation/unknown-$CID.json" --check summary.close.reason eq 'Conversation not found'
   ```
   Close code 4004, reason `Conversation not found`, after a successful auth
   frame.
 - **Malformed handshake (`F07.bad-handshake`).** Path and query validation
   run before the socket is accepted.
   ```sh
-  control-agent-server ws listen /sockets/session/qa-not-a-uuid --duration 3 | grep -qF '"http_status": 403'
-  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=qa --duration 3 | grep -qF '"http_status": 403'
+  control-agent-server ws listen /sockets/session/qa-not-a-uuid --duration 3 --expect-reject 403
+  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=qa --duration 3 --expect-reject 403
+  control-agent-server ws listen "/sockets/session/$CID" --query after_seq=4 --count 1 --expect-kind sync --expect-open
   ```
-  Both are HTTP 403 handshake rejections, not close codes.
+  Both are HTTP 403 handshake rejections, not close codes, while the same
+  path with an integer cursor opens.
 - **Live durable frame (`F07.live-durable`).** Capture a live-only socket in
   the background, then append a message over REST without running.
   ```sh
   control-agent-server ws start "/sockets/session/$CID" --name "live-$CID" --settle 2
   control-agent-server api POST "/api/conversations/$CID/events" --json '{"role":"user","content":[{"type":"text","text":"QA_F07_LIVE"}],"run":false}' --expect 200
   L5=$(control-agent-server api GET "/api/conversations/$CID/events/search" --query limit=100 --field items.5.id)
+  L6=$(control-agent-server api GET "/api/conversations/$CID/events/search" --query limit=100 --field items.6.id)
   control-agent-server conversation events "$CID" --kinds MessageEvent --contains QA_F07_LIVE --expect-kind MessageEvent
-  control-agent-server ws stop "live-$CID" --kinds durable --contains "\"seq\": 5, \"event\": {\"id\": \"$L5\"" --save "F07.live-durable/live-$CID"
-  control-agent-server state cat "evidence/F07.live-durable/live-$CID.json" --check frames len-eq 4 \
-    --check frames.0.frame.through_seq eq 4 --check frames.1.frame.type eq transient
+  control-agent-server ws read "live-$CID" --wait 10 --kinds durable:ConversationStateUpdateEvent --contains "\"seq\": 6, \"event\": {\"id\": \"$L6\""
+  control-agent-server ws stop "live-$CID" --wait 10 --kinds durable:MessageEvent --contains "\"seq\": 5, \"event\": {\"id\": \"$L5\"" --save "F07.live-durable/live-$CID"
+  control-agent-server state cat "evidence/F07.live-durable/live-$CID.json" \
+    --check frames.0.frame.through_seq eq 4 --check frames.1.frame.type eq transient --check frames.4.direction ne received
   ```
   After `sync` (`through_seq` 4) and the snapshot, two durable frames arrive:
   the message as `seq` 5, with the id REST lists at index 5, and its
-  `last_user_message_id` update as `seq` 6.
+  `last_user_message_id` update as `seq` 6 (the id REST lists at index 6),
+  and nothing else: no frame at or below `through_seq` is resent. A saved
+  `ws stop` capture ends with a `stopped` entry, so `frames.4.direction ne
+  received` says exactly four frames arrived.
 - **Live frames in seq order (`F07.live-order`), known bug.** Durable frames
   on one connection should arrive in `seq` order, like the replay. A user
   message is published after the `last_user_message_id` update it causes,
@@ -281,50 +302,88 @@ Preconditions:
   control-agent-server ws start "/sockets/session/$ORD" --name "order-$ORD" --settle 2
   control-agent-server api POST "/api/conversations/$ORD/events" --json '{"role":"user","content":[{"type":"text","text":"QA_F07_ORDER"}],"run":false}' --expect 200
   control-agent-server conversation events "$ORD" --kinds MessageEvent --contains QA_F07_ORDER --expect-kind MessageEvent
-  control-agent-server ws stop "order-$ORD" --kinds durable --contains QA_F07_ORDER --save "F07.live-order/order-$ORD"
-  control-agent-server state cat "evidence/F07.live-order/order-$ORD.json" --check frames len-eq 5 \
+  control-agent-server ws read "order-$ORD" --wait 10 --kinds durable:ConversationStateUpdateEvent --contains '"seq": 2,'
+  control-agent-server ws stop "order-$ORD" --wait 10 --kinds durable:MessageEvent --contains QA_F07_ORDER --save "F07.live-order/order-$ORD"
+  control-agent-server state cat "evidence/F07.live-order/order-$ORD.json" --check frames.5.direction ne received \
     --check frames.2.frame.seq eq 0 --check frames.3.frame.seq eq 1 --check frames.4.frame.seq eq 2
   ```
   Expected `seq` 0, 1, 2; today the frames arrive as 0, 2, 1 (the
   `last_user_message_id` update, then the message), on every user message,
-  whether it came over REST or over the socket.
+  whether it came over REST or over the socket. Both waits pass either way,
+  so only the order checks fail while the bug lasts.
+- **Replay and live tail, each event once (`F07.replay-then-live`).** Open a
+  full-history capture while four more messages are being appended in the
+  background, so the connect lands before, inside or after the appends;
+  whichever way it lands, the union of replay and live must be the whole log
+  once.
+  ```sh
+  SEAM=$(control-agent-server conversation start --tools none --no-autotitle --print-id)
+  control-agent-server api POST "/api/conversations/$SEAM/events" --json '{"role":"user","content":[{"type":"text","text":"QA_F07_SEAM_0"}],"run":false}' --expect 200
+  (for i in 1 2 3 4; do
+    control-agent-server api POST "/api/conversations/$SEAM/events" --json "{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"QA_F07_SEAM_$i\"}],\"run\":false}" --expect 200 >/dev/null
+  done) &
+  SEAMPID=$!
+  control-agent-server ws start "/sockets/session/$SEAM" --name "seam-$SEAM" --query after_seq=-1 --settle 0
+  wait "$SEAMPID"
+  control-agent-server api GET "/api/conversations/$SEAM/events/count" --check . eq 11
+  control-agent-server ws stop "seam-$SEAM" --wait 15 --kinds durable:SystemPromptEvent,durable:MessageEvent,durable:ConversationStateUpdateEvent \
+    --expect-min 11 --save "F07.replay-then-live/seam-$SEAM"
+  python3 - "$AGENT_SERVER_VERIFY_RUN/evidence/F07.replay-then-live/seam-$SEAM.json" 11 <<'EOF'
+  import json, sys
+  frames = [e["frame"] for e in json.load(open(sys.argv[1]))["frames"] if e["direction"] == "received"]
+  durable = [f for f in frames if f["type"] == "durable"]
+  assert frames[0]["type"] == "sync" and frames[0]["from_seq"] == -1, frames[0]
+  assert sorted(f["seq"] for f in durable) == list(range(int(sys.argv[2]))), [f["seq"] for f in durable]
+  assert len({f["event"]["id"] for f in durable}) == len(durable), "an event arrived twice"
+  print("through_seq at connect:", frames[0].get("through_seq"), "durable seqs:", [f["seq"] for f in durable])
+  EOF
+  ```
+  REST counts 11 events (the system prompt, five messages, five
+  `last_user_message_id` updates) and the capture carries `seq` 0 to 10,
+  each once, with distinct event ids. The printed `through_seq` shows where
+  the connect landed (anything from 2 to 10); the order inside the live tail
+  is `F07.live-order`'s business, not this check's.
 - **Send a message on the socket (`F07.send-message`).** A tiny deepseek-flash
   run; the message is sent by the background capture as it connects.
   ```sh
   control-agent-server ws start "/sockets/session/$CID" --name "send-$CID" --settle 2 \
     --send '{"role":"user","content":[{"type":"text","text":"QA_F07_WS Reply with the single word: ok"}]}'
   control-agent-server conversation wait "$CID" --until finished --timeout 180
-  control-agent-server ws stop "send-$CID" --kinds durable --contains QA_F07_WS --save "F07.send-message/send-$CID"
-  control-agent-server ws read "send-$CID" --kinds durable --contains '"value": "finished"'
+  control-agent-server ws read "send-$CID" --wait 15 --kinds durable:ConversationStateUpdateEvent --contains '"value": "finished"'
+  control-agent-server ws stop "send-$CID" --kinds durable:MessageEvent --contains QA_F07_WS --expect-min 1 --save "F07.send-message/send-$CID"
+  control-agent-server ws read "send-$CID" --contains '"source": "agent"' --expect-min 1
   control-agent-server conversation events "$CID" --kinds MessageEvent --contains QA_F07_WS --expect-kind MessageEvent
   control-agent-server api GET "/api/conversations/$CID" --check execution_status eq finished
   ```
-  The socket echoes the user message as a durable frame and later the
-  durable `execution_status: finished` update; REST lists the message and
-  reports `finished`. No `run` field was needed.
+  The socket echoes the user message as a durable frame, then the agent's
+  output (a durable event with `source` `agent`: its reply, or a `finish`
+  action) and the durable `execution_status: finished` update; REST lists
+  the message and reports `finished`. No `run` field was needed.
 - **Cursor survives a restart (`F07.restart-resume`).** Restart the server,
   then resume from the same cursor.
   ```sh
   T=$(control-agent-server api GET "/api/conversations/$CID/events/count" --field .)
   control-agent-server restart
   control-agent-server ws listen "/sockets/session/$CID" --query after_seq=2 --duration 3 --save "F07.restart-resume/after2-$CID"
-  control-agent-server state cat "evidence/F07.restart-resume/after2-$CID.json" --check frames len-eq "$((T - 1))" \
+  control-agent-server state cat "evidence/F07.restart-resume/after2-$CID.json" --check summary.frames eq "$((T - 1))" \
     --check frames.0.frame.through_seq eq "$((T - 1))" \
     --check frames.1.frame.seq eq 3 --check frames.1.frame.event.id eq "$E3" \
-    --check frames.2.frame.seq eq 4 --check frames.2.frame.event.id eq "$E4"
+    --check frames.2.frame.seq eq 4 --check frames.2.frame.event.id eq "$E4" \
+    --check "frames.$((T - 3)).frame.seq" eq "$((T - 1))" --check "frames.$((T - 2)).frame.type" eq transient
   ```
   After the restart `through_seq` is still the last index before it, and
   `seq` 3 and 4 still carry `E3` and `E4`: `sync`, `T - 3` durable frames and
   the snapshot.
-- **Streaming progress frames (`F07.progress-frames`).** Turn on
-  `llm.stream` for one new conversation, restore the setting, then send a
-  message on its socket and check the protocol's item rules on the capture.
+- **Streaming progress frames (`F07.progress-frames`).** Start one
+  conversation with `llm.stream` on (shared settings stay untouched), then
+  send a message on its socket and check the protocol's item rules on the
+  capture.
   ```sh
-  control-agent-server api PATCH /api/settings --json '{"agent_settings_diff": {"llm": {"stream": true}}}' --expect 200 --check agent_settings.llm.stream eq true
-  SID=$(control-agent-server conversation start --tools none --no-autotitle --print-id)
-  control-agent-server api PATCH /api/settings --json '{"agent_settings_diff": {"llm": {"stream": false}}}' --expect 200 --check agent_settings.llm.stream eq false
+  SID=$(control-agent-server conversation start --tools none --no-autotitle --llm-json '{"stream": true}' --print-id)
+  control-agent-server api GET "/api/conversations/$SID" --check agent.llm.stream eq true
   control-agent-server ws listen "/sockets/session/$SID" --send '{"role":"user","content":[{"type":"text","text":"Reply with the single word: ok"}]}' \
-    --until-kind durable --until event.key=execution_status --until event.value=finished --duration 180 --save "F07.progress-frames/run-$SID"
+    --until-kind durable:ConversationStateUpdateEvent --until event.key=execution_status --until event.value=finished --duration 180 \
+    --expect-kind item_started --expect-kind delta --save "F07.progress-frames/run-$SID"
   ITEM=$(python3 - "$AGENT_SERVER_VERIFY_RUN/evidence/F07.progress-frames/run-$SID.json" <<'EOF'
   import json, sys
   frames = [e["frame"] for e in json.load(open(sys.argv[1]))["frames"] if e["direction"] == "received"]
@@ -357,8 +416,11 @@ Preconditions:
 - **Progress is never replayed (`F07.progress-not-replayed`).** Reconnect to
   the streamed conversation with the full history.
   ```sh
-  control-agent-server ws listen "/sockets/session/$SID" --query after_seq=-1 --duration 3 --save "F07.progress-not-replayed/replay-$SID"
-  control-agent-server state cat "evidence/F07.progress-not-replayed/replay-$SID.json" --contains "$ITEM" \
+  test -n "$ITEM"
+  control-agent-server ws listen "/sockets/session/$SID" --query after_seq=-1 --duration 3 \
+    --expect-kind durable:MessageEvent --expect-no-kind item_started --expect-no-kind delta --expect-no-kind item_aborted \
+    --save "F07.progress-not-replayed/replay-$SID"
+  control-agent-server state cat "evidence/F07.progress-not-replayed/replay-$SID.json" --contains "\"id\": \"$ITEM\"" \
     --not-contains '"item_started"' --not-contains '"type": "delta"' --not-contains '"item_aborted"'
   ```
   The replay carries the durable reply (its id is `ITEM`) and no progress
@@ -369,14 +431,14 @@ Preconditions:
   BIG=$(control-agent-server conversation start --tools none --no-autotitle --print-id)
   mkdir -p "$AGENT_SERVER_VERIFY_RUN/fixtures"
   python3 -c 'import json, sys; json.dump({"role": "user", "content": [{"type": "text", "text": "QA_F07_BIG " + "x" * (5 * 1024 * 1024)}], "run": False}, open(sys.argv[1], "w"))' "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f07-5mib.json"
-  control-agent-server api POST "/api/conversations/$BIG/events" --json-file "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f07-5mib.json" --expect 200 | tail -c 300
+  control-agent-server api POST "/api/conversations/$BIG/events" --json-file "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f07-5mib.json" --expect 200 --quiet
   control-agent-server api GET "/api/conversations/$BIG/events/count" --check . eq 3
-  control-agent-server ws listen "/sockets/session/$BIG" --query after_seq=-1 --duration 10 --expect-close 1013 --save "F07.frame-too-large/replay-$BIG"
+  control-agent-server ws listen "/sockets/session/$BIG" --query after_seq=-1 --duration 10 --expect-close 1013 --expect-frames 2 --save "F07.frame-too-large/replay-$BIG"
   control-agent-server state cat "evidence/F07.frame-too-large/replay-$BIG.json" --check summary.close.reason eq frame_too_large \
-    --check frames len-eq 2 --check frames.1.frame.seq eq 0
+    --check frames.1.frame.seq eq 0
   control-agent-server api GET "/api/conversations/$BIG/events/count" --query body=QA_F07_BIG --check . eq 1
-  control-agent-server ws listen "/sockets/session/$BIG" --query after_seq=1 --duration 3 --expect-open --save "F07.frame-too-large/skip-$BIG"
-  control-agent-server state cat "evidence/F07.frame-too-large/skip-$BIG.json" --check frames len-eq 3 --check frames.1.frame.seq eq 2
+  control-agent-server ws listen "/sockets/session/$BIG" --query after_seq=1 --duration 3 --expect-open --expect-frames 3 --save "F07.frame-too-large/skip-$BIG"
+  control-agent-server state cat "evidence/F07.frame-too-large/skip-$BIG.json" --check frames.1.frame.seq eq 2 --check frames.2.frame.type eq transient
   ```
   The replay delivers `seq` 0 and closes with 1013 `frame_too_large` at the
   5 MiB event; REST still finds it (a body-filtered count of 1; the search
@@ -391,7 +453,7 @@ Preconditions:
   mkdir -p "$AGENT_SERVER_VERIFY_RUN/fixtures"
   python3 -c 'import json, sys; json.dump({"role": "user", "content": [{"type": "text", "text": "QA_F07_SLOW " + "y" * 4089000}], "run": False}, open(sys.argv[1], "w"))' "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f07-3m9.json"
   for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
-    control-agent-server api POST "/api/conversations/$SLOW/events" --json-file "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f07-3m9.json" --expect 200 | tail -c 300
+    control-agent-server api POST "/api/conversations/$SLOW/events" --json-file "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f07-3m9.json" --expect 200 --quiet
   done
   control-agent-server api GET "/api/conversations/$SLOW/events/count" --check . eq 25
   cat > "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f07-stalled-reader.py" <<'EOF'
@@ -519,19 +581,30 @@ Preconditions:
 - Neither the SDK nor the TypeScript client uses this socket yet, so a
   regression here breaks no shipped consumer's tests; only these recipes and
   `tests/agent_server/test_session_socket.py` notice.
-- The CLI names a frame by its `kind` field before its `type`: session frames
-  show up as `sync`, `durable`, `transient`, `error` and `item_started`, but
-  a `delta` frame shows up as `text` or `reasoning` (its own `kind` field).
-  `--until-kind delta` never matches; check the saved capture instead. Match
-  on the envelope with `--until FIELD=VALUE` (`event.key=execution_status`)
-  or `--contains` on the frame's JSON (`"seq": 5, "event": {"id": "..."}`,
-  key order as the server sends it).
+- The CLI names a session frame `<type>:<EventKind>` when it carries an
+  event (`durable:MessageEvent`, `durable:ConversationStateUpdateEvent`,
+  `transient:ConversationStateUpdateEvent`) and by its bare `type` otherwise
+  (`sync`, `item_started`, `delta`, `item_aborted`, `error`). `--kinds`,
+  `--expect-kind` and `--until-kind` match that name exactly, so a bare
+  `durable` matches nothing. Narrow further with `--until FIELD=VALUE`
+  (`event.key=execution_status`) or `--contains` on the frame's compact JSON
+  (`"seq": 5, "event": {"id": "..."}`, key order as the server sends it).
+- A saved capture's `frames` list holds every entry, not only received
+  frames: `ws listen --save` puts the `--send` frames first and ends with an
+  `ended` or `closed` entry, and a `ws stop --save` capture ends with a
+  `stopped` entry. Count received frames with `ws listen --expect-frames N`
+  (or `summary.frames`), or check that `frames.N.direction ne received`;
+  `frames len-eq` is off by the extra entries. `state cat --contains` reads
+  the saved file, which is indented JSON (`"seq": 5,` on its own line), so
+  match compact frame JSON with `ws read|stop --contains` instead.
 - A conversation without an initial message has no events at all, so its
   `sync` has no `through_seq`; the first `POST .../events` writes the
-  `SystemPromptEvent` (seq 0) before the message. A conversation started with
-  `--prompt` always runs, even with `--no-run` (the server ignores
-  `initial_message.run`), so fixtures that must not call the model append
-  messages with `POST .../events` and `"run": false` instead.
+  `SystemPromptEvent` (seq 0) before the message. The server ignores
+  `initial_message.run` on `POST /api/conversations`: an initial message
+  always runs the agent, even with `"run": false` (F04's territory). The
+  CLI's `conversation start --prompt ... --no-run` therefore creates the
+  conversation without one and appends the prompt with `POST .../events`
+  and `"run": false`, as the fixtures here do by hand.
 - Messages sent on the socket always run: `Message` ignores unknown fields, so
   `"run": false` in the frame is silently dropped. There is no way to append
   without running over this socket.
@@ -553,7 +626,9 @@ Preconditions:
   message count. A `websockets` client is a poor stall: it keeps reading
   into its own buffer even with `max_queue=1`.
 - Durable frames dropped with a connection (oversize, slow consumer) are not
-  lost: reconnect with `after_seq` set to the last `seq` received. Progress
+  lost: reconnect with `after_seq` set to the highest `seq` below which
+  nothing is missing. Today that is not always the last `seq` received,
+  because live frames can arrive out of order (`F07.live-order`). Progress
   frames are never replayed, by design.
 - The 50-subscriber cap is per conversation and shared with the legacy
   `/sockets/events/{id}` socket and internal subscribers (autotitle,
@@ -566,7 +641,15 @@ Preconditions:
   raised).
 - `ws start` waits `--settle` seconds (default 1) for the capture to
   connect; on a loaded machine use `--settle 2` or more before triggering
-  the action, or the capture misses it.
+  the action, or the capture misses it. Before stopping a capture, wait for
+  the frame you need with `ws read|stop --wait S` and a `--kinds`/`--contains`
+  filter; a REST view that already shows the event does not mean the frame
+  has reached the capture.
+- An `after_seq` above the log's last `seq` is not rejected: `sync` echoes
+  it with the smaller `through_seq`, nothing is replayed, and later events
+  arrive live even though their `seq` is not above the cursor. A client
+  should treat `from_seq > through_seq` as a stale cursor.
 - `api` echoes the whole request body in its output, so the multi-megabyte
-  POSTs above pipe through `tail -c 300` to keep the map-run transcript
-  small; `--max-chars` only trims non-JSON response bodies.
+  POSTs above use `--quiet` to keep the map-run transcript small (`--expect`
+  and `--check` still see the bodies); `--max-chars` only trims non-JSON
+  response bodies.

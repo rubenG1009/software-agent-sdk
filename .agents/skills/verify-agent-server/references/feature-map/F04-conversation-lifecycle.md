@@ -23,7 +23,7 @@ Routes: `GET /api/conversations/search`, `GET /api/conversations/count`,
 ## Sub-features
 
 - `F04.create-settings`: a create from the saved settings (`agent_settings` plus `secrets_encrypted`, the Agent Canvas path) returns 201 `idle`, adds one to the count, and persists the agent only in `base_state.json`, never in `meta.json`.
-- `F04.create-inline-agent`: an inline `agent` without `kind` is accepted as `Agent`; the API key is never echoed back.
+- `F04.create-inline-agent`: an inline `agent` without `kind` is accepted as `Agent`; the API key is never echoed back and the response trims inline skills.
 - `F04.create-agent-profile`: `agent_profile_id` resolves a stored Agent Profile and its LLM profile and records `launched_agent_profile`.
 - `F04.create-validation`: a missing agent source, two agent sources, a missing workspace, a bad tag key, `max_iterations` 0 and invalid `agent_settings` are 422; an unknown `agent_profile_id` is 404; a profile with a dangling LLM reference is 422 `unresolved_profile_references`; no key is 401; nothing is created.
 - `F04.create-idempotent`: re-posting an existing client `conversation_id` returns 200 with the same conversation, creates nothing and does not resend the initial message.
@@ -38,7 +38,7 @@ Routes: `GET /api/conversations/search`, `GET /api/conversations/count`,
 - `F04.get`: `GET /api/conversations/{id}` returns `runtime_info`, trims skills unless `include_skills=true`, accepts the 32-hex id form, and answers 404, 422 and 401.
 - `F04.batch-get`: `GET /api/conversations?ids=..` returns a list aligned with the ids, `null` for unknown ones, and 422 without or with malformed ids.
 - `F04.batch-get-limit`: 100 ids in one batch are refused with a client error, not a 500.
-- `F04.search-page`: `limit` and `next_page_id` page newest first by default; `sort_order=CREATED_AT` reverses it; bad limits and sort orders are 422.
+- `F04.search-page`: `limit` and `next_page_id` page newest first by default; `sort_order=CREATED_AT` reverses it; skills are trimmed unless `include_skills=true`; bad limits and sort orders are 422.
 - `F04.search-filter`: `status` filters search and count consistently; an unknown status is 422.
 - `F04.count`: `GET /api/conversations/count` equals the number of conversations search lists.
 - `F04.patch-title`: PATCH `title` is stripped, stored in `meta.json`, bumps `updated_at` and moves the conversation to the top of `UPDATED_AT_DESC`.
@@ -47,6 +47,7 @@ Routes: `GET /api/conversations/search`, `GET /api/conversations/count`,
 - `F04.patch-whitespace-title`: a whitespace-only title is rejected instead of erasing the stored title.
 - `F04.delete`: DELETE stops a running conversation (`PauseEvent`, `InterruptEvent`), removes its state, keeps the workspace and worktree, orphans children, and later reads are 404 (socket close 4004); a repeat or unknown id is 400.
 - `F04.restart-persist`: after a restart the catalog, statuses, titles, tags, final responses and event replay are unchanged, and deleted conversations stay deleted.
+- `F04.read-no-hydrate`: after a restart, GET, the batch get, search and count read a cold conversation without loading it (no `owner_lease.json`), while `agent_final_response` loads it and claims the lease.
 
 ## How to get to it (agent POV)
 
@@ -88,9 +89,10 @@ Routes: `GET /api/conversations/search`, `GET /api/conversations/count`,
   `conversation start` does); the sidebar uses search, count, title and tags;
   rename and delete use PATCH and DELETE.
 - Recipes below use REST through `api`, the CLI's `conversation start` (the
-  Agent Canvas create path), and the events socket through `ws`. Batch gets with
-  more than one id go through a small `urllib` helper run by `exec`, because
-  `api --query` sends one value per key.
+  Agent Canvas create path), and the events socket through `ws`. Batch gets
+  repeat the key (`api --query ids=A --query ids=B`); the 99- and 100-id
+  batches go through a small `urllib` helper run by `exec`, so the recipe does
+  not spell out 100 flags.
 
 ## Driving it with control-agent-server
 
@@ -150,7 +152,8 @@ EOF
   path: `agent_settings` from `GET /api/settings` (encrypted) and no prompt.
   ```sh
   N1=$(control-agent-server api GET /api/conversations/count --field .)
-  CID=$(control-agent-server conversation start --tools none --no-autotitle --tag qa=f04 --workspace "$W" --save F04.create-settings/start --print-id)
+  START=$(control-agent-server conversation start --tools none --no-autotitle --tag qa=f04 --workspace "$W" --save F04.create-settings/start)
+  CID=$(python3 -c 'import json, sys; d = json.loads(sys.argv[1]); assert d["status"] == 201 and d["execution_status"] == "idle", d; print(d["id"])' "$START")
   control-agent-server api GET "/api/conversations/$CID" --expect 200 --check execution_status eq idle \
     --check agent.kind eq Agent --check agent.llm.model eq deepseek/deepseek-flash --check agent.tools len-eq 0 \
     --check agent.llm.api_key ne "$DEEPSEEK_API_KEY" --check tags.qa eq f04 --check title missing \
@@ -170,11 +173,14 @@ EOF
     --json "{\"workspace\": {\"working_dir\": \"$W\"}, \"agent\": $OFFLINE_AGENT, \"autotitle\": false}" \
     --expect 201 --check agent.kind eq Agent --check agent.llm.model eq openai/qa-offline \
     --check agent.llm.api_key ne qa-offline-key --check execution_status eq idle \
+    --check agent.agent_context.skills len-eq 0 \
     --check launched_agent_profile missing --save F04.create-inline-agent/start --field id)
   control-agent-server api GET "/api/conversations/$IID" --expect 200 --check agent.kind eq Agent \
     --check agent.llm.base_url eq http://127.0.0.1:9/v1 --check agent.llm.api_key ne qa-offline-key
   ```
-  Both views say `kind` `Agent`; the API key comes back as `null`.
+  Both views say `kind` `Agent`; the API key comes back as `null`, and the
+  create response trims the inline skill like every read (`F04.get` shows it
+  is stored).
 - **Stored Agent Profile (`F04.create-agent-profile`).** An Agent Profile that
   references the saved `deepseek-flash` LLM profile.
   ```sh
@@ -312,13 +318,12 @@ EOF
     --prompt 'Reply with the single word: pong' --wait --until finished --timeout 300 --save F04.run-real/start --print-id)
   control-agent-server api GET "/api/conversations/$RID" --check execution_status eq finished \
     --check agent.llm.model eq deepseek/deepseek-flash --check stats.usage_to_metrics.default.model_name exists --save F04.run-real/get
-  control-agent-server ws listen "/sockets/events/$RID" --query resend_mode=all --until key=execution_status --until value=finished \
-    --duration 20 --save F04.run-real/replay
+  control-agent-server ws listen "/sockets/events/$RID" --query resend_mode=all --until-kind ConversationStateUpdateEvent \
+    --until key=execution_status --until value=finished --duration 20 --save F04.run-real/replay
   control-agent-server conversation events "$RID" --kinds MessageEvent --contains 'single word: pong'
   control-agent-server api GET "/api/conversations/$RID/events/count" --query source=user --check . eq 1
   control-agent-server api GET "/api/conversations/$RID/agent_final_response" --expect 200 --check response matches '\S' --save F04.run-real/final-response
-  for _ in $(seq 60); do control-agent-server api GET "/api/conversations/$RID" --check title exists >/dev/null && break; sleep 1; done
-  control-agent-server api GET "/api/conversations/$RID" --check title exists --save F04.run-real/title
+  control-agent-server api GET "/api/conversations/$RID" --check title exists --until-ok 60 --save F04.run-real/title
   ```
   The run finishes, the replay ends with `execution_status` `finished`, the
   prompt is recorded once as the user's `MessageEvent`, the final response is
@@ -359,9 +364,11 @@ EOF
   control-agent-server api GET /api/conversations --query ids="$IID" --expect 200 --check . len-eq 1 \
     --check 0.id eq "$IID" --check 0.runtime_info.runtime_status eq available --check 0.agent.agent_context.skills len-eq 0 --save F04.batch-get/one
   control-agent-server api GET /api/conversations --query ids="$IID" --query include_skills=true --check 0.agent.agent_context.skills len-eq 1
-  control-agent-server exec --expect-output QA_BATCH_OK --save F04.batch-get/aligned -- python3 "$F/qa-f04-batch.py" "$IID,$NOPE,$FID" 200 "$IID,null,$FID"
+  control-agent-server api GET /api/conversations --query ids="$IID" --query ids="$NOPE" --query ids="$FID" --expect 200 \
+    --check . len-eq 3 --check 0.id eq "$IID" --check 1 eq null --check 2.id eq "$FID" --save F04.batch-get/aligned
   IDS99=$(python3 -c 'import uuid; print(",".join(str(uuid.uuid4()) for _ in range(99)))')
-  control-agent-server exec --expect-output QA_BATCH_OK -- python3 "$F/qa-f04-batch.py" "$IDS99" 200
+  NULLS99=$(python3 -c 'print(",".join(["null"] * 99))')
+  control-agent-server exec --expect-output QA_BATCH_OK -- python3 "$F/qa-f04-batch.py" "$IDS99" 200 "$NULLS99"
   control-agent-server api GET /api/conversations --expect 422 --check detail.0.loc contains ids
   control-agent-server api GET /api/conversations --query ids=not-a-uuid --expect 422
   control-agent-server api GET /api/conversations --query ids="$IID" --auth none --expect 401
@@ -387,13 +394,16 @@ EOF
     --check next_page_id eq "${S1//-/}" --save F04.search-page/first
   control-agent-server api GET /api/conversations/search --query limit=1 --query page_id="${S1//-/}" --check items.0.id eq "$S1" --save F04.search-page/second
   control-agent-server api GET /api/conversations/search --query sort_order=CREATED_AT --query limit=100 --check items.-1.id eq "$S2" --check next_page_id missing
+  control-agent-server api GET /api/conversations/search --query limit=100 --check items not-contains qa-f04-skill --quiet
+  control-agent-server api GET /api/conversations/search --query limit=100 --query include_skills=true --check items contains qa-f04-skill --quiet
   control-agent-server api GET /api/conversations/search --query limit=0 --expect 422
   control-agent-server api GET /api/conversations/search --query limit=101 --expect 422
   control-agent-server api GET /api/conversations/search --query sort_order=bogus --expect 422
   control-agent-server api GET /api/conversations/search --auth none --expect 401
   ```
   The first page holds `S2` and points at `S1` (32-hex); that page starts with
-  `S1`; ascending order ends with `S2`.
+  `S1`; ascending order ends with `S2`. The inline skill `qa-f04-skill` is
+  absent from the listing unless `include_skills=true`.
 - **Status filter (`F04.search-filter`).** Finished and idle conversations
   from the bullets above.
   ```sh
@@ -401,12 +411,14 @@ EOF
     --check items contains "$QID" --check items not-contains "$IID" --check items.0.execution_status eq finished --save F04.search-filter/finished
   NF=$(control-agent-server api GET /api/conversations/count --query status=finished --field .)
   control-agent-server api GET /api/conversations/search --query status=finished --query limit=100 --check items len-eq "$NF"
-  control-agent-server api GET /api/conversations/search --query status=idle --check items contains "$IID" --check items not-contains "$FID"
+  control-agent-server api GET /api/conversations/search --query status=idle --check items contains "$AID" --check items not-contains "$FID"
   control-agent-server api GET /api/conversations/search --query status=bogus --expect 422
   control-agent-server api GET /api/conversations/count --query status=bogus --expect 422
   ```
   The finished page holds the stub and DeepSeek conversations only, and its
-  size equals `count?status=finished`.
+  size equals `count?status=finished`. `contains` matches anywhere in an
+  item's JSON, so the positive checks name conversations no other item links
+  to (`$IID` would also match its child's `parent_conversation_id`).
 - **Count (`F04.count`).** The total agrees with search.
   ```sh
   N=$(control-agent-server api GET /api/conversations/count --expect 200 --field .)
@@ -434,9 +446,10 @@ EOF
     --check title eq 'QA F04 title' --save F04.patch-tags/get
   control-agent-server state cat "server/workspace/conversations/${CID//-/}/base_state.json" --max-chars 200 --check tags.env eq prod --check tags.run missing
   control-agent-server state cat "server/workspace/conversations/${CID//-/}/meta.json" --max-chars 200 --check tags.env eq prod
-  control-agent-server ws stop qa-f04-tags --kinds ConversationStateUpdateEvent --save F04.patch-tags/live
-  grep -q '"key": "tags", "value": {"env": "prod"}' "$AGENT_SERVER_VERIFY_RUN/captures/qa-f04-tags.jsonl"
-  control-agent-server ws listen "/sockets/events/$CID" --query resend_mode=all --until key=tags --until value.env=prod --duration 15
+  control-agent-server ws stop qa-f04-tags --kinds ConversationStateUpdateEvent --contains '"key": "tags", "value": {"env": "prod"}' \
+    --expect-min 1 --wait 15 --save F04.patch-tags/live
+  control-agent-server ws listen "/sockets/events/$CID" --query resend_mode=all --until-kind ConversationStateUpdateEvent \
+    --until key=tags --until value.env=prod --duration 15
   ```
   Only `env=prod` remains, in both files; the live capture and the replay both
   carry the `tags` state update.
@@ -476,7 +489,7 @@ EOF
   N4=$(control-agent-server api GET /api/conversations/count --field .)
   control-agent-server ws start "/sockets/events/$DEL" --name qa-f04-delete --duration 60
   control-agent-server api DELETE "/api/conversations/$DEL" --expect 200 --check success eq true --timeout 30 --save F04.delete/delete
-  control-agent-server ws stop qa-f04-delete --expect-kind InterruptEvent --save F04.delete/live
+  control-agent-server ws stop qa-f04-delete --kinds PauseEvent --expect-min 1 --expect-kind InterruptEvent --wait 15 --save F04.delete/live
   control-agent-server api GET "/api/conversations/$DEL" --expect 404 --save F04.delete/get-after
   control-agent-server api GET "/api/conversations/$DEL/agent_final_response" --expect 404
   control-agent-server api GET /api/conversations --query ids="$DEL" --check 0 eq null
@@ -513,15 +526,31 @@ EOF
   ```
   Everything reads back the same, the deleted conversation stays 404, and the
   finished conversation's events replay up to its `finish` action.
+- **Cold reads do not load a conversation (`F04.read-no-hydrate`).** The
+  inline-agent conversation `$IID`, which only GET touched since the restart.
+  ```sh
+  LEASE="$AGENT_SERVER_VERIFY_RUN/server/workspace/conversations/${IID//-/}/owner_lease.json"
+  test ! -e "$LEASE"
+  control-agent-server api GET "/api/conversations/$IID" --expect 200 --check id eq "$IID" --quiet
+  control-agent-server api GET /api/conversations --query ids="$IID" --check 0.id eq "$IID" --quiet
+  control-agent-server api GET /api/conversations/search --query status=idle --check items contains "$IID" --quiet
+  control-agent-server api GET /api/conversations/count --query status=idle --check . ge 1
+  test ! -e "$LEASE"
+  control-agent-server api GET "/api/conversations/$IID/agent_final_response" --expect 200 --check response eq '' --save F04.read-no-hydrate/final-response
+  test -f "$LEASE"
+  ```
+  The graceful restart released every lease; the four catalog reads leave
+  `$IID` unloaded, and `agent_final_response` loads it, which claims
+  `owner_lease.json`.
 
 ## Gotchas
 
 - A create with `initial_message` always starts a run (`initial_message.run`
   is ignored), and the create response is composed right after the run is
   scheduled, so it may still say `idle`. Wait with `conversation wait`. To
-  create without running, omit `initial_message` (so
-  `conversation start --prompt ... --no-run`, which sends `"run": false`,
-  still runs; send the message afterwards with `conversation send --no-run`).
+  create without running, omit `initial_message` and post the message to
+  `.../events` with `"run": false`; `conversation start --prompt ... --no-run`
+  does exactly that.
 - `GET`, `search` and the batch get read the autosaved `base_state.json`
   snapshot (plus `meta.json`), not live memory. Changes applied in place
   without an autosave (start-time secrets, `POST .../secrets`) stay invisible
@@ -540,18 +569,20 @@ EOF
   `{"success": false}` and DELETE is 400, although the OpenAPI document lists
   404 for PATCH and DELETE (the router tests lock the current codes).
 - `GET /api/conversations` takes fewer than 100 ids (see
-  `F04.batch-get-limit`). `api --query` sends one value per key and drops a
-  `?query` written into PATH, so batches of several ids go through the
-  `exec` helper in `Preconditions:`.
+  `F04.batch-get-limit`). Repeat `--query ids=...` once per id.
 - PATCH `tags` replaces the whole map; PATCH `title` alone leaves tags alone.
   A set title stops autotitle. PATCH, DELETE and `agent_final_response` load
   (hydrate) a cold conversation, which claims its `owner_lease.json`; GET,
-  search, count and the batch get do not.
+  search, count and the batch get do not (`F04.read-no-hydrate`).
 - Autotitle is a separate background LLM call after the first user message; it
   emits no event, so poll `title` (bounded) after the run.
 - `parent_conversation_id` needs the same `working_dir` as the parent. DELETE
   does not cascade: children keep a dangling `parent_conversation_id`, and a
   worktree and its `openhands/<id>` branch stay behind.
+- An events socket that was already open during a DELETE receives the pause
+  frames and then stays open with no further events (no close frame within
+  10 s, observed live); only new connections get 4004. Watch for 404 on the
+  REST side rather than waiting for a close.
 - Saved LLM profiles cannot be named in `agent_settings`; start from one with
   `agent_profile_id` (an Agent Profile whose `llm_profile_ref` names it), as
   in `F04.create-agent-profile`.
@@ -561,12 +592,13 @@ EOF
   minutes.
 - A relative `working_dir` is resolved against the server's working directory
   (the run's `server/`), not the caller's.
-- `conversation start --title` does not set a title (the start request has no
-  title field); rename with PATCH.
-- Harness traps: `conversation events --contains X` asserts only without
-  `--expect-kind` (which checks the whole log and ignores `--contains`), and
-  `ws stop|read --contains` filters the display without failing, so the tags
-  bullet greps the capture file and replays with `ws listen --until`.
+- The start request has no title field; `conversation start --title` sends a
+  PATCH right after the create.
+- Harness traps: `ws listen --until FIELD=VALUE` asserts only together with
+  `--until-kind`; without it a listen that never sees the frame still passes.
+  `ws stop --contains` fails when nothing matches, but add `--wait` so a frame
+  still in flight is not missed. `api --check items contains X` matches X
+  anywhere in an item's JSON, including another conversation's link fields.
 - A create reserves one `max_concurrent_runs` slot while it initializes, so a
   full server answers 429 even for a create without a prompt (driven in the
   run family).

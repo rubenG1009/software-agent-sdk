@@ -39,9 +39,9 @@ Routes: `GET /api/file/home`, `GET /api/file/search_subdirs`,
 - `F14.subdirs-pagination`: `limit` and the `next_page_id` cursor page through the entries; `limit` outside 1..100 is 422.
 - `F14.subdirs-errors`: `search_subdirs` on a missing directory is 404, on a file 400, on a relative path 400.
 - `F14.subdirs-case-pagination`: following `next_page_id` across two directories that differ only by case (`Foo`, `foo`) reaches the second one instead of repeating the first page forever.
-- `F14.archive-tar`: `format=tar.gz` returns an `application/gzip` archive named `<dir>.tar.gz`, rooted at `<dir>/`, with `archive_manifest.json`, the default excludes applied (`.git/`, `node_modules/`), symlinks skipped, and no temp file left in the parent directory.
-- `F14.archive-excludes`: `use_default_excludes=false` keeps `node_modules` and `.git` internals but never `.git/config` or reflogs; `exclude=<glob>` drops matching files and is recorded in the manifest.
-- `F14.archive-git-delta`: the default `git-delta` format with `base_ref=HEAD` is a `text/x-patch` of the uncommitted and untracked changes that applies to a clone of HEAD, carries `X-Archive-Base-Commit`, `X-Archive-Base-Ref`, `X-Archive-Branch` and `X-Archive-Head-Commit`, and leaves the repository's index untouched; without `base_ref` on a remote-less repo the patch is against the empty tree and has no base headers.
+- `F14.archive-tar`: `format=tar.gz` returns an `application/gzip` archive named `<dir>.tar.gz`, rooted at `<dir>/`, with `archive_manifest.json`, the repository identity headers but no `X-Archive-Base-*`, the default excludes applied (`.git/`, `node_modules/`), symlinks skipped, and no temp file left in the parent directory.
+- `F14.archive-excludes`: `use_default_excludes=false` keeps `node_modules` and `.git` internals but never `.git/config` or reflogs; `exclude=<glob>` (repeatable) drops matching files and is recorded in the manifest.
+- `F14.archive-git-delta`: the default `git-delta` format with `base_ref=HEAD` is a `text/x-patch` of the uncommitted and untracked changes that applies to a clone of HEAD, carries `X-Archive-Base-Commit`, `X-Archive-Base-Ref`, `X-Archive-Branch` and `X-Archive-Head-Commit`, and leaves the repository's index untouched; without `base_ref` on a remote-less repo the patch is against the empty tree and has no base headers; a subdirectory of a repository yields only that subtree's delta.
 - `F14.archive-nested-repo`: archiving a non-repo directory that holds exactly one git repository archives that repository; with two repositories `git-delta` is 400 and `tar.gz` archives the directory itself.
 - `F14.archive-errors`: a relative path is 400, a missing directory 404, a file 400, a `base_ref` starting with `-` 400, an unknown `base_ref` 400, an unknown `format` 422, and `git-delta` of a non-repo directory 400.
 - `F14.trajectory`: `GET /api/file/download-trajectory/{id}` returns `<hex>.zip` with `meta.json`, `base_state.json` and one file per event, the LLM `api_key` redacted to `**********` and no Fernet ciphertext, for dashed and hex ids, and leaves no temp zip behind.
@@ -52,6 +52,7 @@ Routes: `GET /api/file/home`, `GET /api/file/search_subdirs`,
 - `F14.scoped-path-guard`: scoped routes reject paths outside the workspace (another conversation's workspace, `..` traversal, a symlink escape, a sibling with the same prefix, a relative path) with 422 and write nothing, while the global route serves the same path.
 - `F14.scoped-conversation-errors`: a scoped route for an unknown conversation is 404 and does nothing; a malformed conversation id is 422.
 - `F14.scoped-trajectory-archive`: the scoped trajectory route serves only its own conversation (another or malformed id is 422), and the scoped archive packs the workspace, including the agent's file, but refuses a path outside it with 422.
+- `F14.sdk-workspace`: the SDK's `RemoteWorkspace.file_upload`/`file_download` round-trip bytes through the global routes and, with `runtime_conversation_id`, through the scoped routes; a scoped upload outside the workspace returns `success=False` with the 422 and writes nothing.
 - `F14.restart`: after a restart, uploaded files, the scoped download and the trajectory are still served.
 
 ## How to get to it (agent POV)
@@ -71,7 +72,8 @@ Routes: `GET /api/file/home`, `GET /api/file/search_subdirs`,
   `GET /api/file/search_subdirs?path=...&limit=...&page_id=...&include_hidden=...`.
 - SDK: `RemoteWorkspace.file_upload()` / `file_download()` (and the async
   `AsyncRemoteWorkspace` versions) call `/api/file/upload|download`, or the
-  scoped routes when the workspace has `runtime_conversation_id`.
+  scoped routes when the workspace has `runtime_conversation_id`. Driven by
+  `F14.sdk-workspace` (an `exec` program, both scopes).
 - TypeScript client: `FileClient.uploadFile`, `uploadTextFile`, `downloadFile`,
   `downloadTextFile`, `downloadTrajectory` (scoped through the runtime
   transport when a `conversationId` is set), `getHome`,
@@ -89,13 +91,19 @@ Preconditions:
 - A run is live and exported, `doctor` is ok, `$DEEPSEEK_API_KEY` is set and
   `git` is installed. No launch flags are needed; the init bullet starts its
   own deferred-init server and stops it.
-- The block below activates `deepseek-flash`, creates the run-owned fixtures
+- The block below first restarts the server with
+  `GIT_CEILING_DIRECTORIES` set to the run directory, so git on the server
+  cannot discover a repository above the run (a stray `/tmp/.git` turns every
+  "non-repo" fixture into part of that repository and stops the server from
+  `git init`ing workspaces; see Gotchas). It then activates `deepseek-flash`,
+  creates the run-owned fixtures
   under `$AGENT_SERVER_VERIFY_RUN/fixtures/` (a 70 kB random blob, a small text
   file, the `qa-f14-repo` git fixture with a `node_modules/` and a `qa.log`
   added), runs one tiny model conversation `CID` whose agent writes
   `qa-f14-agent.txt` with the file editor (no `tmux` needed), and creates a
   second, never-run conversation `CID2` with its own workspace.
   ```sh
+  control-agent-server restart --env GIT_CEILING_DIRECTORIES="$AGENT_SERVER_VERIFY_RUN"
   control-agent-server llm preset deepseek
   F="$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f14"
   mkdir -p "$F"
@@ -110,6 +118,7 @@ Preconditions:
     --wait --until finished --timeout 300 --print-id)
   WS=$(control-agent-server api GET "/api/conversations/$CID" --field workspace.working_dir)
   control-agent-server conversation events "$CID" --kinds ObservationEvent --contains qa-f14-agent.txt --expect-kind ObservationEvent
+  test -d "$WS/.git"
   CID2=$(control-agent-server conversation start --tools file_editor --no-autotitle --print-id)
   WS2=$(control-agent-server api GET "/api/conversations/$CID2" --field workspace.working_dir)
   ```
@@ -128,7 +137,8 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$CID/file/download" --auth none --query path="$WS/qa-f14-agent.txt" --expect 401
   control-agent-server api POST "/api/conversations/$CID/file/create_directory" --auth none --query path="$WS/noauth-dir" --expect 401
   control-agent-server api GET "/api/conversations/$CID/file/archive" --auth none --query path="$WS" --expect 401
-  control-agent-server api GET "/api/conversations/$CID/file/download-trajectory/$CID" --auth none --expect 401 --save F14.auth/scoped-trajectory
+  control-agent-server api GET "/api/conversations/$CID/file/download-trajectory/$CID" --auth none --expect 401 \
+    --check detail eq Unauthorized --save F14.auth/scoped-trajectory
   test ! -e "$F/noauth" && test ! -e "$F/noauth-dir" && test ! -e "$WS/noauth.bin" && test ! -e "$WS/noauth-dir"
   ```
   All twelve answer `401 {"detail": "Unauthorized"}` and no file or
@@ -139,11 +149,11 @@ Preconditions:
   control-agent-server api POST /api/file/upload --query path="$F/xfer/a/b/blob.bin" --file file="$F/blob.bin" \
     --expect 200 --check success eq true --save F14.upload-download/upload
   test -d "$F/xfer/a/b"
-  DL=$(control-agent-server api GET /api/file/download --query path="$F/xfer/a/b/blob.bin" --expect 200 \
-    --raw-out "$F/blob.out" --save F14.upload-download/download)
+  control-agent-server api GET /api/file/download --query path="$F/xfer/a/b/blob.bin" --expect 200 \
+    --check-header content-disposition eq 'attachment; filename="blob.bin"' \
+    --check-header content-type eq application/octet-stream \
+    --raw-out "$F/blob.out" --save F14.upload-download/download
   cmp "$F/blob.bin" "$F/blob.out"
-  grep -qF 'attachment; filename=\"blob.bin\"' <<< "$DL"
-  grep -qF '"content-type": "application/octet-stream"' <<< "$DL"
   control-agent-server api POST /api/file/upload --query path="$F/xfer/a/b/blob.bin" --file file="$F/v2.txt" --expect 200
   control-agent-server api GET /api/file/download --query path="$F/xfer/a/b/blob.bin" --expect 200 \
     --raw-out "$F/v2.out" --save F14.upload-download/overwritten
@@ -170,11 +180,14 @@ Preconditions:
   mkdir -p "$F/xfer/is-a-dir"
   control-agent-server api POST /api/file/upload --query path="$F/xfer/is-a-dir" --file file="$F/v2.txt" \
     --expect 4xx --save F14.upload-onto-directory/upload
+  control-agent-server api POST /api/file/upload --query path="$F/v2.txt/child" --file file="$F/v2.txt" \
+    --expect 4xx --save F14.upload-onto-directory/parent-is-file
   ```
-  Expected: a 4xx such as 400 `Path exists and is not a directory`. Actual:
+  Expected: a 4xx such as 400 `Path exists and is not a directory`, as
+  `create_directory` answers for the same collisions. Actual:
   `500 {"detail": "Internal Server Error", "exception": "500: Failed to upload file: [Errno 21] Is a directory: ..."}`
-  (`_upload_file` maps every `OSError` to 500). A path whose parent is a file
-  (`$F/v2.txt/child`) fails the same way.
+  (`_upload_file` maps every exception to 500). A path whose parent is a file
+  (`$F/v2.txt/child`) fails the same way (`[Errno 17] File exists`).
 - **Download errors (`F14.download-errors`).** Missing file, directory,
   relative path, no path.
   ```sh
@@ -278,10 +291,11 @@ Preconditions:
 - **tar.gz archive (`F14.archive-tar`).** Archive the fixture repo, then a
   plain tree whose symlinks point inside and outside it.
   ```sh
-  OUT=$(control-agent-server api GET /api/file/archive --query path="$REPO" --query format=tar.gz --expect 200 \
-    --raw-out "$F/repo.tgz" --save F14.archive-tar/repo)
-  grep -qF 'attachment; filename=\"qa-f14-repo.tar.gz\"' <<< "$OUT"
-  grep -qF '"content-type": "application/gzip"' <<< "$OUT"
+  control-agent-server api GET /api/file/archive --query path="$REPO" --query format=tar.gz --expect 200 \
+    --check-header content-disposition eq 'attachment; filename="qa-f14-repo.tar.gz"' \
+    --check-header content-type eq application/gzip \
+    --check-header x-archive-head-commit eq "$(git -C "$REPO" rev-parse HEAD)" --check-header x-archive-branch eq main \
+    --check-header x-archive-base-commit missing --raw-out "$F/repo.tgz" --save F14.archive-tar/repo
   tar tzf "$F/repo.tgz" > "$F/repo.list"
   grep -qx 'qa-f14-repo/README.md' "$F/repo.list" && grep -qx 'qa-f14-repo/notes.txt' "$F/repo.list"
   grep -qx 'qa-f14-repo/src/util.py' "$F/repo.list" && grep -qx 'qa-f14-repo/archive_manifest.json' "$F/repo.list"
@@ -297,7 +311,9 @@ Preconditions:
   ```
   The repo archive is `qa-f14-repo.tar.gz` with the five working-tree files
   (tracked, modified, untracked and `qa.log`) and the manifest
-  (`file_count` 5), but no `.git/` and no `node_modules/`. The tree archive
+  (`file_count` 5), but no `.git/` and no `node_modules/`; it carries the
+  repository identity (`X-Archive-Head-Commit`, `X-Archive-Branch`) but no
+  `X-Archive-Base-*`, which only describe a patch. The tree archive
   holds `f.txt` and the real directories (empty ones too) but neither symlink.
   The temp archive the server builds in the parent directory is gone (the
   short poll waits for the server's own after-response cleanup).
@@ -315,41 +331,53 @@ Preconditions:
   tar tzf "$F/nolog.tgz" > "$F/nolog.list"
   grep -qx 'qa-f14-repo/notes.txt' "$F/nolog.list" && test -z "$(grep 'qa.log' "$F/nolog.list")"
   tar xzOf "$F/nolog.tgz" qa-f14-repo/archive_manifest.json | python3 -c 'import json,sys; m=json.load(sys.stdin); assert m["excludes"][-1] == "*.log" and ".git/" in m["excludes"], m'
+  control-agent-server api GET /api/file/archive --query path="$REPO" --query format=tar.gz --query 'exclude=*.log' \
+    --query exclude=notes.txt --expect 200 --raw-out "$F/two-ex.tgz" --save F14.archive-excludes/exclude-two
+  tar tzf "$F/two-ex.tgz" > "$F/two-ex.list"
+  grep -qx 'qa-f14-repo/README.md' "$F/two-ex.list" && test -z "$(grep -E 'qa\.log|notes\.txt' "$F/two-ex.list")"
   ```
   The full capture has `node_modules/pkg/j.js` and `.git/HEAD` but no
   `.git/config` and no `.git/logs/` although both exist on disk; `exclude=*.log`
   drops `qa.log`, keeps the defaults, and the manifest lists `*.log` last.
+  `exclude` is repeatable: with `*.log` and `notes.txt` both files are gone.
 - **git-delta patch (`F14.archive-git-delta`).** The default format against
-  `HEAD`, then against the automatic base. `api` does not record the
-  `X-Archive-*` headers, so `exec` reads them with `curl` (the key stays in the
-  child's environment).
+  `HEAD`, then against the automatic base.
   ```sh
   HEAD_SHA=$(git -C "$REPO" rev-parse HEAD)
-  OUT=$(control-agent-server api GET /api/file/archive --query path="$REPO" --query base_ref=HEAD --expect 200 \
-    --raw-out "$F/head.patch" --save F14.archive-git-delta/base-head)
-  grep -qF 'attachment; filename=\"qa-f14-repo.patch\"' <<< "$OUT"
-  grep -qF '"content-type": "text/x-patch' <<< "$OUT"
+  control-agent-server api GET /api/file/archive --query path="$REPO" --query base_ref=HEAD --expect 200 \
+    --check-header content-disposition eq 'attachment; filename="qa-f14-repo.patch"' \
+    --check-header content-type matches '^text/x-patch' \
+    --check-header x-archive-base-commit eq "$HEAD_SHA" --check-header x-archive-base-ref eq HEAD \
+    --check-header x-archive-branch eq main --check-header x-archive-head-commit eq "$HEAD_SHA" \
+    --check-header x-archive-repo-root eq "$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$REPO")" \
+    --raw-out "$F/head.patch" --save F14.archive-git-delta/base-head
   grep -q '^diff --git a/README.md b/README.md' "$F/head.patch" && grep -q '^diff --git a/notes.txt b/notes.txt' "$F/head.patch"
+  grep -q '^diff --git a/qa.log b/qa.log' "$F/head.patch"
   test -z "$(grep -E '^diff --git a/(src/|node_modules/)' "$F/head.patch")"
   git clone -q "$REPO" "$F/clone"
   git -C "$F/clone" apply --check "$F/head.patch"
   git -C "$REPO" diff --cached --quiet
-  control-agent-server exec --env REPO="$REPO" --env HDR="$F/head.headers" -- sh -c 'curl -fsS -G -D "$HDR" -o /dev/null -H "X-Session-API-Key: $SESSION_API_KEY" --data-urlencode "path=$REPO" --data-urlencode base_ref=HEAD "$AGENT_SERVER_URL/api/file/archive"'
-  grep -qi "^x-archive-base-commit: $HEAD_SHA" "$F/head.headers" && grep -qi '^x-archive-base-ref: HEAD' "$F/head.headers"
-  grep -qi '^x-archive-branch: main' "$F/head.headers" && grep -qi "^x-archive-head-commit: $HEAD_SHA" "$F/head.headers"
-  control-agent-server api GET /api/file/archive --query path="$REPO" --expect 200 --raw-out "$F/auto.patch" --save F14.archive-git-delta/auto
+  control-agent-server api GET /api/file/archive --query path="$REPO" --expect 200 \
+    --check-header x-archive-branch eq main --check-header x-archive-base-commit missing \
+    --check-header x-archive-base-ref missing --raw-out "$F/auto.patch" --save F14.archive-git-delta/auto
   grep -q '^diff --git a/src/app.py b/src/app.py' "$F/auto.patch"
-  control-agent-server exec --env REPO="$REPO" --env HDR="$F/auto.headers" -- sh -c 'curl -fsS -G -D "$HDR" -o /dev/null -H "X-Session-API-Key: $SESSION_API_KEY" --data-urlencode "path=$REPO" "$AGENT_SERVER_URL/api/file/archive"'
-  grep -qi '^x-archive-branch: main' "$F/auto.headers" && test -z "$(grep -i '^x-archive-base-' "$F/auto.headers")"
+  control-agent-server api GET /api/file/archive --query path="$REPO/src" --query base_ref=HEAD~1 --expect 200 \
+    --check-header content-disposition eq 'attachment; filename="src.patch"' \
+    --check-header x-archive-base-commit eq "$(git -C "$REPO" rev-parse HEAD~1)" \
+    --raw-out "$F/src.patch" --save F14.archive-git-delta/subdir
+  test "$(grep -c '^diff --git' "$F/src.patch")" = 1 && grep -q '^diff --git a/src/util.py b/src/util.py' "$F/src.patch"
   ```
   With `base_ref=HEAD` the patch (`qa-f14-repo.patch`, `text/x-patch`) holds
   the modified `README.md` and the untracked `notes.txt` and `qa.log`, not the
   committed `src/` files or `node_modules`; it applies to a fresh clone, and
   the fixture's index has nothing staged afterwards. The headers name the base
-  and head commit, `HEAD` and `main` (`X-Archive-Repo-Root` is
-  percent-encoded). Without `base_ref` the fixture has no remote, so the base
+  and head commit, `HEAD` and `main`, and `X-Archive-Repo-Root` is the
+  percent-encoded repository path. Without `base_ref` the fixture has no remote, so the base
   is the empty tree: every file appears as new and there is no
-  `X-Archive-Base-*` header.
+  `X-Archive-Base-*` header. A subdirectory of the repository (`src`, against
+  `HEAD~1`) yields `src.patch` with only that subtree's change
+  (`src/util.py`, paths still relative to the repository root), not the
+  `README.md`, `notes.txt` and `qa.log` changes beside it.
 - **Nested repository (`F14.archive-nested-repo`).** A non-repo parent with one
   copy of the repo two levels down, then a second copy.
   ```sh
@@ -357,9 +385,9 @@ Preconditions:
   mkdir -p "$P/group"
   cp -r "$REPO" "$P/group/proj"
   printf 'top\n' > "$P/top.txt"
-  OUT=$(control-agent-server api GET /api/file/archive --query path="$P" --query base_ref=HEAD --expect 200 \
-    --raw-out "$F/parent.patch" --save F14.archive-nested-repo/one-repo)
-  grep -qF 'attachment; filename=\"proj.patch\"' <<< "$OUT"
+  control-agent-server api GET /api/file/archive --query path="$P" --query base_ref=HEAD --expect 200 \
+    --check-header content-disposition eq 'attachment; filename="proj.patch"' \
+    --raw-out "$F/parent.patch" --save F14.archive-nested-repo/one-repo
   grep -q '^diff --git a/notes.txt b/notes.txt' "$F/parent.patch"
   control-agent-server api GET /api/file/archive --query path="$P" --query format=tar.gz --expect 200 --raw-out "$F/parent.tgz"
   tar tzf "$F/parent.tgz" > "$F/parent.list"
@@ -397,8 +425,8 @@ Preconditions:
   ```sh
   HEX=$(printf '%s' "$CID" | tr -d -)
   NEV=$(control-agent-server api GET "/api/conversations/$CID/events/count" --field .)
-  OUT=$(control-agent-server api GET "/api/file/download-trajectory/$CID" --expect 200 --raw-out "$F/traj.zip" --save F14.trajectory/zip)
-  grep -qF "$HEX.zip" <<< "$OUT"
+  control-agent-server api GET "/api/file/download-trajectory/$CID" --expect 200 \
+    --check-header content-disposition eq "attachment; filename=\"$HEX.zip\"" --raw-out "$F/traj.zip" --save F14.trajectory/zip
   python3 -c 'import json,sys,zipfile; z=zipfile.ZipFile(sys.argv[1]); h=sys.argv[2]; n=z.namelist(); assert h+"/meta.json" in n and h+"/base_state.json" in n, n; ev=[m for m in n if m.startswith(h+"/events/event-")]; assert len(ev) == int(sys.argv[3]), (len(ev), sys.argv[3]); s=json.loads(z.read(h+"/base_state.json")); assert s["agent"]["llm"]["api_key"] == "**********", "api_key not redacted"; assert not any(b"gAAAAA" in z.read(m) for m in n), "Fernet ciphertext in the zip"' "$F/traj.zip" "$HEX" "$NEV"
   grep -q '"api_key": *"gAAAAA' "$AGENT_SERVER_VERIFY_RUN/server/workspace/conversations/$HEX/base_state.json"
   control-agent-server api GET "/api/file/download-trajectory/$HEX" --expect 200 --raw-out "$F/traj-hex.zip"
@@ -465,6 +493,7 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$CID2/file/download" --query path="$WS2/qa-f14-escape/qa-f14-agent.txt" --expect 422
   control-agent-server api GET "/api/conversations/$CID2/file/download" --query path="${WS2}-sibling/x.txt" --expect 422
   control-agent-server api GET "/api/conversations/$CID2/file/download" --query path=qa-f14-agent.txt --expect 422
+  control-agent-server api GET "/api/conversations/$CID/file/download" --query path="$WS/qa-f14-up/../qa-f14-agent.txt" --expect 200
   control-agent-server api POST "/api/conversations/$CID2/file/upload" --query path="$WS/qa-f14-intruder.txt" --file file="$F/v2.txt" --expect 422
   control-agent-server api POST "/api/conversations/$CID2/file/create_directory" --query path="$WS/qa-f14-intruder-dir" --expect 422
   test ! -e "$WS/qa-f14-intruder.txt" && test ! -e "$WS/qa-f14-intruder-dir"
@@ -475,8 +504,9 @@ Preconditions:
   `WS`, a sibling directory sharing `WS2`'s prefix, and a relative path are all
   `422 path must be inside the conversation workspace` (the dependency runs
   before the handler, so a relative path is 422 here, not 400); the refused
-  upload and directory never appear. The global route serves the same
-  symlinked path with 200.
+  upload and directory never appear. The guard resolves the path rather than
+  refusing every `..`: `$WS/qa-f14-up/../qa-f14-agent.txt` through `CID`'s
+  own scope is 200. The global route serves the same symlinked path with 200.
 - **Unknown or malformed conversation (`F14.scoped-conversation-errors`).**
   ```sh
   control-agent-server api GET /api/conversations/00000000-0000-4000-8000-00000000f14b/file/download --query path="$WS/qa-f14-agent.txt" \
@@ -513,6 +543,45 @@ Preconditions:
   is against the empty tree and lists the agent's `qa-f14-agent.txt` as a new
   file; the `tar.gz` holds it and the uploaded blob. Archiving the fixture
   repo or another workspace through this scope is 422.
+- **SDK workspace (`F14.sdk-workspace`).** `RemoteWorkspace.file_upload` and
+  `file_download`, first on the host (`/api/file/...`), then scoped to `CID`
+  (`runtime_conversation_id`, `/api/conversations/{id}/file/...`).
+  ```sh
+  cat > "$F/sdk_files.py" <<'PY'
+  import os
+  import sys
+  from pathlib import Path
+  from uuid import UUID
+
+  from openhands.sdk.workspace.remote.base import RemoteWorkspace
+
+  fixtures, ws, cid = Path(sys.argv[1]), Path(sys.argv[2]), UUID(sys.argv[3])
+  host, key = os.environ["AGENT_SERVER_URL"], os.environ["SESSION_API_KEY"]
+  blob = (fixtures / "blob.bin").read_bytes()
+  plain = RemoteWorkspace(host=host, api_key=key, working_dir=str(fixtures))
+  scoped = RemoteWorkspace(host=host, api_key=key, working_dir=str(ws), runtime_conversation_id=cid)
+  for name, w, remote in (
+      ("plain", plain, fixtures / "sdk" / "blob.bin"),
+      ("scoped", scoped, ws / "qa-f14-sdk" / "blob.bin"),
+  ):
+      up = w.file_upload(fixtures / "blob.bin", remote)
+      assert up.success and up.error is None, (name, up)
+      assert remote.read_bytes() == blob, name
+      local = fixtures / f"sdk-{name}.out"
+      down = w.file_download(remote, local)
+      assert down.success and down.file_size == len(blob), (name, down)
+      assert local.read_bytes() == blob, name
+  refused = scoped.file_upload(fixtures / "v2.txt", fixtures / "sdk-outside.txt")
+  assert not refused.success and "422" in (refused.error or ""), refused
+  assert not (fixtures / "sdk-outside.txt").exists()
+  print("SDK_FILES_OK")
+  PY
+  control-agent-server exec --expect-output SDK_FILES_OK --save F14.sdk-workspace/program -- .venv/bin/python "$F/sdk_files.py" "$F" "$WS" "$CID"
+  ```
+  Both workspaces upload the blob (the file on disk matches) and download it
+  back byte for byte; the scoped workspace's upload outside `WS` returns
+  `success=False` with the 422 in `error` (the SDK swallows HTTP errors into
+  the result) and writes nothing.
 - **Restart (`F14.restart`).** Restart the server and read everything back.
   ```sh
   control-agent-server restart
@@ -533,7 +602,7 @@ Preconditions:
   `CID2`), and `doctor` is ok.
 - **Init-time conversations path (`F14.trajectory-init-path`), known bug.**
   A second server starts dormant;
-  `POST /api/init` (authenticated with that run's secret key in
+  `POST /api/init` (`--auth init` sends that run's secret key in
   `X-Init-API-Key`) moves its conversations to a fixture directory. The trap
   stops the second server even when an assertion fails; its evidence stays in
   its own run directory.
@@ -542,13 +611,15 @@ Preconditions:
   trap 'control-agent-server stop --run "$B" > /dev/null' EXIT
   BP="$B/fixtures/qa-f14-conversations"
   mkdir -p "$BP"
-  control-agent-server api POST /api/init --run "$B" --header "X-Init-API-Key: $(cat "$B/private/secret_key")" \
+  control-agent-server api POST /api/init --run "$B" --auth init \
     --json "{\"conversations_path\": \"$BP\"}" --expect 200 --check state eq ready
   control-agent-server llm preset deepseek --run "$B"
   BCID=$(control-agent-server conversation start --run "$B" --tools file_editor --no-autotitle --print-id)
   test -d "$BP/$(printf '%s' "$BCID" | tr -d -)"
   control-agent-server api GET "/api/conversations/$BCID" --run "$B" --expect 200 --check id eq "$BCID"
   control-agent-server api GET "/api/file/download-trajectory/$BCID" --run "$B" --expect 200 --save F14.trajectory-init-path/global
+  control-agent-server api GET "/api/conversations/$BCID/file/download-trajectory/$BCID" --run "$B" --expect 200 \
+    --save F14.trajectory-init-path/scoped
   ```
   The conversation is persisted under the init-time path and `GET` finds it,
   but both trajectory routes answer `404 Conversation not found`:
@@ -587,11 +658,25 @@ Preconditions:
   `origin/<branch>`, the merge base, or the empty tree, so a remote-less
   repository gives a full-repository patch unless `base_ref=HEAD`; a detached
   HEAD uses `HEAD`.
-- Header values such as `X-Archive-Repo-Root` are percent-encoded. `api`
-  records only `content-type`, `content-disposition`, `content-length`,
-  `location` and `set-cookie`, so the recipes read `X-Archive-*` with
-  `exec ... curl`. `api --query` keeps one value per key, so a repeated
-  `exclude=a&exclude=b` also needs `exec ... curl`.
+- The repository identity headers (`X-Archive-Repo-Root`, `-Branch`,
+  `-Head-Commit`, `-Repo-Remote`) are sent only when the archived directory
+  itself holds `.git`; archiving a subdirectory of a repository returns the
+  `X-Archive-Base-*` headers but no identity headers.
+- Header values such as `X-Archive-Repo-Root` are percent-encoded.
+  `api --check-header` asserts on any response header (the saved exchange
+  keeps only a few unless `--all-headers` is given), and repeated `--query`
+  flags keep every value, so `exclude=a&exclude=b` is two `--query exclude=`
+  flags.
+- git discovery walks up from `path`. If any ancestor of the runs home is a
+  repository (a conversation whose workspace was `/tmp` leaves `/tmp/.git`,
+  because the server `git init`s workspaces that are not inside a repo), a
+  plain directory is "inside a repo": `git-delta` of it answers 200 with a
+  patch relative to that ancestor, and the server skips `git init` for new
+  workspaces, so scoped patches carry long ancestor-relative paths. The
+  preconditions therefore restart the run with
+  `GIT_CEILING_DIRECTORIES=<run>` and check that `CID`'s workspace got its own
+  `.git`; drop that line only on a machine with no repository above the runs
+  home.
 - The archive's temp file is created in `path`'s parent directory (the system
   temp directory when the parent is not writable) and removed after the
   response; for a scoped archive of the workspace root it lives outside the
@@ -609,9 +694,6 @@ Preconditions:
   views are downloads, listings, archives and the disk.
 - On a deferred-init server every route here is 503 until `POST /api/init`
   (the deferred-init family owns that gate).
-- Under the default runs home (`/tmp/agent-server-verify`), a run name of seven
-  or more characters, including `map run --fresh`'s `map-f14`, pushes the
-  per-conversation tmux socket under `<run>/tmux/` past the 107-byte Unix
-  socket path limit, and starting a conversation with the terminal tool fails
-  with 500 (`File name too long`). This family therefore gives its agent only
-  `file_editor`.
+- The agent gets only `file_editor` (`conversation start --tools file_editor`),
+  so the family needs no `tmux`; the model's one job is to write
+  `qa-f14-agent.txt`, which the scoped download and archives then read.

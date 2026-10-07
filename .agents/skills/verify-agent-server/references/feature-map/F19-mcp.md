@@ -10,11 +10,15 @@ the server's `auth.state`. Credentials (`env`, `headers`, `auth` values and
 OAuth tokens) are redacted in responses, encrypted on disk and decrypted again
 before a connection. Conversations started from these settings connect to every
 enabled server and expose its tools to the agent; disabled servers stay stored
-but are never spawned.
+but are never spawned. When a conversation refreshes an expired OAuth token,
+the rotated tokens are written back into the stored server, or, for a server
+passed inline on the agent, posted to the app server's webhook.
 
 Source: `openhands-agent-server/openhands/agent_server/mcp_router.py`, `openhands-agent-server/openhands/agent_server/mcp_oauth_store.py`, `openhands-agent-server/openhands/agent_server/settings_router.py`, `openhands-agent-server/openhands/agent_server/_secrets_exposure.py`, `openhands-sdk/openhands/sdk/mcp/`, `openhands-sdk/openhands/sdk/settings/api_models.py`, `openhands-sdk/openhands/sdk/utils/redact.py`, `openhands-sdk/openhands/sdk/workspace/remote/base.py`, `clients/typescript/src/client/mcp-client.ts`, `clients/typescript/src/client/settings-client.ts`
 
 Needs: `llm`
+
+Launch: `--webhook-sink`
 
 Routes: `POST /api/mcp/test`, `POST /api/mcp/oauth/start`,
 `GET /api/mcp/oauth/status/{job_id}`, `POST /api/mcp/oauth/callback/{job_id}`,
@@ -36,17 +40,21 @@ Routes: `POST /api/mcp/test`, `POST /api/mcp/oauth/start`,
 - `F19.test-timeout`: a stdio server that never completes the handshake yields `ok: false`, `error_kind: timeout` close to the requested `timeout`, and its process is killed.
 - `F19.test-validation`: a missing server, an empty command, an unknown transport, a `timeout` outside (0, 120], top-level `authentication` and `auth` next to an `Authorization` header are 422.
 - `F19.test-encrypted-env`: `env` values encrypted by the settings API are decrypted before the stdio server starts, and the child does not inherit the agent server's own keys.
-- `F19.test-remote-bearer`: a streamable-HTTP server behind a bearer token connects with `auth.strategy: bearer` or an `Authorization` header (also as `type: shttp`), and a wrong token answers `ok: false`.
+- `F19.test-remote-bearer`: a streamable-HTTP server behind a bearer token connects with `auth.strategy: bearer`, an `Authorization` header (also as `type: shttp`) or `auth.strategy: header`, and a wrong token answers `ok: false`.
 - `F19.oauth-start-errors`: OAuth start is 400 for a stdio or non-oauth2 server, reports `ok: false` with a failed job for an unreachable server (whose callback is then 409), and finishes without consent for a server that needs no OAuth.
 - `F19.oauth-unknown-job`: status and callback for an unknown job id are 404, and a callback without `callback_url` is 422.
 - `F19.oauth-flow`: against a local OAuth-protected MCP server, start returns an `authorization_url`, status reports `authorizing` and `callback_ready`, and submitting the browser's redirect URL completes the job with tools, the tool result and an encrypted `oauth_state`.
-- `F19.oauth-callback-replay`: submitting a callback again after the job finished answers the job's status or 409, not 500, and the job stays `succeeded`.
+- `F19.oauth-callback-replay`: submitting a callback again after the job finished answers the job's status or a client error (4xx), not 500, and the job stays `succeeded`.
 - `F19.oauth-callback-bad-port`: a callback URL with a port outside 0-65535 is rejected with 400, not 500.
 - `F19.oauth-callback-validation`: on a live job, an https URL, a foreign host, another port or another path is 400 and the job keeps waiting; the redirect URL with `127.0.0.1` instead of `localhost` completes it.
+- `F19.oauth-consent-denied`: submitting the redirect a provider sends when the user denies consent (`error=access_denied`) answers `ok: false` and fails the job without tokens.
 - `F19.oauth-consent-timeout`: a consent that is not completed within the job's `timeout` fails the job with `error_kind: timeout`.
+- `F19.oauth-inline-writeback`: an OAuth server passed inline on a conversation's agent (not in settings) whose access token has expired is refreshed when the conversation connects, keeps its tools, and the rotated tokens are posted with the run's session key to the webhook's `/mcp-oauth-state`, not stored in settings.
 - `F19.oauth-stored-state`: the returned `oauth_state` used as `auth.state` connects without consent (test, and start without `authorization_url`), and stored through the settings route it is redacted, encrypted on disk and decrypted to the real token.
 - `F19.disabled-server`: a conversation started from the settings exposes the tools of enabled servers (including the OAuth server from its stored tokens) and neither exposes nor spawns a disabled server.
 - `F19.conversation-tool`: a model-driven conversation calls the configured stdio server's `qa_echo` tool, the `ObservationEvent` (REST and WebSocket) carries `QA_MCP_ECHO:hi`, and deleting the conversation stops the stdio child.
+- `F19.oauth-refresh-writeback`: when a stored OAuth server's access token has expired, the next conversation refreshes it, keeps the server's tools, and writes the rotated token and new expiry back into the settings (encrypted on disk) without posting them to the webhook.
+- `F19.conversation-secrets-at-rest`: a conversation started from the settings persists its agent's MCP credentials (a disabled server's `env`, OAuth tokens) encrypted, and no MCP credential this family used appears in plaintext under the conversations directory or in the server log.
 - `F19.restart`: stored MCP servers and their credentials survive a restart (plaintext GET and the SDK's `RemoteWorkspace.get_mcp_config()`), while in-memory OAuth jobs are gone (404).
 
 ## How to get to it (agent POV)
@@ -67,8 +75,16 @@ Routes: `POST /api/mcp/test`, `POST /api/mcp/oauth/start`,
   `auth.state` through the settings route.
 - Conversations: `POST /api/conversations` with `agent_settings` from
   `GET /api/settings` (what `conversation start` and Agent Canvas do) carries
-  `mcp_config`; the server connects at conversation creation and lists the MCP
-  tools in the first `SystemPromptEvent`.
+  `mcp_config`; the server connects to the enabled servers when the agent
+  initializes (on the first message, queued or run) and lists the MCP tools in
+  the first `SystemPromptEvent`.
+- Token refresh during a conversation (no route): the server's MCP tool
+  provider serves FastMCP's OAuth client from the stored `auth.state` and
+  writes refreshed tokens back into the settings; for an OAuth server passed
+  inline on the agent it keeps them in memory and POSTs
+  `{"server_url", "oauth_state"}` with `X-Session-API-Key` to every configured
+  webhook's `<base_url>/mcp-oauth-state`, so the app server can persist them
+  (driven with `launch --webhook-sink` and `sink read`).
 - SDK: `RemoteWorkspace.get_mcp_config()` reads the stored servers with
   plaintext credentials (exercised in `F19.restart` through `exec`).
 - TypeScript client: `MCPClient.testServer`, `startOAuth`, `getOAuthStatus`,
@@ -82,9 +98,11 @@ Routes: `POST /api/mcp/test`, `POST /api/mcp/oauth/start`,
 
 Preconditions:
 
-- A run launched with default flags (`launch --new`), `doctor` ok,
-  `$DEEPSEEK_API_KEY` set (only `F19.conversation-tool` uses the model), and
-  `jq`, `curl` and `pgrep` on `PATH`.
+- A run launched with a recording webhook sink (`launch --new --webhook-sink`,
+  the family's `Launch:` flags; only `F19.oauth-inline-writeback` and
+  `F19.oauth-refresh-writeback` read it), `doctor` ok, `$DEEPSEEK_API_KEY` set
+  (only `F19.conversation-tool` uses the model), and `jq`, `curl` and `pgrep`
+  on `PATH`.
 - The CLI's stdio fixture (`fixture mcp-server`, tool `qa_echo`) plus three
   recipe-local fixtures written below (no CLI verb exists for them): a stdio
   server with `qa_env`, `qa_sleep` and `qa_fail` whose first argument delays
@@ -278,8 +296,8 @@ Preconditions:
   ```
   Every body is 422 (the settings routes take `transport`, not the test
   route's legacy `type`) and `qa-bad` never appears.
-- **No credentials in validation errors (`F19.settings-validation-redaction`),
-  known bug.** The 422 handler runs every error's `input` through
+- **No credentials in validation errors (`F19.settings-validation-redaction`), known bug.**
+  The 422 handler runs every error's `input` through
   `sanitize_dict`, which redacts `headers` and `env` maps and keys that look
   secret, but the MCP credential's field is called `value`, so a bearer or
   api_key token comes back verbatim. The correct behavior asserted here is
@@ -293,14 +311,15 @@ Preconditions:
     --check . not-contains QA_F19_HDR --check . not-contains QA_F19_AUTH_VALUE
   ```
   Today the header shows as `<redacted>` and `detail[0].input.auth.value` is
-  `QA_F19_AUTH_VALUE`, so the second check fails on the first command.
-- **Server with neither command nor url (`F19.settings-empty-server`), known
-  bug.** `MCPServer` only requires `command` or `url` once `transport` is set,
+  `QA_F19_AUTH_VALUE`, so the second check fails on the first command; the
+  connection test route echoes the same `auth.value` in its 422.
+- **Server with neither command nor url (`F19.settings-empty-server`), known bug.**
+  `MCPServer` only requires `command` or `url` once `transport` is set,
   so `{}` is stored as `{"enabled": true}` with 201. While it exists, every new
   conversation's MCP configuration fails validation as a whole and the agent
   gets no MCP tools at all, only a `MCP server startup failed ... continuing
   without its tools` warning in the log (reproduced with a valid stdio server
-  next to it). The correct behavior asserted is 422; the else branch removes
+  next to it). The correct behavior asserted is 422; the failure branch removes
   the stored entry so later bullets are unaffected.
   ```sh
   if ! control-agent-server api POST /api/settings/mcp/qa-empty --json '{}' --expect 422 --save F19.settings-empty-server/create; then
@@ -330,11 +349,13 @@ Preconditions:
   control-agent-server api PATCH /api/settings/mcp/qa-f19-nope --json '{"enabled":false}' --expect 404 \
     --check detail eq "MCP server 'qa-f19-nope' was not found" --save F19.settings-patch/unknown
   control-agent-server api GET /api/settings --check agent_settings.mcp_config.qa-remote.url eq https://example.invalid/mcp \
-    --check agent_settings.mcp_config.qa-f19-nope missing
+    --check agent_settings.mcp_config.qa-remote.enabled eq true \
+    --check agent_settings.mcp_config.qa-f19-nope missing --save F19.settings-patch/get-after-errors
   ```
   The first patch keeps url and headers; the header patch removes only `X-QA`
   and adds `X-New` while `Authorization` survives; `enabled: null` brings back
-  `true`; the three bad patches change nothing and the 404 creates nothing.
+  `true` (also on the final read); the three bad patches change nothing and
+  the 404 creates nothing.
 - **Delete one server (`F19.settings-delete`).** A sibling with an `env`
   credential, then delete both.
   ```sh
@@ -383,13 +404,13 @@ Preconditions:
     --expect 200 --check ok eq true --check tool_result.is_error eq true --check tool_result.text contains QA_MCP_FAIL --save F19.test-tool-errors/raises
   control-agent-server api POST /api/mcp/test --json "$(jq -nc --argjson s "$TOOLS_SRV" '{server: $s, timeout: 30, tool_call: {name: "qa_nope"}}')" \
     --expect 200 --check ok eq true --check tool_result.is_error eq true --check tool_result.text contains 'not advertised by server'
-  control-agent-server api POST /api/mcp/test --timeout 20 --save F19.test-tool-errors/slow-tool \
+  control-agent-server api POST /api/mcp/test --timeout 20 --expect-max-ms 15000 --save F19.test-tool-errors/slow-tool \
     --json "$(jq -nc --argjson s "$TOOLS_SRV" '{server: $s, timeout: 3, tool_call: {name: "qa_sleep", arguments: {seconds: 30}}}')" \
     --expect 200 --check ok eq true --check tool_result.is_error eq true --check tool_result.text contains 'timed out after 3.0 seconds'
   ```
   `ok` stays `true` in all three because the server connected and listed; the
   slow call is cut at the request's `timeout` (the whole request takes about 6
-  seconds, well inside the CLI's 20-second bound).
+  seconds; `--expect-max-ms` fails it if the 30-second sleep ran out).
 - **Connection failures (`F19.test-connect-failures`).** Always HTTP 200.
   ```sh
   control-agent-server api POST /api/mcp/test --json '{"name":"qa-bad","server":{"command":"/nonexistent/qa-f19-bin"},"timeout":10}' --expect 200 \
@@ -405,13 +426,15 @@ Preconditions:
 - **Handshake timeout (`F19.test-timeout`).** The tools fixture sleeps 60
   seconds before speaking MCP; the request allows 3.
   ```sh
-  control-agent-server api POST /api/mcp/test --timeout 20 --expect 200 --save F19.test-timeout/slow-start \
+  T0=$SECONDS
+  control-agent-server api POST /api/mcp/test --timeout 20 --expect 200 --expect-max-ms 12000 --save F19.test-timeout/slow-start \
     --json "$(jq -nc --arg py "$PY" --arg s "$F19/qa_f19_tools.py" '{name: "qa-slow", server: {command: $py, args: [$s, "60"]}, timeout: 3}')" \
     --check ok eq false --check error_kind eq timeout --check error contains 'timed out after 3.0 seconds'
+  test $((SECONDS - T0)) -ge 3
   if pgrep -fx "$PY $F19/qa_f19_tools.py 60"; then echo 'the slow stdio child survived the timeout'; exit 1; fi
   ```
-  The answer arrives in about 5 seconds with `error_kind: timeout`, and the
-  sleeping child is gone.
+  The answer arrives after at least 3 and well under 12 seconds (about 5)
+  with `error_kind: timeout`, and the sleeping child is gone.
 - **Encrypted env from settings (`F19.test-encrypted-env`).** Store a server
   with an `env` credential, take its ciphertext the way Agent Canvas does
   (`X-Expose-Secrets: encrypted`) and test with it.
@@ -438,12 +461,17 @@ Preconditions:
   control-agent-server api POST /api/mcp/test --expect 200 \
     --json "{\"server\":{\"type\":\"shttp\",\"url\":\"http://127.0.0.1:$BEARER_PORT/mcp\",\"headers\":{\"Authorization\":\"Bearer qa-f19-bearer\"}},\"timeout\":20}" \
     --check ok eq true --check tools contains read_subject
+  control-agent-server api POST /api/mcp/test --expect 200 \
+    --json "{\"server\":{\"transport\":\"http\",\"url\":\"http://127.0.0.1:$BEARER_PORT/mcp\",\"auth\":{\"strategy\":\"header\",\"headers\":{\"Authorization\":\"Bearer qa-f19-bearer\"}}},\"timeout\":20}" \
+    --check ok eq true --check tools contains read_subject
   control-agent-server api POST /api/mcp/test --expect 200 --save F19.test-remote-bearer/wrong-token \
     --json "{\"server\":{\"transport\":\"http\",\"url\":\"http://127.0.0.1:$BEARER_PORT/mcp\",\"auth\":{\"strategy\":\"bearer\",\"value\":\"qa-f19-wrong\"}},\"timeout\":20}" \
     --check ok eq false --check error contains 401
   ```
-  The right token works through `auth` and through a plain header (with the
-  legacy `shttp` alias); the wrong one answers `ok: false` naming the 401.
+  The right token works through `auth.strategy: bearer`, through a plain
+  header (with the legacy `shttp` alias) and through `auth.strategy: header`
+  (the form the 422 for `auth` plus an `Authorization` header recommends);
+  the wrong one answers `ok: false` naming the 401.
 - **OAuth start refusals and early outcomes (`F19.oauth-start-errors`).**
   ```sh
   control-agent-server api POST /api/mcp/oauth/start --json "$(jq -nc --argjson s "$MCP" '{server: $s}')" --expect 400 \
@@ -501,9 +529,9 @@ Preconditions:
   URL with `httpx` without handling the connection error, so a second submit
   (or a submit after the browser already reached the callback itself) is a 500
   `All connection attempts failed`. The correct behavior asserted is a handled
-  answer (the job's status, or 409) and an unchanged job.
+  answer (the job's status, or a 4xx such as 409) and an unchanged job.
   ```sh
-  control-agent-server api POST "/api/mcp/oauth/callback/$J" --json "$(jq -nc --arg u "$CALLBACK" '{callback_url: $u}')" --expect 200,409 --save F19.oauth-callback-replay/replay
+  control-agent-server api POST "/api/mcp/oauth/callback/$J" --json "$(jq -nc --arg u "$CALLBACK" '{callback_url: $u}')" --expect 200,4xx --save F19.oauth-callback-replay/replay
   control-agent-server api GET "/api/mcp/oauth/status/$J" --check status eq succeeded
   ```
   Today the first command gets 500. The same 500 (with an empty message) is
@@ -511,13 +539,21 @@ Preconditions:
 - **Port out of range (`F19.oauth-callback-bad-port`), known bug.**
   `_validate_callback_url` reads `urlparse(...).port`, which raises
   `ValueError` for `99999` or a non-numeric port; the route lets it escape as
-  500. The correct behavior asserted is 400 like every other malformed URL.
+  500. The bullet uses its own job that is waiting for consent, so only the
+  URL check is under test. The correct behavior asserted is 400 like every
+  other malformed URL, with the job still waiting.
   ```sh
-  control-agent-server api POST "/api/mcp/oauth/callback/$J" --json '{"callback_url":"http://localhost:99999/callback?code=x"}' --expect 400 --save F19.oauth-callback-bad-port/port-99999
-  control-agent-server api POST "/api/mcp/oauth/callback/$J" --json '{"callback_url":"http://localhost:abc/callback?code=x"}' --expect 400
+  JB=$(control-agent-server api POST /api/mcp/oauth/start --json "$(jq -nc --argjson s "$OAUTH_SRV" '{server: $s, timeout: 30}')" \
+    --check authorization_url exists --field job_id)
+  control-agent-server api GET "/api/mcp/oauth/status/$JB" --check callback_ready eq true --until-ok 20
+  control-agent-server api POST "/api/mcp/oauth/callback/$JB" --json '{"callback_url":"http://localhost:99999/callback?code=x"}' --expect 400 --save F19.oauth-callback-bad-port/port-99999
+  control-agent-server api POST "/api/mcp/oauth/callback/$JB" --json '{"callback_url":"http://localhost:abc/callback?code=x"}' --expect 400
+  control-agent-server api GET "/api/mcp/oauth/status/$JB" --check status eq authorizing
   ```
-  Today both are 500 (`Port out of range 0-65535`,
-  `Port could not be cast to integer value as 'abc'`).
+  Today both posts are 500 (`Port out of range 0-65535`,
+  `Port could not be cast to integer value as 'abc'`) although the job keeps
+  waiting; port `0` and other in-range ports already get the 400
+  `Unexpected OAuth callback URL`.
 - **Callback URL checks on a live job (`F19.oauth-callback-validation`).** A
   fresh job, four wrong URLs, then the right one with `127.0.0.1`.
   ```sh
@@ -535,24 +571,84 @@ Preconditions:
   control-agent-server api POST "/api/mcp/oauth/callback/$JV" --json '{"callback_url":"http://localhost:1/callback?code=x"}' --expect 400 \
     --check detail eq 'Unexpected OAuth callback URL'
   control-agent-server api GET "/api/mcp/oauth/status/$JV" --check status eq authorizing
-  control-agent-server api POST "/api/mcp/oauth/callback/$JV" --json "$(jq -nc --arg u "$(echo "$VCB" | sed 's#//localhost:#//127.0.0.1:#')" '{callback_url: $u}')" \
+  VCB_IP=$(echo "$VCB" | sed 's#//localhost:#//127.0.0.1:#')
+  VBODY=$(jq -nc --arg u "$VCB_IP" '{callback_url: $u}')
+  control-agent-server api POST "/api/mcp/oauth/callback/$JV" --json "$VBODY" \
     --expect 200 --check ok eq true --save F19.oauth-callback-validation/loopback-ip
   control-agent-server api GET "/api/mcp/oauth/status/$JV" --check status eq succeeded --until-ok 30
   ```
   The scheme and host checks answer `Invalid OAuth callback URL`, the port
   and path checks `Unexpected OAuth callback URL`; none of them disturbs the
   waiting job, and the loopback IP form completes it.
+- **Denied consent (`F19.oauth-consent-denied`).** The fixture's provider
+  approves everything, so the recipe plays a provider that refused: it keeps
+  the probe's callback port and `state` from the real redirect and replaces
+  the code with `error=access_denied`, as a provider does when the user
+  clicks "Deny".
+  ```sh
+  JDN=$(control-agent-server api POST /api/mcp/oauth/start --json "$(jq -nc --argjson s "$OAUTH_SRV" '{server: $s, timeout: 60}')" \
+    --check authorization_url exists --field job_id)
+  control-agent-server api GET "/api/mcp/oauth/status/$JDN" --check callback_ready eq true --until-ok 20
+  DAU=$(control-agent-server api GET "/api/mcp/oauth/status/$JDN" --field authorization_url)
+  DCB=$(curl -s --noproxy '*' -o /dev/null -w '%{redirect_url}' "$DAU")
+  DSTATE=$(echo "$DCB" | sed -nE 's#.*[?&]state=([^&]*).*#\1#p')
+  test -n "$DSTATE"
+  DENY_URL="$(echo "$DCB" | sed 's#?.*##')?error=access_denied&error_description=QA%20denied&state=$DSTATE"
+  DENY_BODY=$(jq -nc --arg u "$DENY_URL" '{callback_url: $u}')
+  control-agent-server api POST "/api/mcp/oauth/callback/$JDN" --json "$DENY_BODY" --expect 200 --save F19.oauth-consent-denied/callback \
+    --check ok eq false --check status eq failed --check error eq 'OAuth callback returned HTTP 400' --check error_kind eq connection
+  control-agent-server api GET "/api/mcp/oauth/status/$JDN" --until-ok 15 --save F19.oauth-consent-denied/status \
+    --check status eq failed --check ok eq false --check error contains 'Access was denied' --check oauth_state missing --check tools missing
+  ```
+  The callback route reports the probe's callback page answering 400; the job
+  itself then fails with `Client failed to connect: Access was denied by the
+  authorization server.` (`error_kind: connection`) and holds no tokens.
 - **Consent timeout (`F19.oauth-consent-timeout`).** A job with a 4-second
   `timeout` whose authorization URL nobody visits; the probe's own timer is
   under test.
   ```sh
+  T0=$SECONDS
   JT=$(control-agent-server api POST /api/mcp/oauth/start --json "$(jq -nc --argjson s "$OAUTH_SRV" '{server: $s, timeout: 4}')" \
     --check authorization_url exists --field job_id)
+  control-agent-server api GET "/api/mcp/oauth/status/$JT" --check status eq authorizing
   control-agent-server api GET "/api/mcp/oauth/status/$JT" --until-ok 30 --save F19.oauth-consent-timeout/failed \
     --check status eq failed --check ok eq false --check error_kind eq timeout --check error contains 'timed out after 4.0 seconds'
+  test $((SECONDS - T0)) -ge 4
+  test $((SECONDS - T0)) -le 15
   ```
-  About four seconds after start the job is `failed` with `error_kind:
-  timeout`; the user would have to start over.
+  The job waits in `authorizing`, then, between 4 and 15 seconds after start
+  (about four), is `failed` with `error_kind: timeout`; the user would have to
+  start over.
+- **Inline OAuth server refresh (`F19.oauth-inline-writeback`).** The hosted
+  case: the app server passes the OAuth server inline on the agent instead of
+  storing it here. The recipe takes the token set `F19.oauth-callback-validation`
+  obtained (job `JV`), marks it expired (`token_expires_at: 1`, a client-side
+  value: the provider would still accept the token) and starts a conversation
+  with a placeholder model and that server, queueing a prompt without running
+  it so only the MCP connection happens. No server with this URL is in the
+  settings yet.
+  ```sh
+  ISTATE=$(control-agent-server api GET "/api/mcp/oauth/status/$JV" --check oauth_state.tokens.refresh_token exists --field oauth_state)
+  INLINE=$(jq -nc --argjson s "$OAUTH_SRV" --argjson st "$ISTATE" '$s | .auth.state = ($st | .token_expires_at = 1) | .transport = .type | del(.type)')
+  IBODY=$(jq -nc --argjson srv "$INLINE" '{agent_settings: {agent_kind: "openhands", llm: {model: "openai/qa-placeholder", api_key: "qa-placeholder", base_url: "http://127.0.0.1:9/v1", num_retries: 0}, tools: [], mcp_config: {"qa-inline": $srv}}, secrets_encrypted: true}')
+  control-agent-server sink read --path /mcp-oauth-state --expect-max 0
+  ICID=$(control-agent-server conversation start --body-json "$IBODY" --no-autotitle --prompt 'Say hi' --no-run --print-id)
+  control-agent-server api GET "/api/conversations/$ICID/events/search" --query limit=1 --max-chars 300 --until-ok 30 \
+    --check items.0.kind eq SystemPromptEvent --check . contains read_subject --save F19.oauth-inline-writeback/system-prompt
+  IW=$(control-agent-server sink read --path /mcp-oauth-state --contains "\"server_url\": \"http://127.0.0.1:$OAUTH_PORT/mcp\"" \
+    --expect-min 1 --save F19.oauth-inline-writeback/webhook | jq -r .saved)
+  jq -e --argjson now "$(date +%s)" '[.requests[] | select(.headers["X-Session-API-Key"] == "<redacted:session-api-key>")
+    | .body.oauth_state | select(.tokens.access_token and .tokens.refresh_token and .client_info.client_id) | .token_expires_at] | max > $now' "$IW"
+  control-agent-server api GET /api/settings --check agent_settings.mcp_config.qa-inline missing
+  control-agent-server api DELETE "/api/conversations/$ICID" --expect 200
+  ```
+  The conversation lists `read_subject`; the webhook sink, empty for this
+  path before, received `POST /mcp-oauth-state` for the server's URL, carrying
+  this run's session key and an `oauth_state` with new tokens, the client
+  registration and an expiry in the future (the first of the two posts still
+  has the old expiry `1.0`; the second carries the refreshed one). Nothing
+  was stored in the settings. The posted tokens are plaintext: the app server
+  is expected to encrypt what it persists.
 - **Stored OAuth state (`F19.oauth-stored-state`).** Reuse the state from
   `F19.oauth-flow` for a test, a start, and a stored server.
   ```sh
@@ -580,11 +676,14 @@ Preconditions:
   responses and encrypted on disk.
 - **Disabled servers stay off (`F19.disabled-server`).** Store the CLI's
   stdio fixture, disable `qa-env`, and look at a new conversation's tools
-  without running the model.
+  without running the model: the conversation starts with a queued prompt
+  (`--no-run`), because the agent, and with it every MCP connection, is
+  initialized on the first message, not at creation.
   ```sh
   control-agent-server api POST /api/settings/mcp/qa-f19 --json "$MCP" --expect 201
   control-agent-server api PATCH /api/settings/mcp/qa-env --json '{"enabled":false}' --expect 200 --check agent_settings.mcp_config.qa-env.enabled eq false
-  DCID=$(control-agent-server conversation start --tools none --no-autotitle --no-run --print-id)
+  DCID=$(control-agent-server conversation start --tools none --no-autotitle --prompt 'Say hi' --no-run --print-id)
+  control-agent-server api GET "/api/conversations/$DCID" --check execution_status eq idle
   control-agent-server api GET "/api/conversations/$DCID/events/search" --query limit=1 --max-chars 300 --save F19.disabled-server/system-prompt \
     --check items.0.kind eq SystemPromptEvent --check . contains qa_echo --check . contains read_subject --check . not-contains qa_env
   pgrep -fx "$MCP_CMDLINE"
@@ -614,6 +713,66 @@ Preconditions:
   `qa-f19_qa_echo`) carries `QA_MCP_ECHO:hi` in the REST event list and as a
   WebSocket frame, the stdio child exists during the conversation and is gone
   after the delete.
+- **Stored OAuth token refresh (`F19.oauth-refresh-writeback`).** Expire the
+  stored `qa-oauth` token with a sparse patch (client-side expiry only), then
+  let a new conversation connect.
+  ```sh
+  N0=$(control-agent-server sink read --path /mcp-oauth-state --expect-min 1 | jq .requests)
+  control-agent-server api PATCH /api/settings/mcp/qa-oauth --json '{"auth":{"strategy":"oauth2","state":{"token_expires_at":1}}}' --expect 200 \
+    --check agent_settings.mcp_config.qa-oauth.auth.state.tokens.access_token eq '**********'
+  control-agent-server api GET /api/settings --header 'X-Expose-Secrets: plaintext' --save F19.oauth-refresh-writeback/expired \
+    --check agent_settings.mcp_config.qa-oauth.auth.state.token_expires_at eq 1 \
+    --check agent_settings.mcp_config.qa-oauth.auth.state.tokens.access_token eq "$TOKEN" \
+    --check agent_settings.mcp_config.qa-oauth.auth.state.tokens.refresh_token exists \
+    --check agent_settings.mcp_config.qa-oauth.auth.state.client_info.client_id exists
+  RCID=$(control-agent-server conversation start --tools none --no-autotitle --prompt 'Say hi' --no-run --print-id)
+  control-agent-server api GET "/api/conversations/$RCID/events/search" --query limit=1 --max-chars 300 --until-ok 30 \
+    --check items.0.kind eq SystemPromptEvent --check . contains read_subject
+  control-agent-server api GET /api/settings --header 'X-Expose-Secrets: plaintext' --until-ok 15 --save F19.oauth-refresh-writeback/refreshed \
+    --check agent_settings.mcp_config.qa-oauth.auth.state.tokens.access_token ne "$TOKEN" \
+    --check agent_settings.mcp_config.qa-oauth.auth.state.token_expires_at gt "$(date +%s)"
+  TOKEN=$(control-agent-server api GET /api/settings --header 'X-Expose-Secrets: plaintext' --field agent_settings.mcp_config.qa-oauth.auth.state.tokens.access_token)
+  test -n "$TOKEN"
+  control-agent-server state cat home/.openhands/settings.json --not-contains "$TOKEN" \
+    --check agent_settings.mcp_config.qa-oauth.auth.state.tokens.access_token matches '^gAAAA' \
+    --check agent_settings.mcp_config.qa-oauth.auth.state.tokens.refresh_token matches '^gAAAA'
+  N1=$(control-agent-server sink read --path /mcp-oauth-state --save F19.oauth-refresh-writeback/webhook | jq .requests)
+  test "$N1" -eq "$N0"
+  control-agent-server api DELETE "/api/conversations/$RCID" --expect 200
+  ```
+  The patch keeps the tokens and client registration and changes only the
+  expiry. The conversation still lists `read_subject`, and the stored server
+  now holds a different access token with an expiry in the future, encrypted
+  on disk; the webhook received nothing new, because the server is in the
+  settings. `TOKEN` now names the rotated token, which `F19.restart` reads
+  back.
+- **Credentials at rest (`F19.conversation-secrets-at-rest`).**
+  A new conversation from the current settings (`qa-f19`, disabled `qa-env` with its `env` secret, `qa-oauth` with
+  its tokens), then a search of everything the server wrote.
+  ```sh
+  SCID=$(control-agent-server conversation start --tools none --no-autotitle --prompt 'Say hi' --no-run --print-id)
+  control-agent-server api GET "/api/conversations/$SCID/events/search" --query limit=1 --max-chars 300 --until-ok 30 \
+    --check items.0.kind eq SystemPromptEvent --check . contains read_subject
+  control-agent-server state cat base_state.json --conversation "$SCID" --max-chars 300 \
+    --check agent.mcp_config.qa-env.enabled eq false \
+    --check agent.mcp_config.qa-env.env.QA_F19_TOKEN matches '^gAAAA' \
+    --check agent.mcp_config.qa-oauth.auth.state.tokens.access_token matches '^gAAAA' \
+    --check agent.mcp_config.qa-oauth.auth.state.tokens.refresh_token matches '^gAAAA'
+  test "$(control-agent-server state grep qa-oauth --glob 'server/workspace/conversations/**/*' | jq .matches)" -ge 1
+  control-agent-server state grep qa-f19-env-secret --glob 'server/workspace/conversations/**/*' --expect-none
+  control-agent-server state grep "$TOKEN" --glob 'server/workspace/conversations/**/*' --expect-none
+  control-agent-server state grep qa-f19-env-secret --glob 'home/**/*' --expect-none
+  control-agent-server logs --grep 'MCP OAuth authorization URL' --expect-min 1
+  control-agent-server logs --grep 'qa-f19-env-secret|qa-f19-t0k|qa-f19-x|qa-f19-sib|qa-f19-bearer|qa-f19-wrong|QA_F19_AUTH_VALUE|QA_F19_HDR|test_access_token|test_refresh_token' --expect-none
+  control-agent-server api DELETE "/api/conversations/$SCID" --expect 200
+  ```
+  The conversation's `base_state.json` keeps the agent's `mcp_config` with
+  every credential as Fernet ciphertext (the disabled server included), the
+  plaintext env secret and access token are found nowhere under the
+  conversations directory or the run's home (while the server key `qa-oauth`
+  is, so the search sees those files), and none of the header, env, bearer,
+  `auth.value` or OAuth token values used in this family reached the server
+  log (which does hold the OAuth job lines).
 - **Restart (`F19.restart`).** Settings are durable, OAuth jobs are not.
   ```sh
   control-agent-server restart
@@ -650,13 +809,18 @@ Preconditions:
 - `pgrep -f` with a plain substring also matches the `bash -c` that runs the
   recipe (its text contains the pattern): match the whole command line with
   `pgrep -fx`, or anchor with `^`.
+- A conversation connects to its MCP servers lazily: `POST /api/conversations`
+  without `initial_message` spawns nothing and records no events; the first
+  message (even queued with `run: false`) initializes the agent, spawns the
+  stdio children and writes the `SystemPromptEvent` with the MCP tools.
 - With two or more enabled servers, conversation tool names carry the server
   key as a prefix (`qa-f19_qa_echo`); with one server they are bare
   (`qa_echo`). Prompts and `--contains` checks should not depend on which.
 - An unreachable server costs a conversation only its own tools, but a
   configuration that fails validation as a whole (the empty server of
-  `F19.settings-empty-server`) drops every MCP tool with only a log warning:
-  `control-agent-server logs --grep 'MCP server startup failed'`.
+  `F19.settings-empty-server`) drops every MCP tool with only a log warning
+  (`MCP server startup failed for <every key>; continuing without its tools`,
+  wrapped over several log lines, so grep for `MCP server startup`).
 - The settings routes use `transport` (`extra="forbid"`, so the test route's
   legacy `type` is 422 there). A trailing slash on the key path redirects
   (307) and an empty key is 404.
@@ -676,6 +840,19 @@ Preconditions:
 - `oauth_state` is Fernet-encrypted when the server has `OH_SECRET_KEY`
   (every launched run does) and plaintext otherwise; posting it unchanged into
   `auth.state` of the settings route is the intended way to persist it.
+- `auth.state.token_expires_at` is the client's view of the expiry: a past
+  value makes the next connection refresh the token even though the provider
+  would still accept it, which is how the refresh recipes trigger a refresh.
+  A sparse `PATCH` of `{"auth":{"strategy":"oauth2","state":{"token_expires_at":1}}}`
+  deep-merges and keeps the tokens and client registration. The refresh
+  rotates both tokens (the fixture provider revokes the old ones), so a
+  recipe that compares the stored token must re-read it afterwards.
+- Refreshed tokens are written to the settings server whose `url` equals the
+  connection's URL; a server passed inline on the agent matches only when no
+  stored server has the same URL, and its refreshed state goes to the
+  webhooks (`/mcp-oauth-state`, two posts per refresh: tokens, then expiry)
+  in plaintext. Without a webhook in the config it lives only in memory for
+  that conversation.
 - The HTTP fixtures are recipe-local background processes, not CLI fixtures:
   `control-agent-server stop` does not stop them. They exit after 25 minutes,
   60 seconds after the run's `/alive` stops answering, or when the last bullet

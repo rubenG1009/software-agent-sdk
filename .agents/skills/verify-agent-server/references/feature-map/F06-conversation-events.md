@@ -37,20 +37,22 @@ Routes: `GET /api/conversations/{conversation_id}/events/search`,
 - `F06.unknown-event`: an unknown event id returns 404 from get-one and `null` in its slot from batch-get.
 - `F06.batch-get`: `GET .../events` with a JSON array of ids as the body returns those events in request order; no body is a 422.
 - `F06.not-found-auth`: every event route returns 404 for an unknown conversation, 422 for a malformed conversation id and 401 without a valid session key.
-- `F06.send-validation`: a message with an unknown role, string content or an unknown content type is rejected with 422 and nothing is appended.
-- `F06.send-non-user-role`: a message with a schema-valid non-user role (`assistant`) is rejected as a client error (4xx), not a 500.
+- `F06.send-validation`: a missing body, a message with an unknown role, string content or an unknown content type is rejected with 422 and nothing is appended.
+- `F06.send-non-user-role`: a message with a schema-valid non-user role (`assistant`) is rejected as a client error (4xx), not a 500, and leaves no event behind (not even the system prompt of an empty log).
 - `F06.send-run`: `POST .../events` with `run: true` drives a real agent turn to `finished`, persisting the kinds of a normal run (user message, `execution_status` running and finished, `ActionEvent`/`ObservationEvent` pairs, `stats`).
 - `F06.ws-live`: a socket opened before the run receives each event live, every live frame is persisted, and a closing `full_state` snapshot follows the run.
+- `F06.search-timestamp-order`: after a tool-using run, `sort_order=TIMESTAMP` lists events in timestamp order, so a `timestamp__gte` or `resend_mode=since` cut at a listed event keeps every event listed after it.
 - `F06.send-resets-finished`: a message appended to a `finished` conversation sets it back to `idle` with a persisted `execution_status` update.
 - `F06.ws-snapshot`: the first frame after authentication is a transient `full_state` `ConversationStateUpdateEvent` that never appears in search; without `resend_mode` nothing else is replayed.
-- `F06.ws-handshake`: the socket accepts first-frame, deprecated query and deprecated header keys; a wrong first-frame key or no auth frame within 10 s closes with 4001, a wrong deprecated query key is refused at the upgrade (HTTP 403), and an unknown conversation closes with 4004.
+- `F06.ws-handshake`: the socket accepts first-frame, deprecated query and deprecated header keys; a wrong first-frame key, a first frame that is not an auth frame, or no auth frame within 10 s closes with 4001, a wrong deprecated query or header key is refused at the upgrade (HTTP 403), and an unknown conversation closes with 4004.
 - `F06.ws-delete-close`: deleting a conversation closes the sockets that follow it.
 - `F06.ws-replay-all`: `resend_mode=all` (and the deprecated `resend_all=true`) replays the persisted log in search order after the snapshot.
 - `F06.ws-replay-since`: `resend_mode=since` with `after_timestamp` replays exactly the events at or after that timestamp; without `after_timestamp` it replays nothing.
-- `F06.ws-bad-frame`: an invalid inbound frame returns a `ServerErrorEvent` (`ValidationError`, `AssertionError`), appends nothing and leaves the socket open; a redundant auth frame is ignored.
+- `F06.ws-bad-frame`: an invalid inbound frame returns a `ServerErrorEvent` (`ValidationError`, `AssertionError`, `JSONDecodeError` for text that is not JSON), appends nothing and leaves the socket open; a redundant auth frame is ignored.
 - `F06.ws-send`: a user message frame sent on the socket is persisted and runs the agent to `finished`, streaming the run on the same socket.
 - `F06.restart-persist`: event ids, order and count survive a server restart, the socket replays the same log, and new messages append after it.
 - `F06.send-run-limit`: with every run slot taken, `POST .../events` with `run: true` returns 429 `Message saved...` and the message is persisted; a socket send gets a `ConversationRunLimitExceeded` `ServerErrorEvent`.
+- `F06.send-while-running`: `POST .../events` with `run: true` on a conversation that is already running returns 200 (not the 409 of `POST /run`), persists the message, keeps the conversation `running` and starts no second run.
 
 ## How to get to it (agent POV)
 
@@ -60,8 +62,9 @@ Routes: `GET /api/conversations/{conversation_id}/events/search`,
   to `false`. The Python SDK `RemoteConversation.send_message()` and the
   TypeScript `RemoteConversation.sendMessage()` always send `run: false` and
   then call `POST /run` separately; `ConversationClient.sendEvent()` posts the
-  body as given. Recipes drive the route directly (`api POST`) and through
-  `conversation send`.
+  body as given. Recipes drive the route directly (`api POST`), so the body
+  and the status are exactly what a client sends and sees; the CLI's
+  `conversation send` wraps the same route for other families.
 - REST: `GET .../events/search` (query `page_id`, `limit` 1 to 100,
   `kind`, `source`, `body`, `sort_order` `TIMESTAMP|TIMESTAMP_DESC`,
   `timestamp__gte`, `timestamp__lt`) and `GET .../events/count` (same filters
@@ -97,9 +100,10 @@ Preconditions:
   naive event timestamps are UTC) is live and exported, and `doctor` is ok.
 - `$DEEPSEEK_API_KEY` is set; the preset makes `deepseek-flash` the active
   profile, which `conversation start` copies into each conversation.
-- `CID` is a conversation with no tools and no autotitle, created without a
-  message, so its log is empty and fully deterministic until the
-  `F06.ws-send` bullet runs the agent on it.
+- `CID` is a conversation with no autotitle and `--tools none` (only the
+  built-in `finish` and `think` tools), created without a message, so its
+  log is empty and fully deterministic until the `F06.ws-send` bullet runs
+  the agent on it.
 
   ```sh
   control-agent-server llm preset deepseek
@@ -144,11 +148,16 @@ Preconditions:
     --check items.0.id eq "$LAST" --check next_page_id exists --save F06.search-page/desc
   control-agent-server api GET "/api/conversations/$CID/events/search" --query limit=2 --query page_id=qa-unknown-page \
     --expect 200 --check items.0.id eq "$E0"
+  ASC_REVERSED=$(control-agent-server api GET "/api/conversations/$CID/events/search" --field items | jq -c '[.[].id] | reverse')
+  DESC_IDS=$(control-agent-server api GET "/api/conversations/$CID/events/search" --query sort_order=TIMESTAMP_DESC \
+    --field items | jq -c '[.[].id]')
+  test "$ASC_REVERSED" = "$DESC_IDS"
   ```
   `next_page_id` names the first event of the next page (the cursor is
   inclusive), the third page has the last event and no `next_page_id`,
-  descending order starts at the newest event, and an unknown cursor silently
-  starts again at the first event.
+  descending order is exactly the ascending log reversed (starting at the
+  newest event), and an unknown cursor silently starts again at the first
+  event.
 - **Bad search parameters (`F06.search-validation`).**
   ```sh
   control-agent-server api GET "/api/conversations/$CID/events/search" --query limit=0 --expect 422 --check detail.0.loc contains limit
@@ -260,16 +269,19 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$QA_UNKNOWN/events" --json "[\"$E2\"]" --expect 404
   control-agent-server api POST "/api/conversations/$QA_UNKNOWN/events" --json '{"content":[{"type":"text","text":"QA_F06_X"}]}' --expect 404
   control-agent-server api GET /api/conversations/qa-not-a-uuid/events/search --expect 422 --check detail.0.loc contains conversation_id
+  control-agent-server api POST /api/conversations/qa-not-a-uuid/events --json '{"content":[{"type":"text","text":"QA_F06_X"}]}' \
+    --expect 422 --check detail.0.loc contains conversation_id
   control-agent-server api GET "/api/conversations/$CID/events/search" --auth none --expect 401 --save F06.not-found-auth/no-key
   control-agent-server api GET "/api/conversations/$CID/events/count" --auth bad --expect 401
   control-agent-server api GET "/api/conversations/$CID/events/$E2" --auth none --expect 401
+  control-agent-server api GET "/api/conversations/$CID/events" --json "[\"$E2\"]" --auth bad --expect 401
   control-agent-server api POST "/api/conversations/$CID/events" --auth none \
     --json '{"content":[{"type":"text","text":"QA_F06_NOAUTH"}]}' --expect 401
   control-agent-server api GET "/api/conversations/$CID/events/count" --check . eq 5
   ```
   404 `Conversation not found: <id>` on all five routes, 422 for a non-UUID
-  id, 401 without or with a wrong key, and the unauthenticated POST stored
-  nothing.
+  id on the read and the write router, 401 without or with a wrong key on
+  all five, and the unauthenticated POST stored nothing.
 - **Message validation (`F06.send-validation`).**
   ```sh
   control-agent-server api POST "/api/conversations/$CID/events" \
@@ -279,9 +291,11 @@ Preconditions:
     --check detail.0.loc contains content
   control-agent-server api POST "/api/conversations/$CID/events" \
     --json '{"content":[{"type":"qa-unknown","text":"QA_F06_BADTYPE"}]}' --expect 422
+  control-agent-server api POST "/api/conversations/$CID/events" --expect 422 --check detail.0.loc contains body
   control-agent-server api GET "/api/conversations/$CID/events/count" --check . eq 5
   ```
-  `content` must be a list of text or image items; nothing was appended.
+  `content` must be a list of text or image items and the body is
+  required; nothing was appended.
 - **Non-user role (`F06.send-non-user-role`), known bug.** `role` accepts
   `user`, `system`, `assistant` and `tool` in the schema, but a conversation
   only takes user messages.
@@ -290,12 +304,20 @@ Preconditions:
     --json '{"role":"assistant","content":[{"type":"text","text":"QA_F06_ASSISTANT"}]}' --expect 4xx \
     --save F06.send-non-user-role/assistant
   control-agent-server api GET "/api/conversations/$CID/events/count" --check . eq 5
+  QA_ROLE=$(control-agent-server conversation start --no-autotitle --tools none --print-id)
+  control-agent-server api POST "/api/conversations/$QA_ROLE/events" \
+    --json '{"role":"assistant","content":[{"type":"text","text":"QA_F06_ASSISTANT"}]}' --expect 4xx \
+    --save F06.send-non-user-role/assistant-empty-log
+  control-agent-server api GET "/api/conversations/$QA_ROLE/events/count" --check . eq 0 \
+    --save F06.send-non-user-role/empty-log-count
   ```
   Correct behavior: a 4xx client error and nothing appended. Today it is 500
   `{"exception": "Only user messages are allowed to be sent to the agent."}`:
   `LocalConversation.send_message` asserts `role == "user"` and the
-  `AssertionError` reaches the catch-all handler. Nothing is appended (the
-  count check passes).
+  `AssertionError` reaches the catch-all handler. On `CID` nothing is
+  appended, but the assert runs after the agent is initialized, so on a
+  conversation with an empty log the refused message still writes the
+  `SystemPromptEvent` (count 1, not 0).
 - **First frame is a state snapshot (`F06.ws-snapshot`).**
   ```sh
   control-agent-server ws listen "/sockets/events/$CID" --count 1 --until-kind ConversationStateUpdateEvent \
@@ -312,19 +334,27 @@ Preconditions:
   first-frame timeout is the server's own timer, so one capture waits for it.
   ```sh
   control-agent-server ws listen "/sockets/events/$CID" --auth bad --expect-close 4001 --duration 10 --save F06.ws-handshake/bad-key
+  control-agent-server ws listen "/sockets/events/$CID" --auth none --send '{"type":"qa-hello","session_api_key":"qa"}' \
+    --expect-close 4001 --duration 10 --save F06.ws-handshake/not-auth-frame
+  T0=$SECONDS
   control-agent-server ws listen "/sockets/events/$CID" --auth none --expect-close 4001 --duration 15 --save F06.ws-handshake/no-frame
+  test $((SECONDS - T0)) -ge 9
+  test $((SECONDS - T0)) -le 14
   control-agent-server ws listen "/sockets/events/$CID" --auth query --until-kind ConversationStateUpdateEvent --until key=full_state --duration 10
   control-agent-server ws listen "/sockets/events/$CID" --auth header --until-kind ConversationStateUpdateEvent --until key=full_state --duration 10
-  control-agent-server ws listen "/sockets/events/$CID" --auth none --query session_api_key=qa-wrong-key --duration 5 \
-    --save F06.ws-handshake/bad-query-key | jq -e '.close.http_status == 403'
+  control-agent-server ws listen "/sockets/events/$CID" --auth bad-query --expect-reject 403 --duration 5 \
+    --save F06.ws-handshake/bad-query-key
+  control-agent-server ws listen "/sockets/events/$CID" --auth bad-header --expect-reject 403 --duration 5 \
+    --save F06.ws-handshake/bad-header-key
   control-agent-server ws listen "/sockets/events/$QA_UNKNOWN" --expect-close 4004 --duration 10 --save F06.ws-handshake/unknown
   ```
-  A wrong first-frame key and silence both close with 4001
-  `Authentication failed`; the deprecated query and header keys are accepted
-  (the server logs a deprecation warning), and a wrong query key is refused
-  before the upgrade with HTTP 403, so that client sees no close code. A
-  valid key on an unknown conversation authenticates, then closes with 4004
-  `Conversation not found`.
+  A wrong first-frame key, a first frame of another `type`, and silence all
+  close with 4001 `Authentication failed`; silence closes after the server's
+  10-second timer (the capture takes 10 to 11 s). The deprecated query and
+  header keys are accepted (the server logs a deprecation warning), and a
+  wrong query or header key is refused before the upgrade with HTTP 403, so
+  that client sees no close code. A valid key on an unknown conversation
+  authenticates, then closes with 4004 `Conversation not found`.
 - **Deleting a conversation closes its sockets (`F06.ws-delete-close`), known bug.**
   The delete runs in the background two seconds after the socket connects,
   only to order it after the subscription.
@@ -371,35 +401,42 @@ Preconditions:
   search with `timestamp__gte`; `since` without `after_timestamp` replays
   nothing (the server only logs a warning).
 - **Bad frames on the socket (`F06.ws-bad-frame`).** A JSON object that is
-  not a `Message`, a non-user message, then a redundant auth frame.
+  not a `Message`, a non-user message, a redundant auth frame, then text
+  that is not JSON (sent last, so its reply proves the auth frame before it
+  was read and skipped).
   ```sh
   BAD=$(control-agent-server ws listen "/sockets/events/$CID" \
     --send '{"kind":"MessageEvent","text":"QA_F06_BAD"}' \
     --send '{"role":"assistant","content":[{"type":"text","text":"QA_F06_BAD"}]}' \
     --send '{"type":"auth","session_api_key":"qa-ignored"}' \
+    --send 'qa-f06-not-json' \
     --duration 4 --expect-open --save F06.ws-bad-frame/frames | jq -r .saved)
-  jq -e '[.frames[] | select(.direction == "received") | .frame | select(.kind == "ServerErrorEvent") | .code] == ["ValidationError", "AssertionError"]' "$BAD"
+  jq -e '[.frames[] | select(.direction == "received") | .frame | select(.kind == "ServerErrorEvent") | .code] == ["ValidationError", "AssertionError", "JSONDecodeError"]' "$BAD"
   control-agent-server api GET "/api/conversations/$CID/events/count" --query body=QA_F06_BAD --check . eq 0
   control-agent-server api GET "/api/conversations/$CID/events/count" --check . eq 5
   ```
-  Two `ServerErrorEvent` frames (`code` `ValidationError`, then
-  `AssertionError` with `Only user messages are allowed...`), no frame for
-  the auth control message, the socket stays open and nothing was appended.
+  Three `ServerErrorEvent` frames (`code` `ValidationError`, then
+  `AssertionError` with `Only user messages are allowed...`, then
+  `JSONDecodeError`), none for the auth control message, the socket stays
+  open and nothing was appended.
 - **Send a message over the socket (`F06.ws-send`).** Every socket message
   runs the agent; this spends one tiny DeepSeek turn.
   ```sh
   control-agent-server ws listen "/sockets/events/$CID" \
     --send '{"role":"user","content":[{"type":"text","text":"QA_F06_WS: reply with the single word ok"}]}' \
+    --expect-kind MessageEvent \
     --until-kind ConversationStateUpdateEvent --until value=finished --duration 180 --save F06.ws-send/run
-  control-agent-server api GET "/api/conversations/$CID/events/search" --query source=user --query body=QA_F06_WS \
-    --check items len-eq 1 --save F06.ws-send/persisted
+  WS_T=$(control-agent-server api GET "/api/conversations/$CID/events/search" --query source=user --query body=QA_F06_WS \
+    --check items len-eq 1 --save F06.ws-send/persisted --field items.0.timestamp)
   control-agent-server api GET "/api/conversations/$CID" --check execution_status eq finished
-  control-agent-server api GET "/api/conversations/$CID/events/count" \
-    --query kind=openhands.sdk.event.llm_convertible.message.MessageEvent --query source=agent --check . ge 1
+  control-agent-server api GET "/api/conversations/$CID/events/count" --query source=agent --query timestamp__gte="$WS_T" \
+    --check . ge 1
   ```
   The same socket streams the user `MessageEvent`, `execution_status`
-  `running`, the agent's reply and `finished`; REST shows the persisted
-  message and the agent's `MessageEvent`.
+  `running`, the agent's turn and `finished`; REST shows the persisted
+  message and at least one agent event after it (a `MessageEvent` reply or
+  a `finish` `ActionEvent`: the agent has both, so which one is the model's
+  choice).
 - **Run a turn and watch it live (`F06.send-run`, `F06.ws-live`).** The
   capture starts before the message is sent; the agent only has the file
   editor (no tmux needed).
@@ -410,13 +447,13 @@ Preconditions:
     --json '{"content":[{"type":"text","text":"Create qa.txt containing exactly: QA_F06_LIVE"}],"run":true}' \
     --expect 200 --check success eq true --save F06.send-run/post
   control-agent-server conversation wait "$LIVE" --until finished --timeout 240
-  control-agent-server ws stop f06-live --expect-kind ActionEvent --save F06.ws-live/frames
+  control-agent-server ws stop f06-live --wait 30 --expect-kind ActionEvent \
+    --kinds ConversationStateUpdateEvent --contains '"key": "full_state"' --expect-min 2 --save F06.ws-live/frames
   LIVE_IDS=$(control-agent-server api GET "/api/conversations/$LIVE/events/search" --field items | jq -c '[.[].id]')
   control-agent-server ws read f06-live --kinds MessageEvent --contains QA_F06_LIVE
   control-agent-server ws read f06-live --kinds ConversationStateUpdateEvent --contains '"value": "running"'
   control-agent-server ws read f06-live --kinds ObservationEvent --contains '"tool_name": "file_editor"'
   control-agent-server ws read f06-live --kinds ConversationStateUpdateEvent --contains '"value": "finished"'
-  control-agent-server ws read f06-live --kinds ConversationStateUpdateEvent --contains '"key": "full_state"' | jq -e '.matching >= 2'
   LIVE_FRAMES=$(control-agent-server ws read f06-live --save F06.ws-live/all-frames | jq -r .saved)
   jq -e --argjson ids "$LIVE_IDS" '[.frames[] | select(.direction == "received") | .frame | select(.key != "full_state") | .id] | (length > 0) and (. - $ids == [])' "$LIVE_FRAMES"
   control-agent-server conversation events "$LIVE" --kinds ObservationEvent --contains file_editor --save F06.send-run/observations
@@ -424,21 +461,51 @@ Preconditions:
     --query kind=openhands.sdk.event.llm_convertible.action.ActionEvent --check . ge 1
   control-agent-server api GET "/api/conversations/$LIVE/events/count" \
     --query kind=openhands.sdk.event.llm_convertible.observation.ObservationEvent --check . ge 1
-  control-agent-server conversation events "$LIVE" --key stats --show 1 | jq -e '.matching >= 1'
+  control-agent-server conversation events "$LIVE" --key stats --expect-min 1
   LIVE_WS=$(control-agent-server api GET "/api/conversations/$LIVE" --field workspace.working_dir)
   grep -q QA_F06_LIVE "$LIVE_WS/qa.txt"
   ```
-  POST returns 200 at once and the run reaches `finished`. The socket shows
-  the user message, `execution_status` `running`, `ActionEvent`s with their
-  `file_editor` `ObservationEvent`s, `finished` and a second `full_state`
-  snapshot after the run; every live frame id is in the persisted log (read
-  after the capture stops, because an event is persisted before it is
-  published), which also has `stats` updates, and the agent wrote `qa.txt`.
+  POST returns 200 at once and the run reaches `finished`. The capture is
+  stopped only once the second `full_state` snapshot has arrived (the run
+  task publishes it after the REST status already says `finished`, so a
+  stop right after the wait races it). The socket shows the user message,
+  `execution_status` `running`, `ActionEvent`s with their `file_editor`
+  `ObservationEvent`s, `finished` and that closing snapshot; every live
+  frame id is in the persisted log (read after the capture stops, because
+  an event is persisted before it is published), which also has `stats`
+  updates, and the agent wrote `qa.txt`.
   A typical log:
   `SystemPromptEvent`, `MessageEvent` (user), state updates
   `last_user_message_id` and `execution_status=running`, then per step
   `ActionEvent`, `ObservationEvent` and `stats`, ending with the `finish`
   action and `execution_status=finished`.
+- **Log order is timestamp order (`F06.search-timestamp-order`), known bug.**
+  Search walks the log in append order and its docstring relies on that
+  being timestamp order (`_search_events_sync`); `after_timestamp` is
+  documented for "REST fetches history, the socket continues from that
+  point". `LIVE` from the previous bullet has at least one tool step.
+  ```sh
+  OBS_ID=$(control-agent-server api GET "/api/conversations/$LIVE/events/search" \
+    --query kind=openhands.sdk.event.llm_convertible.observation.ObservationEvent --field items.0.id)
+  OBS_T=$(control-agent-server api GET "/api/conversations/$LIVE/events/$OBS_ID" --field timestamp)
+  FROM_OBS=$(control-agent-server api GET "/api/conversations/$LIVE/events/search" --field items \
+    | jq --arg id "$OBS_ID" '[.[].id] | length - index($id)')
+  control-agent-server api GET "/api/conversations/$LIVE/events/count" --query timestamp__gte="$OBS_T" \
+    --check . ge "$FROM_OBS" --save F06.search-timestamp-order/count-since-observation
+  control-agent-server ws listen "/sockets/events/$LIVE" --query resend_mode=since --query after_timestamp="$OBS_T" \
+    --duration 3 --save F06.search-timestamp-order/replay-since-observation | jq -e --argjson n "$FROM_OBS" '.frames - 1 >= $n'
+  control-agent-server api GET "/api/conversations/$LIVE/events/search" --field items | jq -e '[.[].timestamp] | . == sort'
+  ```
+  Correct behavior: a cut at the first `ObservationEvent` keeps it and
+  everything listed after it (`FROM_OBS` events), over REST and over the
+  socket. Today the count is one short (8 of 9 on a two-edit run): the
+  `stats` update of each model call is created, and timestamped, when the
+  model answers, but is persisted from an executor that waits for the state
+  lock, so it lands after that step's action and observation (and after
+  `execution_status=finished` for the last call) with an older timestamp
+  (`_setup_stats_streaming`, `_emit_event_from_thread` in
+  `event_service.py`). A client that loads history over REST and then
+  reconnects with `resend_mode=since` silently misses that update.
 - **A message reopens a finished conversation (`F06.send-resets-finished`).**
   ```sh
   control-agent-server api GET "/api/conversations/$LIVE" --check execution_status eq finished
@@ -472,10 +539,11 @@ Preconditions:
   The first read after the restart rehydrates the conversation; ids, order
   and count are unchanged, the socket replays the same log, and the new
   message lands after it.
-- **Run capacity full (`F06.send-run-limit`).** Last bullet: it restarts the
-  run with one run slot and holds that slot with a scripted provider that
-  hangs (a real model cannot hang on demand). The waiting conversation is
-  created first, because creating a conversation also needs a run slot.
+- **Run capacity full (`F06.send-run-limit`).** It restarts the run with one
+  run slot and holds that slot with a scripted provider that hangs (a real
+  model cannot hang on demand); the next bullet reuses the holder and frees
+  it. The waiting conversation is created first, because creating a
+  conversation also needs a run slot.
   ```sh
   control-agent-server restart --config-json '{"max_concurrent_runs": 1}'
   QA_STUB=$(control-agent-server fixture llm-stub --name qa-f06-hang --step hang:120 --print-path)
@@ -493,16 +561,39 @@ Preconditions:
     --send '{"role":"user","content":[{"type":"text","text":"QA_F06_LIMIT_WS"}]}' \
     --until-kind ServerErrorEvent --until code=ConversationRunLimitExceeded --duration 15 --save F06.send-run-limit/ws
   control-agent-server api GET "/api/conversations/$WAITING/events/count" --query body=QA_F06_LIMIT_WS --check . eq 1
-  control-agent-server api POST "/api/conversations/$HOLD/interrupt" --expect 200
-  control-agent-server conversation wait "$HOLD" --until paused --timeout 60
-  control-agent-server llm preset deepseek
   ```
   The POST answers 429 with `Message saved, but the conversation run limit
   was reached. Retry POST /api/conversations/<id>/run without resending the
   message.`, the message is in the log and the conversation stays `idle`;
   the socket send gets the same detail as a `ServerErrorEvent` with `code`
-  `ConversationRunLimitExceeded` and its message is saved too. Interrupting
-  the holder frees the slot and the preset restores `deepseek-flash`.
+  `ConversationRunLimitExceeded` and its message is saved too.
+- **A message while the agent runs (`F06.send-while-running`).** Last
+  bullet. `HOLD` from the previous bullet is `running`, stuck in its first
+  model call on the hanging stub, so the stub's request log counts runs.
+  ```sh
+  control-agent-server api GET "/api/conversations/$HOLD" --check execution_status eq running
+  control-agent-server sink read --name qa-f06-hang --path /v1/chat/completions --expect-min 1 --expect-max 1
+  control-agent-server api POST "/api/conversations/$HOLD/events" \
+    --json '{"content":[{"type":"text","text":"QA_F06_MIDRUN"}],"run":true}' --expect 200 --check success eq true \
+    --save F06.send-while-running/post
+  control-agent-server api GET "/api/conversations/$HOLD/events/search" --query source=user --query body=QA_F06_MIDRUN \
+    --check items len-eq 1 --save F06.send-while-running/persisted
+  control-agent-server api GET "/api/conversations/$HOLD" --check execution_status eq running
+  control-agent-server api POST "/api/conversations/$HOLD/run" --expect 409
+  control-agent-server api POST "/api/conversations/$HOLD/interrupt" --expect 200
+  control-agent-server conversation wait "$HOLD" --until paused --timeout 60
+  control-agent-server sink read --name qa-f06-hang --path /v1/chat/completions --expect-max 1 \
+    --save F06.send-while-running/model-requests
+  control-agent-server llm preset deepseek
+  ```
+  The POST answers 200 at once although `POST /run` on the same
+  conversation is 409 `Conversation already running...`; the message is in
+  the log, the conversation stays `running`, and the stub still saw exactly
+  one model request after the interrupt, so no second run was started (a
+  running loop picks the message up on its next step; the parked re-run is
+  dropped because the interrupt leaves the conversation `paused`).
+  Interrupting the holder frees the slot and the preset restores
+  `deepseek-flash`.
 
 ## Gotchas
 
@@ -522,7 +613,13 @@ Preconditions:
   time first. Search is in log order, which is not strictly timestamp order:
   a `stats` update is appended after an action and its observation but
   carries a timestamp from before the action, so a `timestamp__gte` or
-  `resend_mode=since` cut taken at that observation's timestamp skips it.
+  `resend_mode=since` cut taken at that observation's timestamp skips it
+  (`F06.search-timestamp-order`).
+- Each conversation's event bus takes at most 50 subscribers, internal ones
+  (webhooks, auto-title) included; one more socket closes with 1013
+  `Too many connections for this conversation`, which the SDK treats as
+  retryable (from source; not driven, since 50 captures cost too much
+  memory).
 - Search drops `null` fields (`exclude_none`); get-one and batch-get keep
   them. Compare ids, not raw JSON.
 - An unknown event id is a 500 today, and one missing id fails a whole batch
@@ -559,9 +656,14 @@ Preconditions:
   the run: a stop hook can set it back to `running`. The `full_state`
   snapshot published after the run is authoritative (the SDK waits for it);
   recipes that stop at `finished` re-read the status over REST.
-- Harness: the run's tmux socket path is
-  `<run dir>/tmux/tmux-<uid>/openhands-<32 hex>`; under
-  `/tmp/agent-server-verify` a fresh `map run` (run name `map-fNN`) makes it
-  108 bytes, over the 107-byte Unix socket limit, so the terminal tool fails
-  with `File name too long` and `POST .../events` with `run: true` answers
-  500. These recipes therefore give the agent only the file editor.
+- `POST .../events` with `run: true` on a `running` conversation is a 200,
+  not the 409 of `POST /run`: the message joins the running loop. A client
+  that wants to know whether a new run started must watch the socket.
+- The body is required (no body is a 422), but every field has a default:
+  `{}` is a valid request and appends a user `MessageEvent` with empty
+  `content`.
+- The agent gets only the file editor (plus the built-in `finish` and
+  `think`) so the family needs no `tmux`. Older runs of this harness put
+  the tmux socket under the run directory, where a fresh `map run` made the
+  path longer than the Unix socket limit and the terminal tool failed with
+  `File name too long`; `launch` now uses a short `/tmp/ohv-*` directory.

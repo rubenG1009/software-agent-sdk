@@ -10,10 +10,12 @@ it). Each profile is one JSON file under `OH_PERSISTENCE_DIR/profiles`, with
 its key encrypted by the server's cipher, so profiles survive restarts. The
 pre-flight `validate` route sends a real one-token completion with the posted
 config and answers `valid` true or false; it never reads or writes the store.
+The SDK's `RemoteWorkspace.get_llm()` and the TypeScript `ProfilesClient` are
+the programmatic consumers.
 
-Source: `openhands-agent-server/openhands/agent_server/profiles_router.py`, `openhands-agent-server/openhands/agent_server/_secrets_exposure.py`, `openhands-sdk/openhands/sdk/llm/llm_profile_store.py`, `openhands-sdk/openhands/sdk/profiles/profile_refs.py`, `clients/typescript/src/client/profiles-client.ts`
+Source: `openhands-agent-server/openhands/agent_server/profiles_router.py`, `openhands-agent-server/openhands/agent_server/_secrets_exposure.py`, `openhands-sdk/openhands/sdk/llm/llm_profile_store.py`, `openhands-sdk/openhands/sdk/profiles/profile_refs.py`, `openhands-sdk/openhands/sdk/workspace/remote/base.py`, `clients/typescript/src/client/profiles-client.ts`
 
-Needs: `llm`
+Needs: `llm`, `node`
 
 Routes: `GET /api/profiles`, `GET /api/profiles/{name}`,
 `POST /api/profiles/{name}`, `POST /api/profiles/{name}/validate`,
@@ -30,6 +32,9 @@ Routes: `GET /api/profiles`, `GET /api/profiles/{name}`,
 - `F20.save-without-secrets`: `include_secrets: false` stores the placeholder `**********` instead of the key; both the list and `GET` report `api_key_set: false` and plaintext reads return `null`.
 - `F20.not-found`: `GET`, `activate` and `rename` of an unknown name answer 404 `Profile '<name>' not found`, also for a same-name rename.
 - `F20.name-rules`: names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`: a leading `-` is 422 on all six named routes, 64 characters are accepted and 65 are 422; a body without `llm` or without `llm.model` is 422 and saves nothing.
+- `F20.corrupt-files`: a profile file that is not valid JSON (or not an object) is left out of the list and answers 400 `Failed to load profile ...` on `GET` and `activate`, saving over it repairs it, and an unreadable `settings.json` makes activation 409 without touching the file.
+- `F20.store-busy`: while another process holds the profile store's lock, a save waits out the 30-second lock timeout and answers 503 `Profile store is busy. Please retry.` without saving; once the lock is free the same save is 201.
+- `F20.store-busy-responsive`: while a profile request waits for the store lock, the server keeps answering other requests (`GET /alive` within 3 seconds).
 - `F20.profile-limit`: with 50 profiles stored, creating another is 409 `Profile limit reached (50)` while overwriting an existing one still answers 201.
 - `F20.validate-live`: `validate` with a working DeepSeek flash config answers `{valid: true, error: null}`, also when the key is the `gAAAAA` token from an `encrypted` read; the draft is not saved.
 - `F20.validate-rejects`: `validate` answers 200 `valid: false` with a typed error for a model the provider does not serve (`LLMBadRequestError`) and for an invalid DeepSeek key, without echoing the key.
@@ -40,7 +45,12 @@ Routes: `GET /api/profiles`, `GET /api/profiles/{name}`,
 - `F20.activate`: `POST /api/profiles/{name}/activate` answers 200 `llm_applied: true`; `GET /api/settings` then has the profile's LLM (model, key, options) in `agent_settings.llm` and `active_profile` set, the list reports the same `active_profile`, and `settings.json` holds the key encrypted.
 - `F20.activate-conversation`: a conversation started from the saved settings after an activation runs on the activated profile's model and options and finishes.
 - `F20.activate-acp`: with ACP agent settings, activation only moves the pointer: 200 `llm_applied: false`, `active_profile` set, no `agent_settings.llm`.
+- `F20.sdk-get-llm`: the SDK's `RemoteWorkspace.get_llm(profile_name=...)` returns the stored model, options and plaintext key with `usage_id` `profile:<name>`, `get_llm()` follows `active_profile`, keyword overrides win, and an unknown name raises `FileNotFoundError`.
+- `F20.ts-client`: the TypeScript `ProfilesClient` lists, saves, reads (hidden, `plaintext`, `encrypted`), validates, renames, activates and deletes a profile, and surfaces 404 and 422 as `HttpError`s.
 - `F20.activate-dangling-provider`: a profile linked to a provider connection that does not exist is saved without its inline key and `base_url`, is listed as `provider_connection_broken: true`, reads fine, and its activation is 422 without moving the active pointer.
+- `F20.activate-linked-provider`: a profile linked to an existing provider connection is saved without its inline key, is listed and read with `api_key_set: true` (the connection's key) and a `null` key, and its activation writes the connection's key into `agent_settings.llm`.
+- `F20.sdk-get-llm-linked`: an SDK conversation whose LLM comes from `RemoteWorkspace.get_llm(profile_name=<linked profile>)` runs on the provider connection's key and finishes.
+- `F20.no-cipher`: on a server with neither `OH_SECRET_KEY` nor a session key (no cipher), a saved key is stored in plaintext in a `600` file, plaintext reads and activation work, and `X-Expose-Secrets: encrypted` answers 503.
 - `F20.persist-restart`: profiles, their encrypted keys, options and the active pointer survive a restart with the same secret key.
 - `F20.rename`: `POST /api/profiles/{name}/rename` moves the file and keeps the key; the old name is 404, `active_profile` follows the rename in the list and in settings, and agent profiles whose `llm_profile_ref` cited the old name now cite the new one.
 - `F20.rename-errors`: renaming onto an existing name is 409 and changes nothing, a same-name rename is 200 `unchanged (same name)`, and an invalid or missing `new_name` is 422.
@@ -62,16 +72,24 @@ Routes: `GET /api/profiles`, `GET /api/profiles/{name}`,
   files under `home/.openhands/profiles/` (`state cat`), and
   `GET /api/agent-profiles/{name}` (`llm_profile_ref`; agent profiles family).
   `PATCH /api/settings` with `active_profile` is a second way to activate a
-  profile (settings family).
+  profile (settings family). `POST` and `DELETE /api/llm/provider-connections`
+  (provider connections family) arrange the linked-profile bullets.
 - SDK: `RemoteWorkspace.get_llm(profile_name=...)` reads
   `GET /api/profiles/{name}` with `X-Expose-Secrets: plaintext` and builds an
   `LLM`; without a name it resolves `active_profile` from `GET /api/settings`
-  first (`openhands-sdk/openhands/sdk/workspace/remote/base.py`). The SDK's
-  local `LLMProfileStore` is the same file format without the server.
+  first (`openhands-sdk/openhands/sdk/workspace/remote/base.py`). Driven by
+  `F20.sdk-get-llm` and `F20.sdk-get-llm-linked` (Python programs run with
+  `exec`). The SDK's local `LLMProfileStore` is the same file format and lock
+  without the server (`F20.store-busy` stands in for it with `flock`).
 - TypeScript client: `ProfilesClient.listProfiles`, `getProfile(name,
   {exposeSecrets})`, `saveProfile`, `validateProfile`, `activateProfile`,
   `renameProfile`, `deleteProfile` (default request timeout 60 s), and the
-  same calls on `SettingsClient`.
+  same calls on `SettingsClient`. Driven by `F20.ts-client` (a `node` program
+  on `clients/typescript/dist`).
+- Configuration: `OH_SECRET_KEY` is the cipher for keys at rest; without it
+  the first session key is the cipher, and with neither there is none
+  (`F20.no-cipher`, `launch --no-auth --no-secret-key`). `OH_PERSISTENCE_DIR`
+  holds `profiles/`.
 - Conversations: a conversation started from the saved settings (the Agent
   Canvas path, `conversation start` without agent fields) uses whatever the
   last activation wrote into `agent_settings.llm`
@@ -85,21 +103,121 @@ Routes: `GET /api/profiles`, `GET /api/profiles/{name}`,
 Preconditions:
 
 - A baseline run is live and exported (`launch --new`), `doctor` is ok,
-  `$DEEPSEEK_API_KEY` is set, and `jq` is on `PATH`. The block below saves the
-  DeepSeek preset (`deepseek-flash`, active, and `deepseek-pro`) and an agent
-  profile `qa-f20-agent` whose `llm_profile_ref` is `qa-flash`; that reference
-  stays soft until `F20.save` creates `qa-flash`, and `F20.rename` and
-  `F20.delete-guarded` rely on it.
+  `$DEEPSEEK_API_KEY` is set, `jq`, `flock` and `node` are on `PATH` (the
+  TypeScript client is built if `clients/typescript/dist` is missing). The
+  block below saves the DeepSeek preset (`deepseek-flash`, active, and
+  `deepseek-pro`) and an agent profile `qa-f20-agent` whose `llm_profile_ref`
+  is `qa-flash`; that reference stays soft until `F20.save` creates
+  `qa-flash`, and `F20.rename` and `F20.delete-guarded` rely on it. It also
+  writes the SDK and TypeScript programs that `F20.sdk-get-llm`,
+  `F20.ts-client` and `F20.sdk-get-llm-linked` run; they read
+  `$DEEPSEEK_API_KEY` from the environment `exec` passes on.
 - Bodies that carry the real key are piped from the shell builtin `printf`
   into `api ... --stdin`, so the key never appears on a command line; the CLI
   redacts it from output and evidence.
-- `F20.persist-restart` restarts the run; `F20.secret-key-rotation` restarts
+- `F20.store-busy` and `F20.store-busy-responsive` hold the store lock for
+  about 34 seconds each; `F20.no-cipher` launches and stops a second server;
+  `F20.persist-restart` restarts the run; `F20.secret-key-rotation` restarts
   it with a new secret key and must stay last.
 
   ```sh
   control-agent-server llm preset deepseek
   control-agent-server api GET /api/profiles --expect 200 --check active_profile eq deepseek-flash --check profiles len-eq 2
   control-agent-server api POST /api/agent-profiles/qa-f20-agent --json '{"llm_profile_ref": "qa-flash"}' --expect 201
+  F20="$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f20"
+  mkdir -p "$F20"
+  cat > "$F20/sdk_get_llm.py" <<'EOF'
+  import os
+
+  from openhands.sdk.workspace import RemoteWorkspace
+
+  ws = RemoteWorkspace(
+      host=os.environ["AGENT_SERVER_URL"],
+      api_key=os.environ["SESSION_API_KEY"],
+      working_dir="/tmp",
+  )
+  named = ws.get_llm(profile_name="qa-flash")
+  assert named.model == "deepseek/deepseek-flash", named.model
+  assert named.num_retries == 0, named.num_retries
+  assert named.usage_id == "profile:qa-flash", named.usage_id
+  assert named.api_key is not None
+  assert named.api_key.get_secret_value() == os.environ["DEEPSEEK_API_KEY"], "key differs"
+  active = ws.get_llm()
+  assert active.usage_id == "profile:qa-flash", active.usage_id
+  assert active.api_key is not None
+  assert active.api_key.get_secret_value() == os.environ["DEEPSEEK_API_KEY"], "key differs"
+  override = ws.get_llm(profile_name="qa-nokey", temperature=0.5)
+  assert override.model == "openai/qa-nokey", override.model
+  assert override.temperature == 0.5, override.temperature
+  assert override.api_key is None, "qa-nokey has no stored key"
+  try:
+      ws.get_llm(profile_name="qa-missing")
+  except FileNotFoundError:
+      pass
+  else:
+      raise AssertionError("an unknown profile did not raise FileNotFoundError")
+  print("QA_F20_SDK_OK")
+  EOF
+  cat > "$F20/sdk_linked.py" <<'EOF'
+  import os
+
+  from openhands.sdk import Agent, Conversation
+  from openhands.sdk.workspace import RemoteWorkspace
+
+  ws = RemoteWorkspace(
+      host=os.environ["AGENT_SERVER_URL"],
+      api_key=os.environ["SESSION_API_KEY"],
+      working_dir="/tmp",
+  )
+  llm = ws.get_llm(profile_name="qa-linked-sdk")
+  print("QA_F20_LINKED_KEY_SET", llm.api_key is not None)
+  conversation = Conversation(agent=Agent(llm=llm, tools=[]), workspace=ws)
+  try:
+      conversation.send_message("Reply with one word: pong")
+      conversation.run()
+      status = conversation.state.execution_status.value
+      print("QA_F20_LINKED_STATUS", status)
+      assert status == "finished", status
+  finally:
+      conversation.close()
+  print("QA_F20_LINKED_OK")
+  EOF
+  cat > "$F20/ts_profiles.mjs" <<'JS'
+  import assert from 'node:assert/strict';
+  import { resolve } from 'node:path';
+  import { pathToFileURL } from 'node:url';
+
+  const { ProfilesClient } = await import(pathToFileURL(resolve('clients/typescript/dist/clients.js')).href);
+  const client = new ProfilesClient({ host: process.env.AGENT_SERVER_URL, apiKey: process.env.SESSION_API_KEY });
+  const before = await client.listProfiles();
+  assert.equal(before.active_profile, 'qa-flash');
+  assert.deepEqual(await client.saveProfile('qa-ts', { llm: { model: 'openai/qa-ts', api_key: 'sk-qa-f20-ts' } }),
+    { name: 'qa-ts', message: "Profile 'qa-ts' saved" });
+  const hidden = await client.getProfile('qa-ts');
+  assert.equal(hidden.config.api_key, null);
+  assert.equal(hidden.api_key_set, true);
+  const plain = await client.getProfile('qa-ts', { exposeSecrets: 'plaintext' });
+  assert.equal(plain.config.api_key, 'sk-qa-f20-ts');
+  const enc = await client.getProfile('qa-ts', { exposeSecrets: 'encrypted' });
+  assert.match(enc.config.api_key, /^gAAAAA/);
+  const verdict = await client.validateProfile('qa-ts', {
+    llm: { model: 'openai/qa-ts', base_url: 'http://127.0.0.1:9/v1', api_key: 'sk-qa-f20-ts', num_retries: 0 },
+  });
+  assert.equal(verdict.valid, false);
+  assert.equal(verdict.error.type, 'LLMServiceUnavailableError');
+  assert.equal((await client.renameProfile('qa-ts', 'qa-ts2')).name, 'qa-ts2');
+  assert.equal((await client.activateProfile('qa-ts2')).llm_applied, true);
+  assert.equal((await client.listProfiles()).active_profile, 'qa-ts2');
+  assert.equal((await client.activateProfile('qa-flash')).llm_applied, true);
+  assert.equal((await client.deleteProfile('qa-ts2')).message, "Profile 'qa-ts2' deleted");
+  await assert.rejects(client.getProfile('qa-ts2'), (err) => err.status === 404);
+  await assert.rejects(client.saveProfile('-qa-bad', { llm: { model: 'openai/qa' } }), (err) => err.status === 422);
+  const after = await client.listProfiles();
+  assert.equal(after.active_profile, 'qa-flash');
+  assert.equal(after.profiles.length, before.profiles.length);
+  client.close();
+  console.log('QA_F20_TS_OK');
+  JS
   ```
 
 - **Key required (`F20.auth-required`).** Call every route without a key or
@@ -134,9 +252,7 @@ Preconditions:
 - **Encrypted at rest (`F20.key-encrypted-at-rest`).** Read the file the save
   wrote.
   ```sh
-  P="$AGENT_SERVER_VERIFY_RUN/home/.openhands/profiles"
-  test "$(stat -c %a "$P/qa-flash.json")" = 600
-  control-agent-server state cat home/.openhands/profiles/qa-flash.json \
+  control-agent-server state cat home/.openhands/profiles/qa-flash.json --mode 600 \
     --check api_key matches '^gAAAAA' --check model eq deepseek/deepseek-flash --check schema_version eq 1
   control-agent-server state grep --env-value DEEPSEEK_API_KEY --glob 'home/**/*' --expect-none
   ```
@@ -220,6 +336,92 @@ Preconditions:
   Every `-qa-bad` call is 422 on the `name` path parameter, 64 characters
   save and 65 are 422 `string_too_long`, both bad bodies are 422, and the list
   is back to four profiles (two preset, `qa-flash`, `qa-nokey`).
+- **Corrupted files (`F20.corrupt-files`).** Write a truncated profile, a
+  profile that is a JSON list, and then a truncated `settings.json` (arrange:
+  a crash mid-write or a hand edit), and drive the routes over them.
+  ```sh
+  P="$AGENT_SERVER_VERIFY_RUN/home/.openhands/profiles"
+  printf '{"model": "openai/qa-corrupt", ' > "$P/qa-corrupt.json"
+  printf '["not", "an", "object"]' > "$P/qa-notdict.json"
+  control-agent-server api GET /api/profiles --expect 200 --check profiles len-eq 4 \
+    --check profiles not-contains '"name": "qa-corrupt"' --check profiles not-contains '"name": "qa-notdict"' --save F20.corrupt-files/list
+  control-agent-server api GET /api/profiles/qa-corrupt --expect 400 --check detail contains 'Failed to load profile `qa-corrupt`' --save F20.corrupt-files/get
+  control-agent-server api GET /api/profiles/qa-notdict --expect 400 --check detail contains 'Failed to load profile `qa-notdict`'
+  control-agent-server api POST /api/profiles/qa-corrupt/activate --expect 400 --check detail contains 'Failed to load profile' --save F20.corrupt-files/activate
+  control-agent-server api GET /api/profiles --check active_profile eq deepseek-flash
+  control-agent-server api POST /api/profiles/qa-corrupt --json '{"llm": {"model": "openai/qa-repaired"}}' --expect 201
+  control-agent-server api GET /api/profiles/qa-corrupt --expect 200 --check config.model eq openai/qa-repaired
+  control-agent-server api DELETE /api/profiles/qa-corrupt --expect 200
+  control-agent-server api DELETE /api/profiles/qa-notdict --expect 200
+  test ! -e "$P/qa-notdict.json"
+  S="$AGENT_SERVER_VERIFY_RUN/home/.openhands/settings.json"
+  cp -p "$S" "$S.qa-f20-bak"
+  printf '{"agent_settings": ' > "$S"
+  control-agent-server api POST /api/profiles/qa-nokey/activate --expect 409 \
+    --check detail eq 'Settings file is corrupted or encrypted with a different key' --save F20.corrupt-files/corrupt-settings
+  test "$(cat "$S")" = '{"agent_settings": '
+  mv "$S.qa-f20-bak" "$S"
+  control-agent-server api GET /api/profiles --check active_profile eq deepseek-flash --check profiles len-eq 4
+  ```
+  Both broken profiles are missing from the list, `GET` and `activate` are
+  400 with the parser's message (not 500) and the active profile stays;
+  saving over `qa-corrupt` repairs it and both deletes are 200. With the
+  truncated `settings.json` the activation is 409 and the file is byte for
+  byte what was written; the original is then put back.
+- **Store busy (`F20.store-busy`).** Another process (here `flock`, standing
+  in for the SDK's `LLMProfileStore` or a second server on the same
+  persistence directory) holds the profile store's lock for 34 seconds while
+  a save arrives. The server's own 30-second lock timeout is under test, so
+  this bullet waits for it.
+  ```sh
+  P="$AGENT_SERVER_VERIFY_RUN/home/.openhands/profiles"
+  HELD="$F20/lock-held"
+  rm -f "$HELD"
+  flock -x "$P/.profiles.lock" sh -c "touch '$HELD'; sleep 34" &
+  LOCKER=$!
+  for i in $(seq 100); do test -e "$HELD" && break; sleep 0.1; done
+  test -e "$HELD"
+  T0=$SECONDS
+  control-agent-server api POST /api/profiles/qa-busy --json '{"llm": {"model": "openai/qa-busy"}}' --timeout 60 --expect 503 \
+    --check exception eq '503: Profile store is busy. Please retry.' --save F20.store-busy/save
+  test $((SECONDS - T0)) -ge 29
+  test $((SECONDS - T0)) -le 33
+  wait "$LOCKER"
+  control-agent-server api GET /api/profiles/qa-busy --expect 404
+  control-agent-server api POST /api/profiles/qa-busy --json '{"llm": {"model": "openai/qa-busy"}}' --expect 201 --expect-max-ms 5000
+  control-agent-server api DELETE /api/profiles/qa-busy --expect 200
+  ```
+  The save answers 503 after 29 to 33 seconds (the body's `detail` is the
+  generic `Internal Server Error`; the route's message is in `exception`),
+  `qa-busy` does not exist afterwards, and the same save succeeds at once
+  when the lock is free.
+- **Lock wait blocks the server (`F20.store-busy-responsive`), known bug.**
+  Hold the lock again, start a save in the background, and probe `/alive`
+  while the save waits. The two-second pause only lets the background save
+  reach the server first, so the probe really overlaps the lock wait.
+  ```sh
+  P="$AGENT_SERVER_VERIFY_RUN/home/.openhands/profiles"
+  HELD="$F20/lock-held-2"
+  rm -f "$HELD"
+  flock -x "$P/.profiles.lock" sh -c "touch '$HELD'; sleep 34" &
+  LOCKER=$!
+  for i in $(seq 100); do test -e "$HELD" && break; sleep 0.1; done
+  test -e "$HELD"
+  (control-agent-server api POST /api/profiles/qa-busy --json '{"llm": {"model": "openai/qa-busy"}}' --timeout 60 --expect 503 --quiet > "$F20/busy-save.json") &
+  SAVER=$!
+  sleep 2
+  RC=0
+  control-agent-server api GET /alive --auth none --expect 200 --expect-max-ms 3000 --timeout 60 --save F20.store-busy-responsive/alive || RC=$?
+  wait "$SAVER"
+  wait "$LOCKER"
+  test "$RC" = 0
+  ```
+  Expected `/alive` to answer within 3 seconds while the save waits. Today
+  it takes about 28 seconds: every profile route is an `async def` that calls
+  the synchronous, file-locked `LLMProfileStore` on the event loop
+  (`profiles_router.py`), so a 30-second lock wait freezes the whole server,
+  liveness and readiness probes included. The bullet waits for both
+  background processes before it fails, so later bullets find the lock free.
 - **Profile limit (`F20.profile-limit`).** Fill the store to 50, then create
   and overwrite.
   ```sh
@@ -296,6 +498,8 @@ Preconditions:
     --check valid eq false --check error.type eq LLMAuthenticationError --save F20.validate-provider-errors/401
   control-agent-server sink read --name qa-f20-stub --contains 'Reply with one token.' --expect-min 1 --save F20.validate-provider-errors/stub-request
   control-agent-server sink read --name qa-f20-stub --contains '"max_tokens": 1' --expect-min 1
+  control-agent-server sink read --name qa-f20-stub --expect-min 1 \
+    --contains '"role": "system"}, {"content": [{"type": "text", "text": "ping"}], "role": "user"}'
   control-agent-server fixture llm-stub --name qa-f20-stub --step status:500
   control-agent-server api POST /api/profiles/qa-stub/validate --json "{\"llm\": $STUB_LLM}" --timeout 60 --expect 200 \
     --check valid eq false --check error.type eq LLMServiceUnavailableError --save F20.validate-provider-errors/500
@@ -312,7 +516,8 @@ Preconditions:
   control-agent-server api GET /api/profiles --check profiles len-eq 4
   ```
   The stub's first request carries the system message `Reply with one
-  token.`, a user `ping` and `max_tokens: 1`; 401 maps to
+  token.` directly before the user `ping` (the repository's system-first
+  invariant), and `max_tokens: 1`; 401 maps to
   `LLMAuthenticationError`, 500 and the closed port to
   `LLMServiceUnavailableError` (`valid: false`), while 429 and the 3-second
   timeout are transient (`valid: true`). Nothing is saved.
@@ -326,9 +531,11 @@ Preconditions:
   ```
   Expected a verdict within 30 s. Today the client gives up (`ReadTimeout`,
   exit 3): `validate` calls the posted LLM unchanged, so a connection error is
-  retried with the LLM's defaults (`num_retries` 5, waits of 8 to 64 s), and
-  the server answers `valid: false` only after about 120 s, twice the
-  TypeScript `ProfilesClient`'s 60 s default timeout.
+  retried with the LLM's defaults (`num_retries` 5 means five attempts, with
+  waits of 8, 16, 32 and 64 s), and the server answers `valid: false`
+  `LLMServiceUnavailableError` only after about 120 s (121 s measured with
+  `--timeout 400`), twice the TypeScript `ProfilesClient`'s 60 s default
+  timeout.
 - **Hanging provider is slower (`F20.validate-hang-bounded`), known bug.**
   An `llm-stub` that never answers, with the default timeout and retries.
   ```sh
@@ -339,8 +546,10 @@ Preconditions:
   ```
   Expected a verdict within 30 s. Today each attempt waits for the LLM's
   300 s `timeout` and the timeout is retried, so the request stays open for
-  about half an hour and then answers `valid: true` (a timeout counts as
-  transient), approving a provider that never answered.
+  about 27 minutes (five attempts of 300 s plus 120 s of backoff) and then
+  answers `valid: true` (a timeout counts as transient), approving a
+  provider that never answered. Measured with `"timeout": 2` in the body:
+  130 s, five requests at the stub, then `valid: true`.
 - **Activate (`F20.activate`).** Make `qa-flash` the active LLM and read the
   settings back.
   ```sh
@@ -388,6 +597,31 @@ Preconditions:
   On ACP settings the activation answers `llm_applied: false` and only moves
   `active_profile`; back on OpenHands settings `qa-flash` is re-activated for
   the next bullets.
+- **SDK consumer (`F20.sdk-get-llm`).** `RemoteWorkspace.get_llm()` by name,
+  from the active pointer, with an override, and for an unknown name.
+  ```sh
+  control-agent-server exec --env OPENHANDS_SUPPRESS_BANNER=1 --timeout 120 --expect-output QA_F20_SDK_OK \
+    --save F20.sdk-get-llm/program -- .venv/bin/python "$F20/sdk_get_llm.py"
+  ```
+  The program prints `QA_F20_SDK_OK`: `get_llm(profile_name="qa-flash")` is
+  `deepseek/deepseek-flash` with `num_retries: 0`, the DeepSeek key and
+  `usage_id` `profile:qa-flash`; `get_llm()` resolves the active `qa-flash`;
+  `temperature=0.5` overrides `qa-nokey`'s stored `0.25` (and its key stays
+  unset); `qa-missing` raises `FileNotFoundError` from the server's 404.
+- **TypeScript client (`F20.ts-client`).** Every `ProfilesClient` method
+  from the built client (built here when missing).
+  ```sh
+  test -f clients/typescript/dist/clients.js || (cd clients/typescript && npm ci && npm run build)
+  control-agent-server exec --timeout 120 --expect-output QA_F20_TS_OK --save F20.ts-client/program -- node "$F20/ts_profiles.mjs"
+  control-agent-server api GET /api/profiles --check active_profile eq qa-flash --check profiles len-eq 4 \
+    --check profiles not-contains '"name": "qa-ts' --save F20.ts-client/list-after
+  ```
+  The program prints `QA_F20_TS_OK`: the saved key is hidden, plaintext and
+  `gAAAAA` in the three reads, `validateProfile` against the closed port is
+  `valid: false` `LLMServiceUnavailableError`, the rename and activation
+  move `active_profile`, and the deleted name and an invalid name reject
+  with `HttpError` status 404 and 422. The list afterwards has the same four
+  profiles and `qa-flash` active again.
 - **Dangling provider link (`F20.activate-dangling-provider`).** Save a
   profile linked to a provider connection id that does not exist, with an
   inline key and `base_url`.
@@ -410,6 +644,81 @@ Preconditions:
   The inline key and `base_url` are dropped on save (the connection owns
   them), the list flags the link as broken, `GET` still works, and the
   activation is 422 with `qa-flash` still active.
+- **Linked provider (`F20.activate-linked-provider`).** Create a provider
+  connection that holds the DeepSeek key (arrange), link a profile to it with
+  a stray inline key, and activate it.
+  ```sh
+  CONN=$(printf '{"display_name": "qa-f20-conn", "provider": "deepseek", "api_key": "%s"}' "$DEEPSEEK_API_KEY" \
+    | control-agent-server api POST /api/llm/provider-connections --stdin --expect 201 --field id)
+  control-agent-server api POST /api/profiles/qa-linked-live --expect 201 \
+    --json "{\"llm\": {\"model\": \"deepseek/deepseek-flash\", \"provider_connection_id\": \"$CONN\", \"api_key\": \"sk-qa-f20-inline\", \"num_retries\": 0}}"
+  control-agent-server state cat home/.openhands/profiles/qa-linked-live.json --not-contains sk-qa-f20-inline \
+    --check api_key missing --check provider_connection_id eq "$CONN"
+  control-agent-server api GET /api/profiles --save F20.activate-linked-provider/list \
+    --check profiles contains "\"name\": \"qa-linked-live\", \"model\": \"deepseek/deepseek-flash\", \"base_url\": null, \"provider_connection_id\": \"$CONN\", \"provider_connection_broken\": false, \"api_key_set\": true"
+  control-agent-server api GET /api/profiles/qa-linked-live --header 'X-Expose-Secrets: plaintext' --expect 200 \
+    --check config.api_key missing --check config.provider_connection_id eq "$CONN" --check api_key_set eq true --save F20.activate-linked-provider/get
+  control-agent-server api POST /api/profiles/qa-linked-live/activate --expect 200 --check llm_applied eq true --save F20.activate-linked-provider/activate
+  control-agent-server api GET /api/settings --header 'X-Expose-Secrets: plaintext' --max-chars 200 --check active_profile eq qa-linked-live \
+    --check agent_settings.llm.api_key eq "$DEEPSEEK_API_KEY" --check agent_settings.llm.provider_connection_id eq "$CONN" \
+    --check llm_api_key_is_set eq true --save F20.activate-linked-provider/settings
+  control-agent-server api POST /api/profiles/qa-flash/activate --expect 200 --check llm_applied eq true
+  control-agent-server api DELETE /api/profiles/qa-linked-live --expect 200
+  control-agent-server api DELETE "/api/llm/provider-connections/$CONN" --expect 200
+  control-agent-server api GET /api/profiles --check active_profile eq qa-flash --check profiles len-eq 4
+  ```
+  The file keeps only the connection id (no inline key); the list and `GET`
+  report `api_key_set: true` from the connection while `GET` shows a `null`
+  key even in plaintext mode; the activation resolves the connection and
+  writes its key into `agent_settings.llm`, keeping `provider_connection_id`.
+  `qa-flash` is re-activated, then the profile and the connection are
+  deleted.
+- **SDK on a linked profile (`F20.sdk-get-llm-linked`), known bug.** Build an
+  SDK conversation from `get_llm()` of a profile linked to a connection that
+  holds the DeepSeek key.
+  ```sh
+  CONN=$(printf '{"display_name": "qa-f20-sdk-conn", "provider": "deepseek", "api_key": "%s"}' "$DEEPSEEK_API_KEY" \
+    | control-agent-server api POST /api/llm/provider-connections --stdin --expect 201 --field id)
+  control-agent-server api POST /api/profiles/qa-linked-sdk --expect 201 \
+    --json "{\"llm\": {\"model\": \"deepseek/deepseek-flash\", \"provider_connection_id\": \"$CONN\", \"num_retries\": 0}}"
+  RC=0
+  control-agent-server exec --env OPENHANDS_SUPPRESS_BANNER=1 --timeout 180 --expect-output QA_F20_LINKED_OK \
+    --save F20.sdk-get-llm-linked/program -- .venv/bin/python "$F20/sdk_linked.py" || RC=$?
+  control-agent-server api DELETE /api/profiles/qa-linked-sdk --expect 200
+  control-agent-server api DELETE "/api/llm/provider-connections/$CONN" --expect 200
+  test "$RC" = 0
+  ```
+  Expected the conversation to finish on the connection's key, as a
+  conversation started after activating the same profile does. Today the
+  program prints `QA_F20_LINKED_KEY_SET False` and `run()` raises
+  `ConversationRunError ... LLMAuthenticationError`: `get_llm()` builds the
+  LLM from `GET /api/profiles/{name}`, which shows a linked profile as stored
+  (`resolve_provider=False`, no key even with `X-Expose-Secrets: plaintext`),
+  and nothing on the conversation start path resolves
+  `provider_connection_id` (only activation and `switch_llm` do). The profile
+  and connection are deleted before the bullet fails.
+- **No cipher (`F20.no-cipher`).** Launch a second server with neither a
+  session key nor `OH_SECRET_KEY` (so no cipher at all), save a keyed
+  profile, read it and activate it there.
+  ```sh
+  B=$(control-agent-server launch --new --print-run --name f20-nocipher --no-auth --no-secret-key)
+  control-agent-server api POST /api/profiles/qa-plain --run "$B" --expect 201 \
+    --json '{"llm": {"model": "openai/qa-plain", "api_key": "sk-qa-f20-plain-key"}}' --save F20.no-cipher/save
+  control-agent-server state cat home/.openhands/profiles/qa-plain.json --run "$B" --mode 600 --check api_key eq sk-qa-f20-plain-key
+  control-agent-server api GET /api/profiles --run "$B" --check profiles contains '"name": "qa-plain", "model": "openai/qa-plain", "base_url": null, "provider_connection_id": null, "provider_connection_broken": false, "api_key_set": true'
+  control-agent-server api GET /api/profiles/qa-plain --run "$B" --header 'X-Expose-Secrets: plaintext' --expect 200 \
+    --check config.api_key eq sk-qa-f20-plain-key --save F20.no-cipher/plaintext
+  control-agent-server api GET /api/profiles/qa-plain --run "$B" --header 'X-Expose-Secrets: encrypted' --expect 503 \
+    --check exception contains 'Encryption not available: OH_SECRET_KEY is not configured' --save F20.no-cipher/encrypted
+  control-agent-server api POST /api/profiles/qa-plain/activate --run "$B" --expect 200 --check llm_applied eq true
+  control-agent-server state cat home/.openhands/settings.json --run "$B" --max-chars 200 --check agent_settings.llm.api_key eq sk-qa-f20-plain-key
+  control-agent-server stop --run "$B"
+  ```
+  The profile file (mode `600`) and `settings.json` hold the key in
+  plaintext, the plaintext read returns it, and the `encrypted` read is 503
+  (message in `exception`). The second server is stopped; the main run's
+  files stay encrypted (`F20.key-encrypted-at-rest`). The `--save` files of
+  this bullet land under the second run's `evidence/` directory.
 - **Restart (`F20.persist-restart`).** Restart the run and read everything
   back.
   ```sh
@@ -507,8 +816,11 @@ Preconditions:
   so the next conversation fails at the provider. The cipher returns `None`
   for a token it cannot decrypt instead of raising
   (`openhands-sdk/openhands/sdk/utils/cipher.py`), and the profile store
-  loads that silently. Run last: every stored secret of this run is now
-  unreadable.
+  loads that silently. The same happens without `OH_SECRET_KEY` when only
+  the session key rotates, because the first session key is then the cipher
+  (checked on a `launch --no-secret-key` run: after `restart --rotate-key`
+  a plaintext read returns `null` and `api_key_set: false`). Run last: every
+  stored secret of this run is now unreadable.
 
 ## Gotchas
 
@@ -554,10 +866,28 @@ Preconditions:
   agent profiles by name, which seeds nothing.
 - Names ending in `.json` are stored without the suffix, so `foo` and
   `foo.json` are the same profile.
-- `launch` always sets `OH_SECRET_KEY` (an empty `--env OH_SECRET_KEY=` still
-  yields a cipher), so the no-cipher behaviors (keys stored in plaintext,
-  `X-Expose-Secrets: encrypted` answering 503) are not reachable with the
-  current CLI.
+- `launch` sets `OH_SECRET_KEY`. `--no-secret-key` alone still leaves a
+  cipher, derived from the first session key (and `restart --rotate-key` then
+  loses every stored key, as in `F20.secret-key-rotation`); only
+  `--no-auth --no-secret-key` gives a server without a cipher
+  (`F20.no-cipher`).
+- 5xx answers from these routes (503 store busy, 503 encryption not
+  available) carry `detail: "Internal Server Error"`; the route's own message
+  is in `exception` (the server's 5xx handler rewrites `detail`). Assert the
+  status and `exception`, not `detail`.
+- Profile routes are `async def` handlers that call the synchronous,
+  file-locked store; while the lock is held elsewhere the whole server stops
+  answering for up to 30 seconds (`F20.store-busy-responsive`). Never hold
+  the lock (`flock` on `profiles/.profiles.lock`) longer than a bullet needs.
+- A corrupted profile file is skipped by the list without an error (a
+  warning in the log), but `GET` and `activate` by name are 400. While
+  `settings.json` is unreadable, `GET /api/profiles` reports
+  `active_profile: null` and activation is 409.
+- A profile linked to a provider connection never shows a key in
+  `GET /api/profiles/{name}`, whatever `X-Expose-Secrets` says; only
+  activation (and `switch_llm`) resolve the connection, so SDK programs that
+  build their LLM with `get_llm(profile_name=...)` get a keyless LLM
+  (`F20.sdk-get-llm-linked`).
 - Profile routes emit no WebSocket events; the second views are
   `GET /api/settings`, the list and the files on disk.
 - The closed port `127.0.0.1:9` stands in for an unreachable provider; if

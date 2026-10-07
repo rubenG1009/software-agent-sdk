@@ -3,7 +3,7 @@
 How an agent or its host drives the agent loop of an existing conversation:
 start it on pending input (`/run`, which returns at once and runs in the
 background), stop it at the next step boundary (`/pause`) or cancel the
-in-flight model call (`/interrupt`), and follow `execution_status` through
+in-flight model or tool call (`/interrupt`), and follow `execution_status` through
 `idle`, `running`, `paused`, `finished` and `error` on the conversation, the
 status filters and the events socket. It also covers what a consumer sees at
 the edges: a second run while one is active (409), the server's run capacity
@@ -12,7 +12,7 @@ stopped gracefully or was killed.
 
 Source: `openhands-agent-server/openhands/agent_server/conversation_router.py`, `openhands-agent-server/openhands/agent_server/conversation_service.py`, `openhands-agent-server/openhands/agent_server/event_service.py`, `openhands-agent-server/openhands/agent_server/api.py`, `openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py`, `openhands-sdk/openhands/sdk/conversation/state.py`
 
-Needs: `llm`
+Needs: `llm`, `tmux`
 
 Launch: `--config-json '{"max_concurrent_runs": 1}'`
 
@@ -23,28 +23,31 @@ Routes: `POST /api/conversations/{conversation_id}/run`,
 ## Sub-features
 
 - `F05.run-queued`: a message appended with `run: false` leaves the conversation `idle`; `POST /run` returns 200 at once and the agent runs on DeepSeek flash through `running` to `finished`, both transitions pushed on the events socket.
-- `F05.run-finished-noop`: `POST /run` on a `finished` conversation without new input returns 200, stays `finished` and adds no events (no model call).
+- `F05.run-finished-noop`: `POST /run` on a `finished` conversation without new input returns 200 and the run ends at once: no `execution_status` change on the socket, still `finished`, no new events (no model call).
 - `F05.run-new-input`: a new user message moves a `finished` conversation back to `idle`, and `POST /run` runs it to `finished` again.
 - `F05.pause-idle`: pausing an idle conversation returns 200, reports `paused` on GET, the status search and count and the events socket, and persists one `PauseEvent`.
 - `F05.pause-repeat`: pausing a `paused` conversation again returns 200 and adds no second `PauseEvent`.
 - `F05.run-resume-paused`: `POST /run` resumes a `paused` conversation through `running` to `finished`.
 - `F05.interrupt-idle`: interrupt with nothing running falls back to pause: `paused`, one `PauseEvent`, no `InterruptEvent`.
-- `F05.run-error`: a run whose model provider is unreachable ends in `error` with a `ConversationErrorEvent` and is listed by `status=error`.
+- `F05.run-error`: a run whose model provider is unreachable ends in `error` with a `ConversationErrorEvent` (also pushed on the events socket) and is listed by `status=error`.
 - `F05.pause-terminal`: pause and interrupt on a `finished` or `error` conversation return 200 and change neither the status nor the event log.
 - `F05.run-error-responsive`: a run that fails does not stall the server: other requests keep answering while the error is handled.
 - `F05.unknown-id-run`: `POST /run` on an unknown id returns 404.
 - `F05.unknown-id-pause`: `POST /pause` and `POST /interrupt` on an unknown id return the documented 404.
-- `F05.control-errors`: all three routes answer 401 without or with a wrong session key and 422 for a malformed id, and the conversation is untouched.
+- `F05.control-errors`: all three routes answer 401 without or with a wrong session key and 422 for a malformed id, and the idle conversation they targeted is untouched (still `idle`, no `PauseEvent`).
 - `F05.run-conflict`: `POST /run` while a run is active returns 409 `Conversation already running...`, and the active run keeps going without a second model call.
 - `F05.pause-running`: pause during a long model call returns 200 at once; the events socket, status search and event log say `paused`, and `/run` stays 409 while the step is still in flight.
 - `F05.pause-running-get`: after a pause during a long model call, `GET /api/conversations/{id}` and `base_state.json` report `paused` like every other view.
-- `F05.pause-running-release`: interrupting a paused conversation whose step is still in flight cancels it (`InterruptEvent`), GET catches up to `paused`, and the run slot is free again.
-- `F05.interrupt-running`: interrupt cancels a hanging model call within 5 s: 200, `paused`, an `InterruptEvent` and no `PauseEvent`, pushed on the events socket.
+- `F05.pause-running-release`: interrupting a paused conversation whose step is still in flight cancels it (`InterruptEvent`), GET catches up to `paused`, and the run slot is free again (a create that needs the slot succeeds).
+- `F05.interrupt-running`: interrupt cancels a hanging model call well within the server's 5 s wait: 200, `paused`, an `InterruptEvent` and no `PauseEvent`, pushed on the events socket.
 - `F05.run-after-interrupt`: after an interrupt, `POST /run` is accepted at once and the resumed run reaches `finished`.
+- `F05.pause-tool-step`: pause while a tool call runs lets that step finish (its observation is recorded), then stops the loop before the next model call: `paused`, one `PauseEvent`, one model request.
+- `F05.interrupt-tool-call`: interrupt while a tool call runs returns at once: `paused`, an `InterruptEvent`, an `AgentErrorEvent` for the unfinished call (same `tool_call_id`) and no observation; the resumed run sends that error to the model as the tool result and finishes.
 - `F05.run-capacity`: with `max_concurrent_runs` 1, `POST /run` on a second conversation returns 429 while the first holds the slot, leaves it `idle`, and succeeds once the first is interrupted.
 - `F05.restart-running-graceful`: a conversation running at a graceful restart comes back `paused`, with a `PauseEvent` and an `InterruptEvent`.
 - `F05.restart-keeps-status`: `finished`, `paused` and `error` statuses survive a restart unchanged.
 - `F05.restart-hard-running`: a conversation running when the server is SIGKILLed comes back `error` on the next start, and `/run` resumes it.
+- `F05.pause-running-crash`: a pause accepted during a model call survives a SIGKILL: the conversation comes back `paused`, as its persisted `PauseEvent` and status update say, not `error`.
 
 ## How to get to it (agent POV)
 
@@ -89,7 +92,9 @@ Routes: `POST /api/conversations/{conversation_id}/run`,
 - Recipes below use REST through `api`, the events socket through `ws start`
   (opened before the action), real DeepSeek flash runs for every happy path,
   `fixture llm-stub` for a model call that hangs (the only way to hold a run
-  in `running` on demand) and an unreachable `base_url` for a provider error.
+  in `running` on demand) or for an exact `terminal` call that runs a slow
+  command (the only way to hold a run inside a tool call), and an unreachable
+  `base_url` for a provider error.
 
 ## Driving it with control-agent-server
 
@@ -102,17 +107,24 @@ Preconditions:
   so the bullets run strictly in order and each one that holds the slot
   releases it (interrupt) before it ends. `F05.run-capacity` depends on the
   limit of 1.
-- No `tmux` or browser: every agent has `tools: []`, which keeps only the
-  built-in `finish` and `think` tools.
+- `tmux` for the two tool-call bullets (`F05.pause-tool-step`,
+  `F05.interrupt-tool-call`), whose agents have the `terminal` tool. Every
+  other agent has `tools: []`, which keeps only the built-in `finish` and
+  `think` tools. No browser.
 - The block below creates, in order: an unknown id `$NOPE`, the
-  fully-qualified event kinds that `events/count` filters on, an inline agent
-  whose provider is unreachable (`$OFFLINE_AGENT`, `127.0.0.1:9`), an
-  `llm-stub` that hangs every call for 300 s (`$HANG_AGENT`), a second hanging
-  stub that `F05.run-after-interrupt` later rewrites to call `finish`
-  (`$RESUME_AGENT`), and all nine conversations, without an initial message
-  (an initial message always starts a run, and creating a conversation needs a
-  free run slot): `A`, `B`, `C`, `Q` on DeepSeek flash, `E` offline, `P`, `G`,
-  `K` on the hanging stub, `R` on the resumable stub. All start `idle`.
+  fully-qualified event kinds that `events/count` and `events/search` filter
+  on, an inline agent whose provider is unreachable (`$OFFLINE_AGENT`,
+  `127.0.0.1:9`), an `llm-stub` that hangs every call for 300 s
+  (`$HANG_AGENT`), a second hanging stub that `F05.run-after-interrupt` later
+  rewrites to call `finish` (`$RESUME_AGENT`), a stub whose model asks for
+  `terminal` `sleep 6 && echo QA_F05_STEP_DONE` (`$STEP_AGENT`), a stub whose
+  model asks for `terminal` `sleep 30` and that `F05.interrupt-tool-call`
+  later rewrites to call `finish` (`$TOOL_AGENT`), and all eleven
+  conversations, without an initial message (an initial message always starts
+  a run, and creating a conversation needs a free run slot): `A`, `B`, `C`,
+  `Q` on DeepSeek flash, `E` offline, `P`, `G`, `K` on the hanging stub, `R`
+  on the resumable stub, `W` on the step stub, `T` on the tool stub. All start
+  `idle`.
 
 ```sh
 control-agent-server llm preset deepseek
@@ -121,11 +133,17 @@ PAUSE_KIND=openhands.sdk.event.user_action.PauseEvent
 INTERRUPT_KIND=openhands.sdk.event.user_action.InterruptEvent
 ERROR_KIND=openhands.sdk.event.conversation_error.ConversationErrorEvent
 ACTION_KIND=openhands.sdk.event.llm_convertible.action.ActionEvent
+OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEvent
+AGENT_ERROR_KIND=openhands.sdk.event.llm_convertible.observation.AgentErrorEvent
 OFFLINE_AGENT='{"llm": {"model": "openai/qa-offline", "api_key": "qa-offline-key", "base_url": "http://127.0.0.1:9/v1", "num_retries": 0}, "tools": []}'
 HANG=$(control-agent-server fixture llm-stub --name qa-f05-hang --step hang:300 --print-path)
 HANG_AGENT="{\"llm\": {\"model\": \"openai/qa-stub\", \"api_key\": \"qa-stub-key\", \"base_url\": \"$HANG/v1\", \"num_retries\": 0}, \"tools\": []}"
 RESUME=$(control-agent-server fixture llm-stub --name qa-f05-resume --step hang:300 --print-path)
 RESUME_AGENT="{\"llm\": {\"model\": \"openai/qa-stub\", \"api_key\": \"qa-stub-key\", \"base_url\": \"$RESUME/v1\", \"num_retries\": 0}, \"tools\": []}"
+STEP=$(control-agent-server fixture llm-stub --name qa-f05-step --step 'tool:terminal:{"command":"sleep 6 && echo QA_F05_STEP_DONE"}' --print-path)
+STEP_AGENT="{\"llm\": {\"model\": \"openai/qa-stub\", \"api_key\": \"qa-stub-key\", \"base_url\": \"$STEP/v1\", \"num_retries\": 0}, \"tools\": [{\"name\": \"terminal\"}]}"
+TOOL=$(control-agent-server fixture llm-stub --name qa-f05-tool --step 'tool:terminal:{"command":"sleep 30"}' --print-path)
+TOOL_AGENT="{\"llm\": {\"model\": \"openai/qa-stub\", \"api_key\": \"qa-stub-key\", \"base_url\": \"$TOOL/v1\", \"num_retries\": 0}, \"tools\": [{\"name\": \"terminal\"}]}"
 A=$(control-agent-server conversation start --tools none --no-autotitle --print-id)
 B=$(control-agent-server conversation start --tools none --no-autotitle --print-id)
 C=$(control-agent-server conversation start --tools none --no-autotitle --print-id)
@@ -135,7 +153,9 @@ P=$(control-agent-server conversation start --body-json "{\"agent\": $HANG_AGENT
 G=$(control-agent-server conversation start --body-json "{\"agent\": $HANG_AGENT}" --no-autotitle --print-id)
 K=$(control-agent-server conversation start --body-json "{\"agent\": $HANG_AGENT}" --no-autotitle --print-id)
 R=$(control-agent-server conversation start --body-json "{\"agent\": $RESUME_AGENT}" --no-autotitle --print-id)
-control-agent-server api GET /api/conversations/count --query status=idle --check . eq 9
+W=$(control-agent-server conversation start --body-json "{\"agent\": $STEP_AGENT}" --no-autotitle --print-id)
+T=$(control-agent-server conversation start --body-json "{\"agent\": $TOOL_AGENT}" --no-autotitle --print-id)
+control-agent-server api GET /api/conversations/count --query status=idle --check . eq 11
 ```
 
 - **Run queued input on a real model (`F05.run-queued`).** Append a message
@@ -144,42 +164,48 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   ```sh
   control-agent-server conversation send "$A" --text 'Reply with the single word ok, then finish.' --no-run
   control-agent-server api GET "/api/conversations/$A" --check execution_status eq idle
+  NA=$(control-agent-server api GET "/api/conversations/$A/events/count" --query source=agent --field .)
   control-agent-server ws start "/sockets/events/$A" --name f05-a-run --duration 300
-  control-agent-server api POST "/api/conversations/$A/run" --expect 200 --check success eq true --save F05.run-queued/run
+  control-agent-server api POST "/api/conversations/$A/run" --expect 200 --check success eq true --expect-max-ms 2000 --save F05.run-queued/run
   control-agent-server conversation wait "$A" --until finished --timeout 180
   control-agent-server api GET "/api/conversations/$A" --check execution_status eq finished --save F05.run-queued/after
-  control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$ACTION_KIND --check . ge 1
+  control-agent-server api GET "/api/conversations/$A/events/count" --query source=agent --check . gt "$NA"
+  control-agent-server ws read f05-a-run --contains '"key": "execution_status", "value": "finished"' --wait 30
   control-agent-server ws stop f05-a-run --contains '"key": "execution_status", "value": "running"' --save F05.run-queued/frames
-  control-agent-server ws read f05-a-run --contains '"key": "execution_status", "value": "finished"'
   ```
   The status stays `idle` after the append, `/run` answers 200
-  `{"success": true}` within milliseconds, the wait reports the transitions
-  `running`, `finished`, the agent emitted at least one action (its `finish`
-  call), and the socket pushed `execution_status` `running` and then
-  `finished`.
+  `{"success": true}` within 2 s (it only schedules the run), the wait
+  reports the transitions `running`, `finished`, the model's answer added
+  agent events (a `finish` call or a plain reply, whichever the model chose),
+  and the socket pushed `execution_status` `running` and `finished`.
 - **Run with nothing to do (`F05.run-finished-noop`).** The proof is an
-  absence, so the bullet gives the background run a fixed 3 s window.
+  absence, so the socket first proves the background run ended: the server
+  pushes a `full_state` snapshot on connect and another when a run ends.
   ```sh
   N=$(control-agent-server api GET "/api/conversations/$A/events/count" --field .)
+  control-agent-server ws start "/sockets/events/$A" --name f05-a-noop --duration 300
   control-agent-server api POST "/api/conversations/$A/run" --expect 200 --check success eq true --save F05.run-finished-noop/run
-  sleep 3
+  control-agent-server ws read f05-a-noop --contains '"key": "full_state"' --expect-min 2 --wait 30
+  control-agent-server ws stop f05-a-noop --contains '"key": "execution_status"' --expect-none --save F05.run-finished-noop/frames
   control-agent-server api GET "/api/conversations/$A/events/count" --check . eq "$N" --save F05.run-finished-noop/count
   control-agent-server api GET "/api/conversations/$A" --check execution_status eq finished
   ```
-  `/run` returns 200, the event count is unchanged and the status is still
-  `finished`: a finished conversation without new input exits the loop before
-  calling the model.
+  `/run` returns 200, the run's closing `full_state` frame arrives without a
+  single `execution_status` frame before it, the event count is unchanged and
+  the status is still `finished`: a finished conversation without new input
+  exits the loop before calling the model.
 - **New input after finishing (`F05.run-new-input`).** A user message resets
   `finished` to `idle`; `/run` picks it up.
   ```sh
   control-agent-server conversation send "$A" --text 'Reply with the single word again, then finish.' --no-run
   control-agent-server api GET "/api/conversations/$A" --check execution_status eq idle --save F05.run-new-input/idle
+  NA=$(control-agent-server api GET "/api/conversations/$A/events/count" --query source=agent --field .)
   control-agent-server api POST "/api/conversations/$A/run" --expect 200 --check success eq true
   control-agent-server conversation wait "$A" --until finished --timeout 180
-  control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$ACTION_KIND --check . ge 2 --save F05.run-new-input/actions
+  control-agent-server api GET "/api/conversations/$A/events/count" --query source=agent --check . gt "$NA" --save F05.run-new-input/agent-events
   ```
   The status reads `idle` after the append and `finished` after the second
-  run, which added at least one more action.
+  run, which added agent events for the new answer.
 - **Pause an idle conversation (`F05.pause-idle`).** `B` has pending input and
   has never run.
   ```sh
@@ -205,15 +231,16 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   The second pause is accepted and changes nothing: still one `PauseEvent`.
 - **Resume a paused conversation (`F05.run-resume-paused`).**
   ```sh
+  NA=$(control-agent-server api GET "/api/conversations/$B/events/count" --query source=agent --field .)
   control-agent-server ws start "/sockets/events/$B" --name f05-b-resume --duration 300
   control-agent-server api POST "/api/conversations/$B/run" --expect 200 --check success eq true --save F05.run-resume-paused/run
   control-agent-server conversation wait "$B" --until finished --timeout 180
-  control-agent-server api GET "/api/conversations/$B/events/count" --query kind=$ACTION_KIND --check . ge 1 --save F05.run-resume-paused/actions
+  control-agent-server api GET "/api/conversations/$B/events/count" --query source=agent --check . gt "$NA" --save F05.run-resume-paused/agent-events
+  control-agent-server ws read f05-b-resume --contains '"key": "execution_status", "value": "finished"' --wait 30
   control-agent-server ws stop f05-b-resume --contains '"key": "execution_status", "value": "running"' --save F05.run-resume-paused/frames
-  control-agent-server ws read f05-b-resume --contains '"key": "execution_status", "value": "finished"'
   ```
-  The paused conversation runs its pending message on DeepSeek flash: the
-  socket shows `running` then `finished`.
+  The paused conversation runs its pending message on DeepSeek flash (new
+  agent events) and the socket shows `running` and `finished`.
 - **Interrupt with nothing running (`F05.interrupt-idle`).** `C` is idle and
   has no input.
   ```sh
@@ -228,21 +255,26 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   (connection refused, no retries).
   ```sh
   control-agent-server conversation send "$E" --text 'hi' --no-run
+  control-agent-server ws start "/sockets/events/$E" --name f05-e-error --duration 300
   control-agent-server api POST "/api/conversations/$E/run" --expect 200 --check success eq true --save F05.run-error/run
   control-agent-server conversation wait "$E" --until error --timeout 120
   control-agent-server api GET "/api/conversations/$E/events/count" --query kind=$ERROR_KIND --check . eq 1
   control-agent-server api GET "/api/conversations/$E/events/search" --query kind=$ERROR_KIND \
     --check items.0.code exists --check items.0.detail exists --save F05.run-error/error-event
   control-agent-server api GET /api/conversations/search --query status=error --check items contains "$E"
+  control-agent-server ws read f05-e-error --expect-kind ConversationErrorEvent --wait 30
+  control-agent-server ws stop f05-e-error --contains '"key": "execution_status", "value": "error"' --save F05.run-error/frames
   ```
   `/run` still answers 200 (the failure happens in the background); the
   status becomes `error`, one `ConversationErrorEvent` carries a `code`
-  (`LLMServiceUnavailableError` here) and a `detail`, and `status=error`
-  lists `E`.
+  (`LLMServiceUnavailableError` here) and a `detail`, `status=error` lists
+  `E`, and the socket pushed the error event and the `error` transition.
 - **Pause and interrupt a terminal conversation (`F05.pause-terminal`).**
   ```sh
-  for CID in "$A" "$E"; do
-    S=$(control-agent-server api GET "/api/conversations/$CID" --field execution_status)
+  for CASE in "$A:finished" "$E:error"; do
+    CID=${CASE%%:*}
+    S=${CASE#*:}
+    control-agent-server api GET "/api/conversations/$CID" --check execution_status eq "$S"
     N=$(control-agent-server api GET "/api/conversations/$CID/events/count" --field .)
     control-agent-server api POST "/api/conversations/$CID/pause" --expect 200 --check success eq true --save F05.pause-terminal/pause
     control-agent-server api POST "/api/conversations/$CID/interrupt" --expect 200 --check success eq true --save F05.pause-terminal/interrupt
@@ -253,25 +285,31 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   Both calls are accepted on the `finished` and the `error` conversation, and
   neither the status nor the event count moves.
 - **Responsive while a run fails (`F05.run-error-responsive`), known bug.**
-  Re-run `E` and probe `/alive` twice right away; normally each probe (CLI
-  start included) takes well under a second.
+  Re-run `E` and keep probing `/alive` and the error count until the second
+  `ConversationErrorEvent` lands, then probe twice more; every request must
+  answer within 1.5 s (normally about 100 ms).
   ```sh
+  NERR=$(control-agent-server api GET "/api/conversations/$E/events/count" --query kind=$ERROR_KIND --field .)
   control-agent-server api POST "/api/conversations/$E/run" --expect 200
-  T0=$(date +%s%N)
-  control-agent-server api GET /alive --auth none --expect 200 --timeout 60
-  control-agent-server api GET /alive --auth none --expect 200 --timeout 60 --save F05.run-error-responsive/alive
-  MS=$(( ($(date +%s%N) - T0) / 1000000 ))
-  control-agent-server conversation wait "$E" --until error --timeout 60
-  echo "two /alive probes took ${MS} ms"
-  test "$MS" -lt 3000
+  for i in $(seq 1 40); do
+    control-agent-server api GET /alive --auth none --expect 200 --expect-max-ms 1500 --timeout 60 --quiet
+    NOW=$(control-agent-server api GET "/api/conversations/$E/events/count" --query kind=$ERROR_KIND --expect-max-ms 1500 --timeout 60 --field .)
+    if [ "$NOW" -gt "$NERR" ]; then break; fi
+  done
+  test "$NOW" -gt "$NERR"
+  control-agent-server api GET /alive --auth none --expect 200 --expect-max-ms 1500 --timeout 60 --save F05.run-error-responsive/alive
+  control-agent-server api GET /alive --auth none --expect 200 --expect-max-ms 1500 --timeout 60
+  control-agent-server api GET "/api/conversations/$E" --check execution_status eq error
   ```
-  Expected: both probes answer in about 100 ms of server time. Today the first
-  one waits about 5 s: `_run_and_publish` logs the run failure with
-  `logger.exception` on the event loop (`event_service.py`, "Error during
-  conversation run"), and the default console handler renders a rich
-  traceback of about 1,000 lines synchronously, blocking every request,
-  socket and run on the server meanwhile. With `LOG_JSON=true` (the Docker
-  images' setting) the probes answer in about 80 ms.
+  Expected: every probe answers in about 100 ms. Today one of them waits
+  about 5 s: `_run_and_publish` logs the run failure with `logger.exception`
+  on the event loop (`event_service.py`, "Error during conversation run"),
+  and the default console handler (`LOG_RICH_TRACEBACKS` defaults to true in
+  `openhands-sdk/openhands/sdk/logger/logger.py`) renders a rich traceback of
+  about 1,000 lines synchronously, blocking every request, socket and run on
+  the server meanwhile. After `restart --env LOG_RICH_TRACEBACKS=false` (or
+  with `LOG_JSON=true`, the Docker images' setting) the same probe answers in
+  under 200 ms.
 - **Run an unknown id (`F05.unknown-id-run`).**
   ```sh
   control-agent-server api POST "/api/conversations/$NOPE/run" --expect 404 --check detail eq 'Not Found' --save F05.unknown-id-run/run
@@ -291,22 +329,28 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   (the handlers raise 400 when the service finds no conversation), so a
   consumer cannot tell a missing conversation from a bad request, and the
   status differs from `/run` for the same id.
-- **Auth and malformed ids (`F05.control-errors`).**
+- **Auth and malformed ids (`F05.control-errors`).** The target is `Q`, which
+  is `idle`, so an accepted pause or interrupt would visibly flip it to
+  `paused`.
   ```sh
-  control-agent-server api POST "/api/conversations/$A/run" --auth none --expect 401 --check detail eq Unauthorized --save F05.control-errors/run-no-key
-  control-agent-server api POST "/api/conversations/$A/pause" --auth none --expect 401 --save F05.control-errors/pause-no-key
-  control-agent-server api POST "/api/conversations/$A/interrupt" --auth none --expect 401 --save F05.control-errors/interrupt-no-key
-  control-agent-server api POST "/api/conversations/$A/run" --auth bad --expect 401
-  control-agent-server api POST "/api/conversations/$A/pause" --auth bad --expect 401
-  control-agent-server api POST "/api/conversations/$A/interrupt" --auth bad --expect 401
+  N=$(control-agent-server api GET "/api/conversations/$Q/events/count" --field .)
+  control-agent-server api POST "/api/conversations/$Q/run" --auth none --expect 401 --check detail eq Unauthorized --save F05.control-errors/run-no-key
+  control-agent-server api POST "/api/conversations/$Q/pause" --auth none --expect 401 --check detail eq Unauthorized --save F05.control-errors/pause-no-key
+  control-agent-server api POST "/api/conversations/$Q/interrupt" --auth none --expect 401 --check detail eq Unauthorized --save F05.control-errors/interrupt-no-key
+  control-agent-server api POST "/api/conversations/$Q/run" --auth bad --expect 401
+  control-agent-server api POST "/api/conversations/$Q/pause" --auth bad --expect 401
+  control-agent-server api POST "/api/conversations/$Q/interrupt" --auth bad --expect 401
   control-agent-server api POST /api/conversations/not-a-uuid/run --expect 422 --check detail.0.loc contains conversation_id --save F05.control-errors/run-malformed
   control-agent-server api POST /api/conversations/not-a-uuid/pause --expect 422 --check detail.0.loc contains conversation_id
   control-agent-server api POST /api/conversations/not-a-uuid/interrupt --expect 422 --check detail.0.loc contains conversation_id
-  control-agent-server api GET "/api/conversations/$A" --check execution_status eq finished
-  control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$PAUSE_KIND --check . eq 0
+  control-agent-server api GET "/api/conversations/$Q" --check execution_status eq idle --save F05.control-errors/untouched
+  control-agent-server api GET "/api/conversations/$Q/events/count" --check . eq "$N"
+  control-agent-server api GET "/api/conversations/$Q/events/count" --query kind=$PAUSE_KIND --check . eq 0
   ```
   Each route rejects a missing and a wrong key with 401 and a malformed path
-  id with 422 naming `conversation_id`; `A` is still `finished`.
+  id with 422 naming `conversation_id`; `Q` is still `idle` with no new
+  event, while the same session key drives every other bullet (the positive
+  control).
 - **Run while running (`F05.run-conflict`).** `P`'s model call hangs, so the
   run stays `running`.
   ```sh
@@ -318,16 +362,14 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
     --check detail eq 'Conversation already running. Wait for completion or pause first.' --save F05.run-conflict/run-409
   control-agent-server api GET "/api/conversations/$P" --check execution_status eq running
   control-agent-server api GET /api/conversations/count --query status=running --check . eq 1
+  control-agent-server sink read --name qa-f05-hang --expect-min 1 --expect-max 1
   ```
   The second `/run` is refused with 409 and that exact detail; `P` is still
-  the one running conversation and the stub saw the single model call.
+  the one running conversation and the stub saw exactly one model call.
 - **Pause during a long model call (`F05.pause-running`).**
   ```sh
   control-agent-server ws start "/sockets/events/$P" --name f05-p-pause --duration 300
-  T0=$(date +%s%N)
-  control-agent-server api POST "/api/conversations/$P/pause" --expect 200 --check success eq true --timeout 60 --save F05.pause-running/pause
-  MS=$(( ($(date +%s%N) - T0) / 1000000 ))
-  test "$MS" -lt 3000
+  control-agent-server api POST "/api/conversations/$P/pause" --expect 200 --check success eq true --expect-max-ms 3000 --timeout 60 --save F05.pause-running/pause
   control-agent-server api GET "/api/conversations/$P/events/count" --query kind=$PAUSE_KIND --check . eq 1
   control-agent-server api GET /api/conversations/search --query status=paused --check items contains "$P" --save F05.pause-running/search
   control-agent-server ws stop f05-p-pause --contains '"key": "execution_status", "value": "paused"' --save F05.pause-running/frames
@@ -348,26 +390,30 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   Today both still say `running` until the model call returns (here 300 s) or
   is interrupted: the pause runs inside the run loop's open state block
   (`ConversationState._save_depth` stays 1 while `arun()` releases only the
-  lock for the network wait), so the autosave of `base_state.json` is deferred
+  lock for the network wait, `_released_state_lock_during_io` in
+  `local_conversation.py`), so the autosave of `base_state.json` is deferred
   to the end of the step, and `GET /api/conversations/{id}` answers from that
-  file. A consumer that pauses and polls GET (as `conversation wait` and SDK
-  pollers do) keeps seeing `running`; a crash in that window restores the
-  conversation as `error` instead of `paused`.
+  file. Even `search?status=paused`, which filters on the live status and so
+  lists `P`, returns `P`'s item with `execution_status` `running`. A consumer
+  that pauses and polls GET (as `conversation wait` and SDK pollers do) keeps
+  seeing `running`, and a crash in that window loses the pause
+  (`F05.pause-running-crash`).
 - **Release a paused step with interrupt (`F05.pause-running-release`).**
   ```sh
   control-agent-server ws start "/sockets/events/$P" --name f05-p-release --duration 300
-  T0=$(date +%s%N)
-  control-agent-server api POST "/api/conversations/$P/interrupt" --expect 200 --check success eq true --timeout 60 --save F05.pause-running-release/interrupt
-  MS=$(( ($(date +%s%N) - T0) / 1000000 ))
-  test "$MS" -lt 5000
+  control-agent-server api POST "/api/conversations/$P/interrupt" --expect 200 --check success eq true --expect-max-ms 4000 --timeout 60 --save F05.pause-running-release/interrupt
   control-agent-server api GET "/api/conversations/$P" --check execution_status eq paused --save F05.pause-running-release/get
   control-agent-server api GET "/api/conversations/$P/events/count" --query kind=$INTERRUPT_KIND --check . eq 1
   control-agent-server api GET /api/conversations/count --query status=running --check . eq 0
   control-agent-server ws stop f05-p-release --expect-kind InterruptEvent --save F05.pause-running-release/frames
+  X=$(control-agent-server conversation start --tools none --no-autotitle --print-id)
+  control-agent-server api DELETE "/api/conversations/$X" --expect 200 --check success eq true
   ```
-  The interrupt cancels the hanging call within 5 s, appends an
-  `InterruptEvent` (also on the socket), GET now reads `paused`, nothing is
-  running and the single run slot is free for the next bullet.
+  The interrupt cancels the hanging call in well under the server's 5 s
+  wait, appends an `InterruptEvent` (also on the socket), GET now reads
+  `paused` and nothing is running. Creating a conversation needs the single
+  run slot (it answers 429 while a run holds it), so the throwaway create
+  (deleted again) proves the slot is free.
 - **Interrupt a running conversation (`F05.interrupt-running`).** `R`'s model
   call hangs until its stub is rewritten.
   ```sh
@@ -376,17 +422,15 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   control-agent-server api POST "/api/conversations/$R/run" --expect 200 --check success eq true
   control-agent-server conversation wait "$R" --until running --timeout 60
   control-agent-server sink read --name qa-f05-resume --expect-min 1
-  T0=$(date +%s%N)
-  control-agent-server api POST "/api/conversations/$R/interrupt" --expect 200 --check success eq true --timeout 60 --save F05.interrupt-running/interrupt
-  MS=$(( ($(date +%s%N) - T0) / 1000000 ))
-  test "$MS" -lt 5000
+  control-agent-server api POST "/api/conversations/$R/interrupt" --expect 200 --check success eq true --expect-max-ms 4000 --timeout 60 --save F05.interrupt-running/interrupt
   control-agent-server api GET "/api/conversations/$R" --check execution_status eq paused --save F05.interrupt-running/get
   control-agent-server api GET "/api/conversations/$R/events/count" --query kind=$INTERRUPT_KIND --check . eq 1
   control-agent-server api GET "/api/conversations/$R/events/count" --query kind=$PAUSE_KIND --check . eq 0
   control-agent-server ws stop f05-r-interrupt --expect-kind InterruptEvent --save F05.interrupt-running/frames
   control-agent-server ws read f05-r-interrupt --contains '"key": "execution_status", "value": "paused"'
   ```
-  The interrupt returns within 5 s although the model call would hang for
+  The interrupt returns within 4 s (normally about 150 ms; the server waits at
+  most 5 s for the cancelled run) although the model call would hang for
   300 s; GET reads `paused`, the log has one `InterruptEvent` and no
   `PauseEvent`, and the socket pushed both the `InterruptEvent` and the
   `paused` transition.
@@ -402,6 +446,56 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   ```
   `/run` is accepted at once (no lingering 409), the resumed run calls the
   model again and ends `finished` with the stub's `finish` message.
+- **Pause during a tool call (`F05.pause-tool-step`).** `W`'s model asks for
+  `terminal` `sleep 6 && echo QA_F05_STEP_DONE` on every call; the pause
+  lands while the command runs. The socket gets a `full_state` frame on
+  connect, after the pause and when the run ends, so three of them prove the
+  run stopped.
+  ```sh
+  control-agent-server conversation send "$W" --text 'hi' --no-run
+  control-agent-server ws start "/sockets/events/$W" --name f05-w-step --duration 300
+  control-agent-server api POST "/api/conversations/$W/run" --expect 200 --check success eq true
+  control-agent-server api GET "/api/conversations/$W/events/count" --query kind=$ACTION_KIND --check . eq 1 --until-ok 30
+  control-agent-server api POST "/api/conversations/$W/pause" --expect 200 --check success eq true --timeout 60 --save F05.pause-tool-step/pause
+  control-agent-server ws read f05-w-step --contains '"key": "full_state"' --expect-min 3 --wait 30
+  control-agent-server api GET "/api/conversations/$W" --check execution_status eq paused --save F05.pause-tool-step/get
+  control-agent-server api GET "/api/conversations/$W/events/search" --query kind=$OBSERVATION_KIND \
+    --check items len-eq 1 --check items.0.observation.content.0.text contains QA_F05_STEP_DONE --save F05.pause-tool-step/observation
+  control-agent-server api GET "/api/conversations/$W/events/count" --query kind=$PAUSE_KIND --check . eq 1
+  control-agent-server api GET "/api/conversations/$W/events/count" --query kind=$ACTION_KIND --check . eq 1
+  control-agent-server sink read --name qa-f05-step --expect-min 1 --expect-max 1
+  control-agent-server ws stop f05-w-step --contains '"key": "execution_status", "value": "paused"' --save F05.pause-tool-step/frames
+  ```
+  The command finishes (its observation holds `QA_F05_STEP_DONE`), then the
+  loop stops: `paused`, one `PauseEvent`, still one action and one model
+  request, and the socket pushed `paused`. Today the `/pause` request itself
+  returns only when the command ends (about 5 s here): the run loop holds the
+  state lock for the whole tool call, and pause waits for it.
+- **Interrupt during a tool call (`F05.interrupt-tool-call`).** `T`'s model
+  asks for `terminal` `sleep 30`; the interrupt lands while it runs. Then the
+  stub is rewritten to call `finish` and the run resumes.
+  ```sh
+  control-agent-server conversation send "$T" --text 'hi' --no-run
+  control-agent-server api POST "/api/conversations/$T/run" --expect 200 --check success eq true
+  control-agent-server api GET "/api/conversations/$T/events/count" --query kind=$ACTION_KIND --check . eq 1 --until-ok 30
+  TCALL=$(control-agent-server api GET "/api/conversations/$T/events/search" --query kind=$ACTION_KIND --field items.0.tool_call_id)
+  control-agent-server api POST "/api/conversations/$T/interrupt" --expect 200 --check success eq true --expect-max-ms 4000 --timeout 60 --save F05.interrupt-tool-call/interrupt
+  control-agent-server api GET "/api/conversations/$T" --check execution_status eq paused
+  control-agent-server api GET "/api/conversations/$T/events/search" --query kind=$AGENT_ERROR_KIND \
+    --check items len-eq 1 --check items.0.tool_call_id eq "$TCALL" --save F05.interrupt-tool-call/agent-error
+  control-agent-server api GET "/api/conversations/$T/events/count" --query kind=$INTERRUPT_KIND --check . eq 1
+  control-agent-server api GET "/api/conversations/$T/events/count" --query kind=$OBSERVATION_KIND --check . eq 0
+  control-agent-server fixture llm-stub --name qa-f05-tool --step 'tool:finish:{"message":"QA_F05_TOOL_RESUMED"}'
+  control-agent-server api POST "/api/conversations/$T/run" --expect 200 --check success eq true
+  control-agent-server conversation wait "$T" --until finished --timeout 60
+  control-agent-server api GET "/api/conversations/$T/agent_final_response" --check response eq QA_F05_TOOL_RESUMED
+  control-agent-server sink read --name qa-f05-tool --contains 'Tool call interrupted before completion' --expect-min 1 --save F05.interrupt-tool-call/resumed-request
+  ```
+  The interrupt answers at once although the command would run for 30 s:
+  `paused`, one `InterruptEvent`, one `AgentErrorEvent` ("Tool call
+  interrupted before completion...") answering the action's `tool_call_id`,
+  and no observation. The resumed model request carries that error as the
+  tool result, so the history stays valid, and `T` finishes.
 - **Run capacity (`F05.run-capacity`).** One slot: `G` holds it on a hanging
   call while `Q` asks to run.
   ```sh
@@ -437,18 +531,19 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
 - **Statuses survive the restart (`F05.restart-keeps-status`).** Read-only
   checks after the previous bullet's restart.
   ```sh
-  for CID in "$A" "$B" "$Q" "$R"; do
+  for CID in "$A" "$B" "$Q" "$R" "$T"; do
     control-agent-server api GET "/api/conversations/$CID" --check execution_status eq finished
   done
-  for CID in "$C" "$P" "$G"; do
+  for CID in "$C" "$P" "$G" "$W"; do
     control-agent-server api GET "/api/conversations/$CID" --check execution_status eq paused
   done
   control-agent-server api GET "/api/conversations/$E" --check execution_status eq error --save F05.restart-keeps-status/error
-  control-agent-server api GET /api/conversations/count --query status=paused --check . eq 4 --save F05.restart-keeps-status/paused-count
+  control-agent-server api GET /api/conversations/count --query status=paused --check . eq 5 --save F05.restart-keeps-status/paused-count
+  control-agent-server api GET /api/conversations/count --query status=finished --check . eq 5
   control-agent-server api GET /api/conversations/count --query status=running --check . eq 0
   ```
-  Four conversations are `finished`, four `paused` (`C`, `P`, `G`, `K`), `E`
-  is still `error` and nothing is `running`.
+  Five conversations are `finished`, five `paused` (`C`, `P`, `G`, `W`, `K`),
+  `E` is still `error` and nothing is `running`.
 - **Crash while running (`F05.restart-hard-running`).** SIGKILL leaves
   `running` on disk.
   ```sh
@@ -469,13 +564,39 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   over the dead owner's lease, marks `K` `error` (a persisted
   `execution_status` update), nothing is `running`, and `/run` resumes `K`
   (interrupted again to free the slot).
+- **Crash after a mid-call pause (`F05.pause-running-crash`), known bug.**
+  `K` runs into the hanging stub again, is paused while the model call is in
+  flight, and the server is SIGKILLed. The last bullet, so nothing depends on
+  what it leaves behind.
+  ```sh
+  H=$(control-agent-server sink read --name qa-f05-hang | python3 -c 'import json, sys; print(json.load(sys.stdin)["requests"])')
+  control-agent-server api POST "/api/conversations/$K/run" --expect 200 --check success eq true
+  control-agent-server conversation wait "$K" --until running --timeout 60
+  for i in $(seq 1 20); do
+    NOW=$(control-agent-server sink read --name qa-f05-hang | python3 -c 'import json, sys; print(json.load(sys.stdin)["requests"])')
+    if [ "$NOW" -gt "$H" ]; then break; fi
+    sleep 0.5
+  done
+  test "$NOW" -gt "$H"
+  control-agent-server api POST "/api/conversations/$K/pause" --expect 200 --check success eq true --expect-max-ms 3000
+  control-agent-server api GET /api/conversations/search --query status=paused --check items contains "$K"
+  control-agent-server api GET "/api/conversations/$K/events/count" --query kind=$PAUSE_KIND --check . eq 2
+  control-agent-server restart --hard
+  control-agent-server api GET "/api/conversations/$K" --check execution_status eq paused --save F05.pause-running-crash/get
+  ```
+  Expected: `paused`, the last status the server accepted and persisted in
+  the event log (the `PauseEvent` and the `execution_status` `paused` update
+  are both on disk). Today `K` comes back `error`: the pause never reached
+  `base_state.json` (`F05.pause-running-get`), so the restart sees `running`
+  and treats the conversation as crashed mid-run.
 
 ## Gotchas
 
 - `initial_message` on create always starts a run, whatever its `run` field
-  says (see F04), and `conversation start --no-run` therefore still runs. To
-  stage pending input, create without a prompt and append with
-  `conversation send --no-run` (`POST .../events` with `"run": false`).
+  says (`_start_conversation` calls `run()` after sending it; see F04). To
+  stage pending input, create without one and append with
+  `conversation send --no-run` (`POST .../events` with `"run": false`);
+  `conversation start --prompt ... --no-run` does exactly that.
 - Creating a conversation takes a run slot too (the create path is admitted
   like a run, by design: `tests/agent_server/test_run_admission.py`). With
   `max_concurrent_runs` 1 and a run in progress, `POST /api/conversations`
@@ -492,6 +613,13 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   is paused. `/interrupt` cancels the call (and is the way out); it waits at
   most 5 s for the run task, and if the task has not ended by then `/run`
   stays 409 until it does.
+- Pause during a tool call is different: the run loop holds the state lock
+  for the whole tool call (it releases it only around model calls), so the
+  `/pause` request itself blocks until the tool returns, then answers 200
+  with the step complete. A consumer with a short HTTP timeout sees a timeout
+  on a pause that later takes effect; `/interrupt` answers at once and turns
+  the unfinished call into an `AgentErrorEvent`
+  (`F05.pause-tool-step`, `F05.interrupt-tool-call`).
 - `/run` returns before anything happens; observe the outcome with
   `conversation wait`, the events socket or the event log. A provider failure
   is a 200 from `/run` followed by `error` and a `ConversationErrorEvent`.
@@ -508,9 +636,15 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   over immediately; a lease from another host must expire first
   (`OH_LEASE_TTL_SECONDS`, default 45), and until then `/run` answers 404.
 - The 5 s stall in `F05.run-error-responsive` depends on logging: it happens
-  with the default console logging (`launch` does not set `LOG_JSON`) and not
-  with `LOG_JSON=true`. Every failed run also delays the socket's error frames
-  by the same amount.
+  with the default console logging (`launch` sets neither `LOG_JSON` nor
+  `LOG_RICH_TRACEBACKS`) and not with `LOG_JSON=true` or
+  `LOG_RICH_TRACEBACKS=false`. Every failed run also delays the socket's
+  error frames by the same amount, so wait for them with `ws read --wait`.
+- A run's end is visible on the socket as a `full_state`
+  `ConversationStateUpdateEvent`; the server also sends one on connect and
+  after every pause and interrupt. Counting them (`--expect-min`) is how the
+  recipes prove a run ended when no status changes (`F05.run-finished-noop`,
+  `F05.pause-tool-step`).
 - `/run` on a conversation waiting for confirmation approves the pending
   actions; pause, interrupt, pause and resume of `/goal` loops, conversation
   webhooks on pause and interrupt, and credential bindings are covered by

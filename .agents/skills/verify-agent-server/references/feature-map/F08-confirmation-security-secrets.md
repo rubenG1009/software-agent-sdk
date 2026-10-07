@@ -43,7 +43,9 @@ Routes: `POST /api/conversations/{conversation_id}/events/respond_to_confirmatio
 - `F08.secrets-bad-value`: a number or `null` as a secret value is refused with 422, not a 500.
 - `F08.secrets-terminal`: a terminal command that names a runtime secret receives its value, while the observation and the next request to the model show `<secret-hidden>` and the plaintext is stored nowhere.
 - `F08.secrets-override`: a runtime secret replaces a start-time secret of the same name for the next command.
+- `F08.secrets-lookup`: a runtime `LookupSecret` is fetched from its URL with its headers only when a command names it; the command gets the fetched text, the observation and the model see `<secret-hidden>`, and GET hides the `Authorization` header that `base_state.json` keeps encrypted.
 - `F08.secrets-profile-scope`: for a conversation launched from an Agent Profile with `secret_refs`, names outside the list are silently dropped (200).
+- `F08.secrets-no-cipher`: on a server with no cipher (no `OH_SECRET_KEY`, no session key) a runtime secret reaches commands while the conversation lives, is persisted only as the redaction placeholder (the server warns at startup), and is empty after a restart although GET still lists the name.
 - `F08.secrets-restart`: a runtime secret that reached `base_state.json` is still injected into commands after a server restart.
 - `F08.secrets-unsaved-restart`: a runtime secret survives a restart even when nothing else changed in the conversation after it was posted.
 - `F08.secrets-override-restart`: a runtime override of a start-time secret still wins after a restart.
@@ -89,7 +91,9 @@ Routes: `POST /api/conversations/{conversation_id}/events/respond_to_confirmatio
   approve/reject buttons on a pending action call these routes.
 - Recipes below use REST through `api`, the socket through `ws start`/`ws stop`,
   scripted terminal actions from `fixture llm-stub` (one stub per scenario,
-  because a stub's step counter never resets), and DeepSeek flash for the
+  because a stub's step counter never resets), `fixture http-sink` as the
+  URL a `LookupSecret` points at, two short-lived second servers (one with
+  `max_concurrent_runs` 1, one without a cipher), and DeepSeek flash for the
   real-model confirmation path.
 
 ## Driving it with control-agent-server
@@ -111,14 +115,22 @@ Preconditions:
   (`rm -rf qa-f08-victim`, finish), `$RISKY_AGENT` (a low-risk `echo`,
   `rm -rf qa-f08-victim`, an `echo`, finish), `$SECRET_AGENT` (write
   `$QA_F08_TOKEN` to a file and echo it, finish, twice), `$ROTATE_AGENT`
-  (write `$QA_F08_ROT` to a file, finish, twice) and `$POLICY_AGENT` (write
-  `qa-f08-policy.txt`, finish).
+  (write `$QA_F08_ROT` to a file, finish), `$ROTATE_RESTART_AGENT` (the same,
+  twice), `$LOOKUP_AGENT` (write `$QA_F08_LOOKUP` to a file and echo it,
+  finish) and `$POLICY_AGENT` (write `qa-f08-policy.txt`, finish). The
+  no-cipher bullet makes its own stub on its own server. Last, it creates
+  `$KID`, an idle conversation on the offline agent that the knob, error and
+  secret-form bullets share.
+- Every `known bug` bullet uses only these variables and arranges the rest
+  itself (including its own `restart`), so
+  `map run --file F08 --only <ID> --fresh` reproduces it alone, as fix
+  verification needs.
 
 ```sh
 control-agent-server llm preset deepseek
 W="$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f08"
 mkdir -p "$W/knobs" "$W/accept" "$W/reject/qa-f08-victim" "$W/risky/qa-f08-victim" "$W/secret" "$W/rotate" \
-  "$W/scoped" "$W/real" "$W/policy" "$W/analyzer"
+  "$W/rotate-restart" "$W/lookup" "$W/scoped" "$W/nocipher" "$W/real" "$W/policy" "$W/analyzer"
 NOPE=$(python3 -c 'import uuid; print(uuid.uuid4())')
 OFFLINE_AGENT='{"llm": {"model": "openai/qa-offline", "api_key": "qa-offline-key", "base_url": "http://127.0.0.1:9/v1", "num_retries": 0}, "tools": []}'
 MSG='{"role": "user", "content": [{"type": "text", "text": "Run the command."}]}'
@@ -134,18 +146,22 @@ RISKY_AGENT=$(stub_agent qa-f08-risky --step 'tool:terminal:{"command":"echo qa-
 SECRET_STEP='tool:terminal:{"command":"printf %s \"$QA_F08_TOKEN\" > qa-f08-token.txt; echo \"token=$QA_F08_TOKEN\""}'
 SECRET_AGENT=$(stub_agent qa-f08-secret --step "$SECRET_STEP" --step "$FINISH" --step "$SECRET_STEP" --step "$FINISH")
 ROTATE_STEP='tool:terminal:{"command":"printf %s \"$QA_F08_ROT\" > qa-f08-rot.txt"}'
-ROTATE_AGENT=$(stub_agent qa-f08-rotate --step "$ROTATE_STEP" --step "$FINISH" --step "$ROTATE_STEP" --step "$FINISH")
+ROTATE_AGENT=$(stub_agent qa-f08-rotate --step "$ROTATE_STEP" --step "$FINISH")
+ROTATE_RESTART_AGENT=$(stub_agent qa-f08-rotate-restart --step "$ROTATE_STEP" --step "$FINISH" --step "$ROTATE_STEP" --step "$FINISH")
+LOOKUP_STEP='tool:terminal:{"command":"printf %s \"$QA_F08_LOOKUP\" > qa-f08-lookup.txt; echo \"lookup=$QA_F08_LOOKUP\""}'
+LOOKUP_AGENT=$(stub_agent qa-f08-lookup --step "$LOOKUP_STEP" --step "$FINISH")
 POLICY_AGENT=$(stub_agent qa-f08-policy --step 'tool:terminal:{"command":"echo qa-policy > qa-f08-policy.txt"}' --step "$FINISH")
 REJECT_KIND=openhands.sdk.event.llm_convertible.observation.UserRejectObservation
 OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEvent
+KID=$(control-agent-server api POST /api/conversations \
+  --json "{\"workspace\": {\"working_dir\": \"$W/knobs\"}, \"agent\": $OFFLINE_AGENT, \"autotitle\": false}" --expect 201 --field id)
 ```
 
-- **Set the confirmation policy (`F08.policy-set`).** An idle conversation
-  starts with `NeverConfirm`; a socket capture records each change.
+- **Set the confirmation policy (`F08.policy-set`).** The idle `$KID`
+  starts with `NeverConfirm` and no analyzer; a socket capture records each
+  change.
   ```sh
-  KID=$(control-agent-server api POST /api/conversations \
-    --json "{\"workspace\": {\"working_dir\": \"$W/knobs\"}, \"agent\": $OFFLINE_AGENT, \"autotitle\": false}" \
-    --expect 201 --check confirmation_policy.kind eq NeverConfirm --check security_analyzer eq null --field id)
+  control-agent-server api GET "/api/conversations/$KID" --check confirmation_policy.kind eq NeverConfirm --check security_analyzer eq null
   control-agent-server ws start "/sockets/events/$KID" --name qa-f08-policy --duration 120
   control-agent-server api POST "/api/conversations/$KID/confirmation_policy" --json '{"policy": {"kind": "AlwaysConfirm"}}' \
     --expect 200 --check success eq true --save F08.policy-set/always
@@ -158,13 +174,16 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
     --check confirmation_policy.threshold eq MEDIUM --check confirmation_policy.confirm_unknown eq false --save F08.policy-set/risky
   control-agent-server api POST "/api/conversations/$KID/confirmation_policy" --json '{"policy": {"kind": "NeverConfirm"}}' --expect 200
   control-agent-server api GET "/api/conversations/$KID" --check confirmation_policy.kind eq NeverConfirm
-  control-agent-server ws stop qa-f08-policy --kinds ConversationStateUpdateEvent --contains '"threshold": "MEDIUM"' --save F08.policy-set/socket
+  control-agent-server ws read qa-f08-policy --kinds ConversationStateUpdateEvent --contains '"threshold": "MEDIUM"' --wait 10
+  control-agent-server ws stop qa-f08-policy --kinds ConversationStateUpdateEvent --contains '"key": "confirmation_policy"' \
+    --expect-min 3 --save F08.policy-set/socket
   control-agent-server conversation events "$KID" --key confirmation_policy --contains ConfirmRisky
   ```
   Each POST is 200 `{"success": true}`, the next GET and `base_state.json`
   show the new policy (`ConfirmRisky` keeps `threshold` `MEDIUM` and
-  `confirm_unknown` `false`), and the socket pushed a `confirmation_policy`
-  state update for each change.
+  `confirm_unknown` `false`), and the socket pushed one `confirmation_policy`
+  state update per change (three), the `ConfirmRisky` one with its
+  threshold; the event history has them too.
 - **Policy errors (`F08.policy-errors`).** Bad bodies, an unknown id, no key.
   ```sh
   control-agent-server api POST "/api/conversations/$KID/confirmation_policy" --json '{"policy": {"kind": "SometimesConfirm"}}' \
@@ -274,13 +293,17 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   test ! -e "$W/cap/qa-f08-cap.txt"
   control-agent-server api POST "/api/conversations/$X/events/respond_to_confirmation" --run "$B" --json '{"accept": false}' --expect 200
   control-agent-server conversation wait "$X" --run "$B" --until idle --timeout 60
+  control-agent-server api GET "/api/conversations/$X/events/search" --run "$B" --query kind="$REJECT_KIND" \
+    --check items len-eq 1 --check items.0.rejection_reason eq 'User rejected the action.'
   control-agent-server api POST "/api/conversations/$Y/events/respond_to_confirmation" --run "$B" --json '{"accept": true}' \
     --expect 200 --save F08.confirm-capacity/accept-running
   control-agent-server api GET "/api/conversations/$Y" --run "$B" --check execution_status eq running
   test ! -e "$W/cap/qa-f08-cap.txt"
   ```
   The accept is 429 `Conversation run limit reached` and `X` keeps waiting
-  with its command unrun; the reject needs no slot and succeeds; an accept
+  with its command unrun; the reject needs no slot and succeeds (one
+  `UserRejectObservation` with the default reason `User rejected the
+  action.`, since the body sent none); an accept
   on the running conversation is a 200 no-op. The trap stops the second
   server.
 - **A real model asks first (`F08.confirm-real`).** DeepSeek flash with the
@@ -322,11 +345,14 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   control-agent-server api GET "/api/conversations/$KID" --check security_analyzer.kind eq LLMSecurityAnalyzer
   control-agent-server api POST "/api/conversations/$KID/security_analyzer" --json '{"security_analyzer": null}' --expect 200
   control-agent-server api GET "/api/conversations/$KID" --check security_analyzer eq null --save F08.analyzer-set-clear/cleared
-  control-agent-server ws stop qa-f08-analyzer --kinds ConversationStateUpdateEvent --contains LLMSecurityAnalyzer --save F08.analyzer-set-clear/socket
+  control-agent-server ws read qa-f08-analyzer --kinds ConversationStateUpdateEvent --contains LLMSecurityAnalyzer --wait 10
+  control-agent-server ws stop qa-f08-analyzer --kinds ConversationStateUpdateEvent --contains '"key": "security_analyzer"' \
+    --expect-min 3 --save F08.analyzer-set-clear/socket
   ```
   GET and `base_state.json` follow each change (`PatternSecurityAnalyzer`
   comes back with its default pattern lists), the clear leaves `null`, and
-  the socket pushed `security_analyzer` state updates.
+  the socket pushed one `security_analyzer` state update per change (three,
+  the last with `value` `null`).
 - **Analyzer errors (`F08.analyzer-errors`).** The field is required even to
   clear it.
   ```sh
@@ -335,10 +361,12 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   control-agent-server api POST "/api/conversations/$KID/security_analyzer" --json '{"security_analyzer": {"kind": "NopeAnalyzer"}}' \
     --expect 422 --check detail.0.msg contains 'Unknown kind'
   control-agent-server api POST "/api/conversations/$NOPE/security_analyzer" --json '{"security_analyzer": null}' --expect 404
-  control-agent-server api POST "/api/conversations/$KID/security_analyzer" --json '{"security_analyzer": null}' --auth none --expect 401
+  control-agent-server api POST "/api/conversations/$KID/security_analyzer" --json '{"security_analyzer": {"kind": "PatternSecurityAnalyzer"}}' \
+    --auth none --expect 401
   control-agent-server api GET "/api/conversations/$KID" --check security_analyzer eq null
   ```
-  All statuses match and the analyzer is still `null`.
+  All statuses match and the analyzer is still `null`, although the
+  refused unauthenticated request asked for `PatternSecurityAnalyzer`.
 - **Risk-based confirmation (`F08.confirm-risky`).** `ConfirmRisky` (default
   threshold `HIGH`, `confirm_unknown` true) with `PatternSecurityAnalyzer`
   set at runtime; the stub proposes `echo`, then `rm -rf qa-f08-victim`, then
@@ -353,6 +381,7 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   test "$(cat "$W/risky/qa-f08-low.txt")" = qa-low
   test -d "$W/risky/qa-f08-victim"
   control-agent-server conversation events "$RK" --kinds ActionEvent --show 1 --contains 'rm -rf' --save F08.confirm-risky/held
+  control-agent-server api GET "/api/conversations/$RK/events/count" --query kind="$OBSERVATION_KIND" --check . eq 1
   control-agent-server api POST "/api/conversations/$RK/events/respond_to_confirmation" --json '{"accept": false, "reason": "QA_F08 high risk"}' --expect 200
   control-agent-server api POST "/api/conversations/$RK/security_analyzer" --json '{"security_analyzer": null}' --expect 200
   control-agent-server api POST "/api/conversations/$RK/events/respond_to_confirmation" --json '{"accept": true}' --expect 200
@@ -377,18 +406,21 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   control-agent-server api PATCH "/api/conversations/$KID" --json '{"tags": {"qa": "f08-save"}}' --expect 200 --check success eq true
   control-agent-server api GET "/api/conversations/$KID" --expect 200 \
     --check secret_registry.secret_sources.QA_F08_PLAIN.kind eq StaticSecret \
-    --check secret_registry.secret_sources.QA_F08_PLAIN.value ne qa-f08-plain-value \
+    --check secret_registry.secret_sources.QA_F08_PLAIN.value eq null \
     --check secret_registry.secret_sources.QA_F08_DICT.kind eq StaticSecret \
     --check secret_registry.secret_sources.QA_F08_STATIC.description eq 'qa static' \
-    --check secret_registry.secret_sources.QA_F08_STATIC.value ne qa-f08-static-value --save F08.secrets-update/get
+    --check secret_registry.secret_sources.QA_F08_STATIC.value eq null --save F08.secrets-update/get
   control-agent-server state cat "server/workspace/conversations/${KID//-/}/base_state.json" --max-chars 200 \
-    --check secret_registry.secret_sources.QA_F08_PLAIN.value exists --not-contains qa-f08-plain-value
+    --check secret_registry.secret_sources.QA_F08_PLAIN.value exists \
+    --check secret_registry.secret_sources.QA_F08_PLAIN.value ne '**********' --not-contains qa-f08-plain-value
   control-agent-server state grep qa-f08-dict-value --glob 'server/**/*' --expect-none
   control-agent-server state grep qa-f08-static-value --glob 'server/**/*' --expect-none
   ```
   The POST is 200; after the save GET lists all three names as
   `StaticSecret` with `value` `null` (masked) and the description kept, and
-  `base_state.json` holds cipher text, never the plaintext.
+  `base_state.json` holds cipher text: neither the plaintext nor the
+  `**********` placeholder a server without a cipher writes
+  (`F08.secrets-no-cipher`).
 - **Runtime secret visible to GET (`F08.secrets-visible`), known bug.** Post
   one more secret and read the conversation right away.
   ```sh
@@ -430,7 +462,7 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   ```
   Expected: 422 like any other invalid body. Today both are 500
   `"exception": "'int' object has no attribute 'pop'"` (`'NoneType'` for
-  `null`): `UpdateSecretsRequest.convert_string_secrets` passes non-string,
+  `null`; `true` gives `'bool'`): `UpdateSecretsRequest.convert_string_secrets` passes non-string,
   non-dict values through, and `DiscriminatedUnionMixin` calls `.pop("kind")`
   on them, an `AttributeError` that escapes request validation. Same root
   cause as `F04.create-secrets-plain`.
@@ -445,15 +477,17 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   test "$(cat "$W/secret/qa-f08-token.txt")" = qa-f08-token-value
   control-agent-server conversation events "$SID" --kinds ObservationEvent --contains 'token=<secret-hidden>' \
     --save F08.secrets-terminal/observation
-  control-agent-server sink read --name qa-f08-secret --contains 'token=<secret-hidden>' --expect-min 1
-  if grep -q qa-f08-token-value "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f08-secret.jsonl"; then exit 1; fi
+  control-agent-server sink read --name qa-f08-secret --contains 'token=<secret-hidden>' --expect-min 1 --save F08.secrets-terminal/model-request
+  control-agent-server sink read --name qa-f08-secret --contains qa-f08-token-value --expect-max 0
+  control-agent-server state grep QA_F08_TOKEN --glob 'server/**/*'
   control-agent-server state grep qa-f08-token-value --glob 'server/**/*' --expect-none
   control-agent-server api GET "/api/conversations/$SID" --check secret_registry.secret_sources.QA_F08_TOKEN.kind eq StaticSecret
   ```
   The file holds the real value, so the command got it as an environment
-  variable; the observation reads `token=<secret-hidden>`, the model's next
-  request carries the masked text and never the value, and no server file
-  holds the plaintext. The run saved the state, so GET lists the name.
+  variable; the observation reads `token=<secret-hidden>`, the stub's
+  recorded model requests carry the masked text and never the value, and no
+  server file holds the plaintext although the name is stored (the positive
+  control for the glob). The run saved the state, so GET lists the name.
 - **Override a start-time secret (`F08.secrets-override`).** A conversation
   created with `QA_F08_ROT` = `qa-f08-rot-old`, then a runtime POST of a new
   value.
@@ -465,10 +499,43 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
     --expect 200 --save F08.secrets-override/post
   control-agent-server conversation send "$ROT" --text 'Run the command.' --wait --until finished --timeout 120
   test "$(cat "$W/rotate/qa-f08-rot.txt")" = qa-f08-rot-new
-  rm "$W/rotate/qa-f08-rot.txt"
   ```
   The command wrote `qa-f08-rot-new`: the runtime value replaced the
   start-time one in the live registry.
+- **Lookup secret (`F08.secrets-lookup`).** A runtime `LookupSecret` whose
+  URL is an HTTP sink that answers `qa-f08-lookup-value`, with an
+  `Authorization` header (a secret-looking name) and a plain one.
+  ```sh
+  LOOKUP_URL=$(control-agent-server fixture http-sink --name qa-f08-lookup-src --body qa-f08-lookup-value --print-path)
+  LK=$(control-agent-server api POST /api/conversations \
+    --json "{\"workspace\": {\"working_dir\": \"$W/lookup\"}, \"agent\": $LOOKUP_AGENT, \"autotitle\": false}" --expect 201 --field id)
+  control-agent-server api POST "/api/conversations/$LK/secrets" \
+    --json "{\"secrets\": {\"QA_F08_LOOKUP\": {\"kind\": \"LookupSecret\", \"url\": \"$LOOKUP_URL/qa-f08-secret\", \"headers\": {\"Authorization\": \"Bearer qa-f08-lookup-auth\", \"X-QA-F08\": \"qa-f08-header\"}}}}" \
+    --expect 200 --check success eq true --save F08.secrets-lookup/post
+  control-agent-server sink read --name qa-f08-lookup-src --expect-max 0
+  control-agent-server conversation send "$LK" --text 'Run the command.' --wait --until finished --timeout 120
+  test "$(cat "$W/lookup/qa-f08-lookup.txt")" = qa-f08-lookup-value
+  control-agent-server sink read --name qa-f08-lookup-src --path /qa-f08-secret --contains 'Bearer qa-f08-lookup-auth' \
+    --expect-min 1 --save F08.secrets-lookup/fetch
+  control-agent-server sink read --name qa-f08-lookup-src --contains qa-f08-header --expect-min 1
+  control-agent-server conversation events "$LK" --kinds ObservationEvent --contains 'lookup=<secret-hidden>' --save F08.secrets-lookup/observation
+  control-agent-server sink read --name qa-f08-lookup --contains 'lookup=<secret-hidden>' --expect-min 1
+  control-agent-server sink read --name qa-f08-lookup --contains qa-f08-lookup-value --expect-max 0
+  control-agent-server api GET "/api/conversations/$LK" --check secret_registry.secret_sources.QA_F08_LOOKUP.kind eq LookupSecret \
+    --check secret_registry.secret_sources.QA_F08_LOOKUP.url eq "$LOOKUP_URL/qa-f08-secret" \
+    --check secret_registry.secret_sources.QA_F08_LOOKUP.headers.X-QA-F08 eq qa-f08-header \
+    --check secret_registry.secret_sources.QA_F08_LOOKUP.headers.Authorization missing --save F08.secrets-lookup/get
+  control-agent-server state cat "server/workspace/conversations/${LK//-/}/base_state.json" --max-chars 200 \
+    --check secret_registry.secret_sources.QA_F08_LOOKUP.headers.Authorization exists --not-contains qa-f08-lookup-auth
+  control-agent-server state grep qa-f08-lookup-value --glob 'server/**/*' --expect-none
+  ```
+  Nothing is fetched when the secret is posted. The command that names
+  `QA_F08_LOOKUP` makes the server `GET` the URL with both headers and
+  receive the sink's text, which the command writes to the file; the
+  observation and the model's next request show `lookup=<secret-hidden>`.
+  GET returns the URL and the plain header but leaves the `Authorization`
+  header out, `base_state.json` keeps it as cipher text, and the fetched
+  value is stored nowhere.
 - **Agent Profile secret scope (`F08.secrets-profile-scope`).** An Agent
   Profile that allows only `QA_F08_ALLOWED`.
   ```sh
@@ -487,21 +554,50 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   ```
   The POST is 200 for both names, but only `QA_F08_ALLOWED` is stored: the
   launched profile's `secret_refs` filter runtime secrets without an error.
-- **Restart with runtime knobs (`F08.secrets-restart`).** Arrange the state
-  the restart bullets read, restart, and prove a saved runtime secret still
-  reaches the terminal.
+- **No cipher (`F08.secrets-no-cipher`).** A second server with neither
+  `OH_SECRET_KEY` nor a session key, so it has no cipher. Its stub's key is
+  also passed as `OPENAI_API_KEY`: without a cipher the agent's own
+  `api_key` is redacted on save too, and the run after the restart would
+  otherwise end in `error` (`LLMAuthenticationError`) before any command.
   ```sh
-  PR=$(control-agent-server api POST /api/conversations \
-    --json "{\"workspace\": {\"working_dir\": \"$W/policy\"}, \"agent\": $POLICY_AGENT, \"autotitle\": false}" --expect 201 --field id)
-  control-agent-server api POST "/api/conversations/$PR/confirmation_policy" --json '{"policy": {"kind": "AlwaysConfirm"}}' --expect 200
-  control-agent-server api GET "/api/conversations/$PR" --check confirmation_policy.kind eq AlwaysConfirm
-  PA=$(control-agent-server api POST /api/conversations \
-    --json "{\"workspace\": {\"working_dir\": \"$W/analyzer\"}, \"agent\": $OFFLINE_AGENT, \"autotitle\": false}" --expect 201 --field id)
-  control-agent-server api POST "/api/conversations/$PA/security_analyzer" --json '{"security_analyzer": {"kind": "PatternSecurityAnalyzer"}}' --expect 200
-  control-agent-server api GET "/api/conversations/$PA" --check security_analyzer.kind eq PatternSecurityAnalyzer
-  control-agent-server api PATCH "/api/conversations/$ROT" --json '{"tags": {"qa": "f08-rotated"}}' --expect 200
-  control-agent-server api GET "/api/conversations/$ROT" --check secret_registry.secret_sources.QA_F08_ROT.kind eq StaticSecret
-  control-agent-server api POST "/api/conversations/$KID/secrets" --json '{"secrets": {"QA_F08_UNSAVED": "qa-f08-unsaved-value"}}' --expect 200
+  NC=$(control-agent-server launch --new --no-auth --no-secret-key --name f08-nocipher --print-run \
+    --env TMUX_TMPDIR=/tmp/qa-f08-tmux --env OPENAI_API_KEY=qa-stub-key)
+  trap 'control-agent-server stop --run "$NC" >/dev/null' EXIT
+  NC_STEP='tool:terminal:{"command":"printf %s \"$QA_F08_NC\" > qa-f08-nc.txt"}'
+  NC_STUB=$(control-agent-server fixture llm-stub --run "$NC" --name qa-f08-nocipher \
+    --step "$NC_STEP" --step "$FINISH" --step "$NC_STEP" --step "$FINISH" --print-path)
+  N=$(control-agent-server api POST /api/conversations --run "$NC" \
+    --json "{\"workspace\": {\"working_dir\": \"$W/nocipher\"}, \"agent\": {\"llm\": {\"model\": \"openai/qa-stub\", \"api_key\": \"qa-stub-key\", \"base_url\": \"$NC_STUB/v1\", \"num_retries\": 0}, \"tools\": [{\"name\": \"terminal\"}]}, \"autotitle\": false}" \
+    --expect 201 --field id)
+  control-agent-server api POST "/api/conversations/$N/secrets" --run "$NC" --json '{"secrets": {"QA_F08_NC": "qa-f08-nc-value"}}' \
+    --expect 200 --save F08.secrets-no-cipher/post
+  control-agent-server conversation send "$N" --run "$NC" --text 'Run the command.' --wait --until finished --timeout 120
+  test "$(cat "$W/nocipher/qa-f08-nc.txt")" = qa-f08-nc-value
+  control-agent-server state cat "server/workspace/conversations/${N//-/}/base_state.json" --run "$NC" --max-chars 200 \
+    --check secret_registry.secret_sources.QA_F08_NC.value eq '**********' --not-contains qa-f08-nc-value
+  control-agent-server state grep QA_F08_NC --run "$NC" --glob 'server/**/*'
+  control-agent-server state grep qa-f08-nc-value --run "$NC" --glob 'server/**/*' --expect-none
+  control-agent-server logs --run "$NC" --grep 'OH_SECRET_KEY was not defined' --expect-min 1
+  rm "$W/nocipher/qa-f08-nc.txt"
+  control-agent-server restart --run "$NC"
+  control-agent-server conversation send "$N" --run "$NC" --text 'Run it again.' --wait --until finished --timeout 120
+  test -e "$W/nocipher/qa-f08-nc.txt"
+  test ! -s "$W/nocipher/qa-f08-nc.txt"
+  control-agent-server api GET "/api/conversations/$N" --run "$NC" --check secret_registry.secret_sources.QA_F08_NC.kind eq StaticSecret \
+    --check secret_registry.secret_sources.QA_F08_NC.value eq null --save F08.secrets-no-cipher/after-restart
+  ```
+  While the conversation lives, the command gets `qa-f08-nc-value`.
+  `base_state.json` holds the redaction placeholder `**********`, never the
+  value, and the log carries `OH_SECRET_KEY was not defined. Secrets will
+  not be persisted between restarts.` After the restart the same command
+  runs with an empty `$QA_F08_NC` (the file exists and is empty), yet GET
+  still lists `QA_F08_NC`, masked like any other secret, so a client cannot
+  tell that it was lost. This is the documented design (`Config.secret_key`);
+  the trap stops the second server.
+- **Restart with a saved secret (`F08.secrets-restart`).** `$SID` got
+  `QA_F08_TOKEN` at runtime and ran a command (which saved the state) in the
+  terminal bullet; restart and run the same command again.
+  ```sh
   rm "$W/secret/qa-f08-token.txt"
   control-agent-server restart
   control-agent-server doctor
@@ -510,40 +606,58 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   control-agent-server api GET "/api/conversations/$SID" --check secret_registry.secret_sources.QA_F08_TOKEN.kind eq StaticSecret \
     --save F08.secrets-restart/after-restart
   ```
-  Before the restart `$PR` runs `AlwaysConfirm`, `$PA` has the pattern
-  analyzer, `$ROT`'s override is saved, and `$KID` has one secret posted
-  with no save after it. After the restart the server is healthy and
-  `QA_F08_TOKEN` (saved encrypted with the run's `OH_SECRET_KEY`) is
-  injected again.
-- **Unsaved secret restart (`F08.secrets-unsaved-restart`), known bug.**
-  `QA_F08_UNSAVED` was posted to `$KID` right before the restart.
+  After the restart the server is healthy and `QA_F08_TOKEN` (saved
+  encrypted with the run's `OH_SECRET_KEY`) is injected again.
+- **Unsaved secret restart (`F08.secrets-unsaved-restart`), known bug.** One
+  secret is saved by a PATCH (the positive control), a second is posted with
+  nothing after it, then the server restarts.
   ```sh
-  control-agent-server api PATCH "/api/conversations/$KID" --json '{"tags": {"qa": "f08-after-restart"}}' --expect 200
-  control-agent-server api GET "/api/conversations/$KID" --check secret_registry.secret_sources.QA_F08_PLAIN exists \
+  UNS=$(control-agent-server api POST /api/conversations \
+    --json "{\"workspace\": {\"working_dir\": \"$W/knobs\"}, \"agent\": $OFFLINE_AGENT, \"autotitle\": false}" --expect 201 --field id)
+  control-agent-server api POST "/api/conversations/$UNS/secrets" --json '{"secrets": {"QA_F08_SAVED": "qa-f08-saved-value"}}' --expect 200
+  control-agent-server api PATCH "/api/conversations/$UNS" --json '{"tags": {"qa": "f08-saved"}}' --expect 200
+  control-agent-server api POST "/api/conversations/$UNS/secrets" --json '{"secrets": {"QA_F08_UNSAVED": "qa-f08-unsaved-value"}}' --expect 200
+  control-agent-server restart
+  control-agent-server api PATCH "/api/conversations/$UNS" --json '{"tags": {"qa": "f08-after-restart"}}' --expect 200
+  control-agent-server api GET "/api/conversations/$UNS" --check secret_registry.secret_sources.QA_F08_SAVED exists \
     --check secret_registry.secret_sources.QA_F08_UNSAVED exists --save F08.secrets-unsaved-restart/get
   ```
-  Expected: both names after the restart. Today `QA_F08_PLAIN` (saved by an
-  earlier PATCH) is there and `QA_F08_UNSAVED` is gone: the POST never
-  reached `base_state.json` (see `F08.secrets-visible`) and runtime secrets
-  are not written to `meta.json`, so a restart, an idle eviction (default
-  20 minutes) or a sandbox pause right after `POST .../secrets` silently
-  drops it.
+  Expected: both names after the restart. Today `QA_F08_SAVED` is there and
+  `QA_F08_UNSAVED` is gone: the POST never reached `base_state.json` (see
+  `F08.secrets-visible`) and runtime secrets are not written to `meta.json`,
+  so a restart, an idle eviction (default 20 minutes) or a sandbox pause
+  right after `POST .../secrets` silently drops it.
 - **Override across a restart (`F08.secrets-override-restart`), known bug.**
-  Run `$ROT`'s command again after the restart.
+  A conversation created with `QA_F08_ROT` = `qa-f08-rot-old` gets
+  `qa-f08-rot-new` at runtime, runs its command (which saves the state),
+  restarts, and runs it again.
   ```sh
-  control-agent-server conversation send "$ROT" --text 'Run it again.' --wait --until finished --timeout 120
-  test "$(cat "$W/rotate/qa-f08-rot.txt")" = qa-f08-rot-new
+  RR=$(control-agent-server api POST /api/conversations \
+    --json "{\"workspace\": {\"working_dir\": \"$W/rotate-restart\"}, \"agent\": $ROTATE_RESTART_AGENT, \"autotitle\": false, \"secrets\": {\"QA_F08_ROT\": {\"kind\": \"StaticSecret\", \"value\": \"qa-f08-rot-old\"}}}" \
+    --expect 201 --field id)
+  control-agent-server api POST "/api/conversations/$RR/secrets" --json '{"secrets": {"QA_F08_ROT": "qa-f08-rot-new"}}' --expect 200
+  control-agent-server conversation send "$RR" --text 'Run the command.' --wait --until finished --timeout 120
+  test "$(cat "$W/rotate-restart/qa-f08-rot.txt")" = qa-f08-rot-new
+  rm "$W/rotate-restart/qa-f08-rot.txt"
+  control-agent-server restart
+  control-agent-server conversation send "$RR" --text 'Run it again.' --wait --until finished --timeout 120
+  test "$(cat "$W/rotate-restart/qa-f08-rot.txt")" = qa-f08-rot-new
   ```
-  Expected: `qa-f08-rot-new`, as before the restart. Today the file holds
+  Expected: `qa-f08-rot-new` both times. Today the second file holds
   `qa-f08-rot-old`: `EventService.start` passes the start-time
   `stored.secrets` (from `meta.json`) to `LocalConversation`, which applies
   them over the persisted registry, and `EventService.update_secrets` never
   updates `stored.secrets` (unlike `apply_resume_secrets`). A rotated
   credential silently reverts to the old one after any reload.
-- **Policy across a restart (`F08.policy-restart`), known bug.** `$PR` was
-  switched to `AlwaysConfirm` at runtime before the restart; send it a
-  message now.
+- **Policy across a restart (`F08.policy-restart`), known bug.** A
+  conversation switched to `AlwaysConfirm` at runtime, a restart, then a
+  message.
   ```sh
+  PR=$(control-agent-server api POST /api/conversations \
+    --json "{\"workspace\": {\"working_dir\": \"$W/policy\"}, \"agent\": $POLICY_AGENT, \"autotitle\": false}" --expect 201 --field id)
+  control-agent-server api POST "/api/conversations/$PR/confirmation_policy" --json '{"policy": {"kind": "AlwaysConfirm"}}' --expect 200
+  control-agent-server api GET "/api/conversations/$PR" --check confirmation_policy.kind eq AlwaysConfirm
+  control-agent-server restart
   control-agent-server api GET "/api/conversations/$PR" --check confirmation_policy.kind eq AlwaysConfirm
   control-agent-server conversation send "$PR" --text 'Run the command.' --wait --until waiting_for_confirmation,finished --timeout 120
   control-agent-server api GET "/api/conversations/$PR" --check confirmation_policy.kind eq AlwaysConfirm \
@@ -551,17 +665,24 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   test ! -e "$W/policy/qa-f08-policy.txt"
   ```
   Expected: the policy is still `AlwaysConfirm` and the command waits.
-  Today the first GET (a cold read of `base_state.json`) still says
-  `AlwaysConfirm`, but loading the conversation re-applies the start-time
-  `NeverConfirm` from `meta.json` (`EventService.start` calls
+  Today the first GET after the restart (a cold read of `base_state.json`)
+  still says `AlwaysConfirm`, but loading the conversation re-applies the
+  start-time `NeverConfirm` from `meta.json` (`EventService.start` calls
   `set_confirmation_policy(self.stored.confirmation_policy)`), so the
   command runs unasked, the conversation finishes, and GET then reports
-  `NeverConfirm` without any state update event. The same happens after an
-  idle eviction (`conversation_idle_ttl_seconds`, default 1200), so a
-  confirmation mode switched on at runtime silently turns off.
-- **Analyzer across a restart (`F08.analyzer-restart`), known bug.** `$PA`
-  got `PatternSecurityAnalyzer` at runtime before the restart; load it.
+  `NeverConfirm` without any state update event. An idle eviction
+  (`conversation_idle_ttl_seconds`, default 1200, only while no socket is
+  attached) does the same, so a confirmation mode switched on at runtime
+  silently turns off.
+- **Analyzer across a restart (`F08.analyzer-restart`), known bug.** A
+  conversation given `PatternSecurityAnalyzer` at runtime, a restart, then a
+  PATCH that loads it.
   ```sh
+  PA=$(control-agent-server api POST /api/conversations \
+    --json "{\"workspace\": {\"working_dir\": \"$W/analyzer\"}, \"agent\": $OFFLINE_AGENT, \"autotitle\": false}" --expect 201 --field id)
+  control-agent-server api POST "/api/conversations/$PA/security_analyzer" --json '{"security_analyzer": {"kind": "PatternSecurityAnalyzer"}}' --expect 200
+  control-agent-server api GET "/api/conversations/$PA" --check security_analyzer.kind eq PatternSecurityAnalyzer
+  control-agent-server restart
   control-agent-server api PATCH "/api/conversations/$PA" --json '{"tags": {"qa": "f08-after-restart"}}' --expect 200
   control-agent-server api GET "/api/conversations/$PA" --check security_analyzer.kind eq PatternSecurityAnalyzer \
     --save F08.analyzer-restart/get
@@ -597,7 +718,16 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   `ConfirmRisky` asks for every action unless `confirm_unknown` is false.
 - Secret values come back as `null` in GET (masked) and as cipher text in
   `base_state.json`. Without `OH_SECRET_KEY` and without a session key there
-  is no cipher and secrets are dropped on save; `launch` sets both.
+  is no cipher: secrets (and the agent's LLM `api_key`) are saved as the
+  `**********` placeholder and are gone after a restart, while GET looks the
+  same (`F08.secrets-no-cipher`). `launch` sets both keys; only
+  `launch --no-auth --no-secret-key` gives a run without a cipher.
+- A `LookupSecret` is fetched with `httpx` from inside the server process,
+  so its URL must be reachable from the server, not from the client. A
+  `LookupSecret` header whose name contains `authorization`, `cookie`,
+  `credential`, `key`, `password`, `secret`, `session` or `token`
+  (case-insensitive, `is_secret_key`) is left out of GET and encrypted at
+  rest; other headers are returned as given.
 - A command receives a secret only when its text mentions the secret's name
   (case-insensitive substring match); masking applies to every registered
   secret's last resolved value, wherever it appears in terminal output.

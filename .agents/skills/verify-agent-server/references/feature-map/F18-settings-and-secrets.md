@@ -37,18 +37,19 @@ Routes: `GET /api/settings/agent-schema`, `GET /api/settings/conversation-schema
 - `F18.patch-validation`: an empty or unknown-keys-only PATCH is 400, an invalid value is 422 `Settings validation failed` without echoing the posted secret, malformed pointers are 422, and nothing is stored.
 - `F18.active-profile-pointer`: PATCH `active_profile` applies that LLM profile to `agent_settings.llm`, an unknown profile is 404, an explicit `llm` diff wins over the profile, and `null` clears only the pointer.
 - `F18.agent-kind-switch`: switching `agent_kind` to `acp` rebuilds from a fresh ACP base (no `llm`, no key); switching back gives fresh OpenHands defaults.
-- `F18.secret-put-list-get`: `PUT /api/settings/secrets` answers `{name, description}`, the list shows names and descriptions but never values, GET by name returns the raw value, and a second PUT overwrites value and description.
+- `F18.secret-put-list-get`: `PUT /api/settings/secrets` answers `{name, description}`, the list shows names and descriptions but never values, GET by name returns the raw value as `text/plain`, and a second PUT overwrites value and description.
 - `F18.secret-delete`: DELETE answers `{"deleted": true}`; afterwards GET and a second DELETE are 404 `Secret not found` and the list omits the name.
-- `F18.secret-name-validation`: names that do not match `^[a-zA-Z][a-zA-Z0-9_]{0,63}$` are 422 on GET, PUT and DELETE; a PUT without `value` is 422; an unknown valid name is 404.
+- `F18.secret-name-validation`: names that do not match `^[a-zA-Z][a-zA-Z0-9_]{0,63}$` are 422 on GET, PUT and DELETE (64 characters are accepted, 65 are not); a PUT without `value` is 422; an unknown valid name is 404.
 - `F18.encrypted-at-rest`: `settings.json` and `secrets.json` hold Fernet tokens, never the raw values, with mode `0600`.
-- `F18.secret-scope-agent-profile`: `?agent_profile_id=` limits the list to that agent profile's `secret_refs` (`[]` lists nothing); an unknown id is 404 `Agent profile not found`.
+- `F18.secret-scope-agent-profile`: `?agent_profile_id=` limits the list to that agent profile's `secret_refs` (`[]` lists nothing, no `secret_refs` lists everything); an unknown id is 404 `Agent profile not found`.
 - `F18.sdk-remote-workspace`: the SDK's `RemoteWorkspace.get_secrets()` returns `LookupSecret`s whose URLs resolve to the stored values, and `get_llm()` returns the stored model and key.
 - `F18.persist-restart`: settings (plaintext key, model, conversation settings) and secrets read back unchanged after a restart with the same cipher key.
 - `F18.corrupted-files`: with an unparsable `settings.json`, GET silently returns defaults and PATCH is 409 without touching the file; with an unparsable `secrets.json` the list is empty, GET by name 404, PUT and DELETE 500; restoring the files restores the values.
-- `F18.no-cipher`: without any cipher key, `X-Expose-Secrets: encrypted` is 503 and both files store plaintext.
+- `F18.no-cipher`: without any cipher key, `X-Expose-Secrets: encrypted` is 503, `plaintext` still works, both files store plaintext, and the secrets routes are open without a key.
 - `F18.secret-empty-value`: a PUT whose value is empty or the redaction placeholder must not leave a listed but unreadable secret or wipe an existing value.
 - `F18.dangling-pointers`: PATCH must refuse an `active_agent_profile_id` or `active_meta_profile` that names nothing, as the dedicated activate routes do (404).
 - `F18.secret-key-rotation`: after a restart with a new cipher key, a write must not destroy values stored under the old key, so rotating back recovers them.
+- `F18.empty-secret-key`: an empty `OH_SECRET_KEY` must count as no key (with no session key, `encrypted` is 503), not as a cipher keyed by the empty string that anyone can decrypt.
 
 ## How to get to it (agent POV)
 
@@ -82,7 +83,8 @@ Routes: `GET /api/settings/agent-schema`, `GET /api/settings/conversation-schema
 - Configuration: `OH_PERSISTENCE_DIR` holds `settings.json` and `secrets.json`
   (else `~/.openhands`; launched runs use `<run>/home/.openhands`);
   `OH_SECRET_KEY` is the cipher, else the first session key; with neither,
-  secrets are stored in plaintext. `OH_SESSION_API_KEYS_*` gates every route.
+  secrets are stored in plaintext (`launch --no-auth --no-secret-key`).
+  `OH_SESSION_API_KEYS_*` gates every route.
 - Agent Canvas: the settings pages render forms from the two schemas and PATCH
   diffs; the secrets page lists, upserts and deletes (context only).
 
@@ -99,8 +101,11 @@ Preconditions:
   `sdk_probe.py`, a small SDK program that drives `RemoteWorkspace` against
   the run (`F18.sdk-remote-workspace`).
 - Bullets mutate settings in order and restore what they change; the last
-  three are known bugs and are self-contained. `F18.persist-restart` and
-  `F18.secret-key-rotation` restart the run.
+  four are known bugs and are self-contained. `F18.persist-restart` and
+  `F18.secret-key-rotation` restart the run; `F18.no-cipher` and
+  `F18.empty-secret-key` launch a second run of their own (`*-f18-nocipher`,
+  `*-f18-emptykey`) and stop it, so their `--save` evidence lands in that
+  run's `evidence/` directory.
 
   ```sh
   F18="$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f18"
@@ -237,6 +242,8 @@ Preconditions:
   control-agent-server api PATCH /api/settings --json '{"agent_settings_diff": {"llm": {"temperature": 0.3, "base_url": "http://127.0.0.1:9/v1"}}}' \
     --expect 200 --check agent_settings.llm.temperature eq 0.3 --check agent_settings.llm.base_url eq http://127.0.0.1:9/v1 \
     --check agent_settings.llm.model eq openai/qa-f18-model --check llm_api_key_is_set eq true --save F18.agent-diff-merge/sparse
+  control-agent-server api GET /api/settings --header 'X-Expose-Secrets: plaintext' --check agent_settings.llm.temperature eq 0.3 \
+    --check agent_settings.llm.base_url eq http://127.0.0.1:9/v1 --check agent_settings.llm.api_key eq "$QA_F18_LLM_KEY"
   control-agent-server api PATCH /api/settings --json '{"agent_settings_diff": {"llm": {"base_url": null, "temperature": null}}}' \
     --expect 200 --check agent_settings.llm.base_url missing --check agent_settings.llm.temperature missing \
     --check llm_api_key_is_set eq true --save F18.agent-diff-merge/unset
@@ -269,6 +276,7 @@ Preconditions:
   control-agent-server api GET /api/settings --check misc_settings.qa_f18 eq '{"theme": "light", "tags": ["c"]}' --save F18.misc-settings-merge/get
   control-agent-server api PATCH /api/settings --json '{"misc_settings_diff": {"qa_f18": null}}' --expect 200 \
     --check misc_settings eq '{"qa_f18": null}' --save F18.misc-settings-merge/top-level-null
+  control-agent-server api GET /api/settings --check misc_settings eq '{"qa_f18": null}'
   ```
   The nested `theme` is replaced, the list `["a", "b"]` becomes `["c"]`, the
   nested `null` removes `keep`. A top-level `null` is stored as `null`: a
@@ -305,6 +313,8 @@ Preconditions:
     --expect 200 --check agent_settings.llm.model eq openai/qa-f18-explicit
   control-agent-server api PATCH /api/settings --json '{"active_profile": null}' --expect 200 --check active_profile missing \
     --check agent_settings.llm.model eq openai/qa-f18-explicit --save F18.active-profile-pointer/clear
+  control-agent-server api GET /api/settings --check active_profile missing --check agent_settings.llm.model eq openai/qa-f18-explicit
+  control-agent-server api GET /api/profiles --check active_profile missing --check profiles len-eq 1
   control-agent-server api PATCH /api/settings --json "{\"agent_settings_diff\": {\"llm\": {\"model\": \"openai/qa-f18-model\", \"api_key\": \"$QA_F18_LLM_KEY\"}}}" --expect 200
   control-agent-server api DELETE /api/profiles/qa-f18-llm --expect 200
   control-agent-server api GET /api/profiles --check active_profile missing --check profiles len-eq 0
@@ -312,7 +322,8 @@ Preconditions:
   The pointer copies the profile's model and key into `agent_settings.llm`
   and `GET /api/profiles` agrees; the unknown name is 404 and leaves the
   pointer; an explicit `llm` diff in the same PATCH wins; `null` clears the
-  pointer and keeps the LLM. The LLM and profile list are restored.
+  pointer (both GETs agree, the profile itself stays) and keeps the LLM. The
+  LLM and profile list are restored.
 - **Agent kind switch (`F18.agent-kind-switch`).** To ACP and back.
   ```sh
   control-agent-server api PATCH /api/settings --json '{"agent_settings_diff": {"agent_kind": "acp", "acp_server": "claude-code"}}' \
@@ -337,7 +348,8 @@ Preconditions:
     --expect 200 --check name eq QA_F18_TOKEN --check description eq 'qa f18 token' --check value missing --save F18.secret-put-list-get/put
   control-agent-server api GET /api/settings/secrets --expect 200 --check secrets len-eq 1 --check secrets.0.name eq QA_F18_TOKEN \
     --check secrets.0.description eq 'qa f18 token' --check . not-contains "$QA_F18_SECRET" --save F18.secret-put-list-get/list
-  control-agent-server api GET /api/settings/secrets/QA_F18_TOKEN --expect 200 --check . eq "$QA_F18_SECRET" --save F18.secret-put-list-get/get
+  control-agent-server api GET /api/settings/secrets/QA_F18_TOKEN --expect 200 --check . eq "$QA_F18_SECRET" \
+    --check-header content-type contains text/plain --save F18.secret-put-list-get/get
   control-agent-server api PUT /api/settings/secrets --json '{"name": "QA_F18_TOKEN", "value": "qa-f18-secret-v2"}' --expect 200 --check description missing
   control-agent-server api GET /api/settings/secrets/QA_F18_TOKEN --expect 200 --check . eq qa-f18-secret-v2 --save F18.secret-put-list-get/get-overwritten
   control-agent-server api GET /api/settings/secrets --check secrets len-eq 1 --check secrets.0.description missing
@@ -366,27 +378,34 @@ Preconditions:
   control-agent-server api DELETE /api/settings/secrets/bad-name --expect 422 --save F18.secret-name-validation/delete
   control-agent-server api PUT /api/settings/secrets --json '{"name": "1bad", "value": "qa-f18-x"}' --expect 422 --save F18.secret-name-validation/put
   control-agent-server api PUT /api/settings/secrets --json "{\"name\": \"A$(printf 'a%.0s' $(seq 64))\", \"value\": \"qa-f18-x\"}" --expect 422
+  LONG64="A$(printf 'a%.0s' $(seq 63))"
+  control-agent-server api PUT /api/settings/secrets --json "{\"name\": \"$LONG64\", \"value\": \"qa-f18-x\"}" --expect 200 --check name eq "$LONG64"
+  control-agent-server api GET "/api/settings/secrets/$LONG64" --expect 200 --check . eq qa-f18-x
+  control-agent-server api DELETE "/api/settings/secrets/$LONG64" --expect 200 --check deleted eq true
   control-agent-server api PUT /api/settings/secrets --json '{"name": "QA_F18_NOVALUE"}' --expect 422 --save F18.secret-name-validation/no-value
   control-agent-server api GET /api/settings/secrets/QA_F18_UNKNOWN --expect 404 --check detail eq 'Secret not found'
   control-agent-server api GET /api/settings/secrets --check secrets len-eq 1
   ```
   Names starting with a digit, containing `-` or longer than 64 characters are
   422 `Invalid secret name format ...` (the docstrings say 400; the code says
-  422); a body without `value` is a request-validation 422; an unknown valid
-  name is 404. Nothing was stored.
+  422), while a 64-character name is stored, read and deleted; a body without
+  `value` is a request-validation 422; an unknown valid name is 404. Only
+  `QA_F18_TOKEN` remains.
 - **Encrypted at rest (`F18.encrypted-at-rest`).** Inspect both files.
   ```sh
   control-agent-server state cat home/.openhands/settings.json --check agent_settings.llm.api_key matches '^gAAAAA' \
-    --check schema_version exists --not-contains "$QA_F18_LLM_KEY"
+    --check schema_version exists --not-contains "$QA_F18_LLM_KEY" --mode 600
   control-agent-server state cat home/.openhands/secrets.json --check custom_secrets.QA_F18_TOKEN.secret matches '^gAAAAA' \
-    --check custom_secrets.QA_F18_TOKEN.description eq 'qa f18 token' --not-contains "$QA_F18_SECRET"
+    --check custom_secrets.QA_F18_TOKEN.description eq 'qa f18 token' --not-contains "$QA_F18_SECRET" --mode 600
+  control-agent-server state grep openai/qa-f18-model --glob 'home/**/*'
+  control-agent-server state grep QA_F18_TOKEN --glob 'home/**/*'
   control-agent-server state grep --env-value QA_F18_LLM_KEY --glob 'home/**/*' --expect-none
   control-agent-server state grep --env-value QA_F18_SECRET --glob 'home/**/*' --expect-none
-  test "$(stat -c %a "$AGENT_SERVER_VERIFY_RUN/home/.openhands/settings.json")" = 600
-  test "$(stat -c %a "$AGENT_SERVER_VERIFY_RUN/home/.openhands/secrets.json")" = 600
   ```
-  Both secret fields are `gAAAAA...` tokens, neither raw value appears
-  anywhere under the run's `HOME`, and both files are `0600`.
+  Both secret fields are `gAAAAA...` tokens and both files are `0600`. The
+  glob does reach both files (the model and the secret's name are stored in
+  clear and found), yet neither raw value appears anywhere under the run's
+  `HOME`.
 - **Secrets scoped by an agent profile (`F18.secret-scope-agent-profile`).**
   Add a second secret and two agent profiles (arrange) with different
   `secret_refs`.
@@ -394,22 +413,27 @@ Preconditions:
   control-agent-server api PUT /api/settings/secrets --json '{"name": "QA_F18_OTHER", "value": "qa-f18-other-value"}' --expect 200
   control-agent-server api POST /api/agent-profiles/qa-f18-scoped --json '{"llm_profile_ref": "qa-f18-llm", "secret_refs": ["QA_F18_TOKEN"]}' --expect 201
   control-agent-server api POST /api/agent-profiles/qa-f18-none --json '{"llm_profile_ref": "qa-f18-llm", "secret_refs": []}' --expect 201
+  control-agent-server api POST /api/agent-profiles/qa-f18-all --json '{"llm_profile_ref": "qa-f18-llm"}' --expect 201
   SCOPED=$(control-agent-server api GET /api/agent-profiles/qa-f18-scoped --field profile.id)
   NONE=$(control-agent-server api GET /api/agent-profiles/qa-f18-none --field profile.id)
+  ALL=$(control-agent-server api GET /api/agent-profiles/qa-f18-all --check profile.secret_refs missing --field profile.id)
   control-agent-server api GET /api/settings/secrets --query "agent_profile_id=$SCOPED" --expect 200 --check secrets len-eq 1 \
     --check secrets.0.name eq QA_F18_TOKEN --save F18.secret-scope-agent-profile/scoped
   control-agent-server api GET /api/settings/secrets --query "agent_profile_id=$NONE" --expect 200 --check secrets len-eq 0 --save F18.secret-scope-agent-profile/none
+  control-agent-server api GET /api/settings/secrets --query "agent_profile_id=$ALL" --expect 200 --check secrets len-eq 2 --save F18.secret-scope-agent-profile/all
   control-agent-server api GET /api/settings/secrets --expect 200 --check secrets len-eq 2
   control-agent-server api GET /api/settings/secrets --query agent_profile_id=00000000-0000-4000-8000-0000000000f1 --expect 404 \
     --check detail eq 'Agent profile not found' --save F18.secret-scope-agent-profile/unknown
   control-agent-server api DELETE /api/agent-profiles/qa-f18-scoped --expect 200
   control-agent-server api DELETE /api/agent-profiles/qa-f18-none --expect 200
+  control-agent-server api DELETE /api/agent-profiles/qa-f18-all --expect 200
   control-agent-server api DELETE /api/settings/secrets/QA_F18_OTHER --expect 200
   control-agent-server api GET /api/settings --check active_agent_profile_id missing
   ```
   `secret_refs: ["QA_F18_TOKEN"]` lists only that secret, `[]` lists none,
-  no filter lists both; an unknown id is 404. The profiles and the second
-  secret are removed and no agent profile became active.
+  a profile without `secret_refs` (null, "all") and no filter both list two;
+  an unknown id is 404. The profiles and the second secret are removed and no
+  agent profile became active.
 - **SDK consumer (`F18.sdk-remote-workspace`).** `RemoteWorkspace` lists the
   secrets as `LookupSecret`s, resolves one, and builds the LLM from settings.
   ```sh
@@ -468,24 +492,29 @@ Preconditions:
   nothing and hides every value (404); PUT and DELETE refuse with 500 (the
   reason is in `exception`). Neither file was touched, and restoring them
   restores the values without a restart.
-- **No cipher (`F18.no-cipher`), blocked.** Prerequisite: a run with no
-  `OH_SECRET_KEY` and no session key. `launch` always injects the run's
-  `OH_SECRET_KEY`, and `--env OH_SECRET_KEY=` still builds a cipher from the
-  empty string (checked: `encrypted` then answers 200), so this needs a
-  `launch --no-secret-key` harness flag. The recipe as far as it can be
-  written:
+- **No cipher (`F18.no-cipher`).** A second run with no `OH_SECRET_KEY` and
+  no session key (`launch --no-auth --no-secret-key`), stopped when the
+  bullet ends.
   ```sh
-  NOCIPHER=$(control-agent-server launch --new --no-auth --name f18-nocipher --print-run)
+  NOCIPHER=$(control-agent-server launch --new --no-auth --no-secret-key --name f18-nocipher --print-run)
   trap 'control-agent-server stop --run "$NOCIPHER" >/dev/null' EXIT
-  control-agent-server api PATCH /api/settings --run "$NOCIPHER" --json '{"agent_settings_diff": {"llm": {"api_key": "qa-f18-nocipher-key"}}}' --expect 200
+  control-agent-server api PATCH /api/settings --run "$NOCIPHER" --json '{"agent_settings_diff": {"llm": {"api_key": "qa-f18-nocipher-key"}}}' \
+    --expect 200 --check llm_api_key_is_set eq true
+  control-agent-server api PUT /api/settings/secrets --run "$NOCIPHER" --json '{"name": "QA_F18_NOCIPHER", "value": "qa-f18-nocipher-secret"}' --expect 200
   control-agent-server api GET /api/settings --run "$NOCIPHER" --header 'X-Expose-Secrets: encrypted' --expect 503 \
     --check exception contains 'OH_SECRET_KEY is not configured' --save F18.no-cipher/encrypted
-  control-agent-server state cat home/.openhands/settings.json --run "$NOCIPHER" --check agent_settings.llm.api_key eq qa-f18-nocipher-key
+  control-agent-server api GET /api/settings --run "$NOCIPHER" --header 'X-Expose-Secrets: plaintext' --expect 200 \
+    --check agent_settings.llm.api_key eq qa-f18-nocipher-key --save F18.no-cipher/plaintext
+  control-agent-server api GET /api/settings/secrets/QA_F18_NOCIPHER --run "$NOCIPHER" --auth none --expect 200 \
+    --check . eq qa-f18-nocipher-secret --save F18.no-cipher/secret-without-key
+  control-agent-server state cat home/.openhands/settings.json --run "$NOCIPHER" --check agent_settings.llm.api_key eq qa-f18-nocipher-key --mode 600
+  control-agent-server state cat home/.openhands/secrets.json --run "$NOCIPHER" \
+    --check custom_secrets.QA_F18_NOCIPHER.secret eq qa-f18-nocipher-secret --mode 600
   ```
-  Expected: `encrypted` is 503 (`detail` rewritten to `Internal Server
-  Error`, the reason in `exception`), `plaintext` still works, and
-  `settings.json` and `secrets.json` hold the raw values (the server logs
-  `Saving settings with secrets in PLAINTEXT`).
+  `encrypted` is 503 (`detail` rewritten to `Internal Server Error`, the
+  reason in `exception`), `plaintext` still works, both files hold the raw
+  values (still `0600`; the server logs `Saving ... in PLAINTEXT (no cipher
+  configured)`), and without session keys anyone can read a secret's value.
 - **Empty or placeholder secret value (`F18.secret-empty-value`), known bug.**
   PUT the redaction placeholder over the existing secret (what a form that
   only edits the description sends), then PUT an empty value.
@@ -545,7 +574,7 @@ Preconditions:
   rc=0
   control-agent-server state cat home/.openhands/secrets.json --check custom_secrets.QA_F18_TOKEN.secret matches '^gAAAAA' || rc=1
   control-agent-server state cat home/.openhands/settings.json --check agent_settings.llm.api_key matches '^gAAAAA' || rc=1
-  control-agent-server restart --env "OH_SECRET_KEY=$(cat "$AGENT_SERVER_VERIFY_RUN/private/previous_secret_key")"
+  control-agent-server restart --restore-secret-key
   control-agent-server api GET /api/settings/secrets/QA_F18_TOKEN --expect 200 --check . eq "$QA_F18_SECRET" --save F18.secret-key-rotation/after-rotating-back || rc=1
   control-agent-server api GET /api/settings --header 'X-Expose-Secrets: plaintext' --check agent_settings.llm.api_key eq "$QA_F18_LLM_KEY" \
     --save F18.secret-key-rotation/settings-after-rotating-back || rc=1
@@ -561,7 +590,26 @@ Preconditions:
   values again. Today the PUT of an unrelated secret and the misc PATCH both
   answer 200 and rewrite `QA_F18_TOKEN.secret` and `llm.api_key` as `null`,
   so after rotating back both are gone for good. A rotation with no write in
-  between is recoverable.
+  between is recoverable (`--restore-secret-key` then reads both again).
+- **Empty cipher key (`F18.empty-secret-key`), known bug.** A second run with
+  no session key and `OH_SECRET_KEY` set to the empty string (what
+  `OH_SECRET_KEY=${UNSET_VAR}` produces), stopped when the bullet ends.
+  ```sh
+  EMPTYKEY=$(control-agent-server launch --new --no-auth --no-secret-key --env OH_SECRET_KEY= --name f18-emptykey --print-run)
+  trap 'control-agent-server stop --run "$EMPTYKEY" >/dev/null' EXIT
+  control-agent-server api PATCH /api/settings --run "$EMPTYKEY" --json '{"agent_settings_diff": {"llm": {"api_key": "qa-f18-emptykey-key"}}}' --expect 200
+  control-agent-server api GET /api/settings --run "$EMPTYKEY" --header 'X-Expose-Secrets: encrypted' --expect 503 \
+    --check exception contains 'OH_SECRET_KEY is not configured' --save F18.empty-secret-key/encrypted
+  ```
+  Expected: an empty key counts as no key, exactly like `F18.no-cipher`
+  (`_default_secret_key` already treats an empty session key that way), so
+  `encrypted` is 503. Today `Config.cipher` builds `Cipher("")`: `encrypted`
+  answers 200 with `gAAAAA...` tokens, `settings.json` holds the same kind of
+  token, nothing is logged, and anyone can decrypt both with the public key
+  `sha256("")` (`Cipher("").decrypt(token)` returns `qa-f18-emptykey-key`).
+  With a session key configured the empty string still wins over the
+  session-key fallback. A fix that refuses to start instead would keep this
+  bullet failing at `launch`; update the expectation then.
 
 ## Gotchas
 
@@ -569,10 +617,14 @@ Preconditions:
   `<run>/home/.openhands/settings.json` and `secrets.json`), not next to the
   conversations. The stores re-read the files on every request, so a heredoc
   edit takes effect without a restart.
-- The cipher is `OH_SECRET_KEY`, else the first session key. Rotating the
-  session key without setting `OH_SECRET_KEY` therefore changes the cipher
-  too (`F18.secret-key-rotation`). `restart --env OH_SECRET_KEY=...` overrides
-  the run's own key for every later restart, including `--rotate-secret-key`.
+- The cipher is `OH_SECRET_KEY`, else the first session key, else none
+  (plaintext at rest, `encrypted` 503). Rotating the session key without
+  setting `OH_SECRET_KEY` therefore changes the cipher too
+  (`F18.secret-key-rotation`), and an empty `OH_SECRET_KEY` is a cipher with
+  a public key (`F18.empty-secret-key`). Go back to the run's previous cipher
+  with `restart --restore-secret-key`, not `restart --env OH_SECRET_KEY=...`:
+  an `--env` override sticks to every later restart and silently turns a
+  later `--rotate-secret-key` into a no-op.
 - `**********` (and an empty string) posted as a secret means "no secret":
   in a settings PATCH it clears the key, in a secrets PUT it stores `null`.
   Round-trip with `X-Expose-Secrets: encrypted`, which the server decrypts.
@@ -583,7 +635,10 @@ Preconditions:
 - `agent_settings_diff` is RFC 7386 (a `null` anywhere unsets);
   `conversation_settings_diff` and `misc_settings_diff` unset only nested
   entries, so a top-level `null` is a 422 for conversation settings and a
-  stored `null` in `misc_settings`. The router docstring overstates this.
+  stored `null` in `misc_settings` (a client cannot delete a top-level misc
+  key). The `update_settings` docstring ("three diffs deep-merged") and the
+  `SettingsUpdateRequest` docstring ("same semantics as
+  `agent_settings_diff`") both overstate this.
 - Changing `agent_kind` starts from a fresh base of the target variant, so a
   switch to ACP and back drops the LLM and its key.
 - A corrupted `settings.json` is indistinguishable from "never configured" on

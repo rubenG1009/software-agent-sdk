@@ -18,7 +18,7 @@ server's secrets can access (`missing_token` when there is none).
 
 Source: `openhands-agent-server/openhands/agent_server/git_router.py`, `openhands-agent-server/openhands/agent_server/git_provider_service.py`, `openhands-agent-server/openhands/agent_server/runtime_router.py`, `openhands-sdk/openhands/sdk/git/`, `openhands-sdk/openhands/sdk/workspace/remote/remote_workspace_mixin.py`, `clients/typescript/src/workspace/remote-workspace.ts`, `clients/typescript/src/client/git-client.ts`
 
-Needs: `llm`, `git`
+Needs: `llm`, `git`, `node`
 
 Routes: `GET /api/conversations/{runtime_conversation_id}/git/changes`,
 `GET /api/conversations/{runtime_conversation_id}/git/diff`,
@@ -34,12 +34,12 @@ Routes: `GET /api/conversations/{runtime_conversation_id}/git/changes`,
 - `F15.changes-statuses`: a staged deletion is `DELETED`, a staged new file `ADDED`, and a staged rename a `DELETED` old path plus an `ADDED` new path.
 - `F15.changes-base`: without `ref` the display base is `HEAD` on a remote-less default branch, the fork point from local `main` on a feature branch (committed work stays visible), the fork point from `origin`'s default branch on a fully pushed clean branch, and the branch's own upstream once the tree is dirty.
 - `F15.changes-ref`: `ref=HEAD` gives `git status`-style changes and an older commit adds its later commits' files; an unknown or option-shaped `ref` is 400 and never runs as a git option; no `path` is 422.
-- `F15.changes-nested-repo`: changes inside a repository nested one level below the requested repository are listed with the nested directory as prefix, and the nested directory itself is not listed.
+- `F15.changes-nested-repo`: changes inside a repository nested one level below the requested repository are listed with the nested directory as prefix, the nested directory itself is not listed, and `diff` of such an entry reads the nested repository.
 - `F15.changes-repo-below-path`: a non-repository directory that holds one repository (the layout of a repository-backed conversation) lists that repository's changes with its directory as prefix; today it lists nothing.
 - `F15.changes-special-names`: a modified tracked file whose name has a space or a non-ASCII character is listed under its real name; today a space fails the whole list with 400 and a non-ASCII name comes back as a mangled git-quoted string.
 - `F15.changes-subdir-paths`: `changes` for a subdirectory of a repository returns paths on one base; today tracked paths are repository-relative (and include files outside the subdirectory) while untracked paths are subdirectory-relative.
 - `F15.non-repo`: on a plain directory, a missing directory and a non-repository file every operation answers 200 with an empty result (`[]`, `{"original": null, "modified": null}`, `{"commits": [], "has_more": false}`); a repository without commits lists its files as `ADDED` and has no commits.
-- `F15.diff`: `diff` for a modified file returns the base text as `original` and the disk text as `modified` (final newline dropped on both sides), and an untracked file has `original` `""`.
+- `F15.diff`: `diff` for a modified file returns the base text as `original` and the disk text as `modified` (final newline dropped on both sides), an untracked file has `original` `""`, and an explicit `ref` moves the base.
 - `F15.diff-commit`: `commit=<sha>` returns the file as that commit changed it, read from git objects: `original` from the first parent (empty for the root commit or an added file), `modified` from the commit (empty for a file it deleted), also for files no longer on disk and for abbreviated SHAs.
 - `F15.diff-errors`: `ref` together with `commit` is 400, a non-hex `commit` 422, an unknown commit or ref 400, a missing file 400, a file over 1 MiB 400, and no `path` 422.
 - `F15.diff-whitespace`: an unchanged file with leading indentation or trailing blank lines diffs to identical `original` and `modified`; today `original` loses them, so a file that `changes` does not list shows a phantom diff.
@@ -47,12 +47,16 @@ Routes: `GET /api/conversations/{runtime_conversation_id}/git/changes`,
 - `F15.commits`: `commits` lists the history newest first with `sha`, `short_sha`, `subject`, `author` and an ISO 8601 `timestamp`, `has_more` tells whether `limit` cut it, and `limit` outside 1..200 is 422.
 - `F15.commit-changes`: `commits/{sha}/changes` lists one commit's files against its first parent (the root commit as all `ADDED`, a rename as `DELETED` plus `ADDED`), accepts abbreviated SHAs, answers 400 for an unknown SHA and 422 for a non-hex or shorter-than-4 SHA.
 - `F15.scoped`: the four conversation-scoped routes on a conversation whose workspace is the fixture repository return exactly what the global routes return.
-- `F15.scoped-guard`: scoped routes refuse a `path` outside the workspace (another directory, a same-prefix sibling, `..`, a symlink escape, a relative path) with 422 while the global route serves it; an unknown conversation is 404, a malformed id 422, and there is no scoped repository search.
+- `F15.scoped-guard`: scoped routes refuse a `path` outside the workspace (another directory, a same-prefix sibling, `..`, a symlink escape, a relative path, a second `path` parameter pointing outside) with 422 while the global route serves it; an unknown conversation is 404, a malformed id 422, and there is no scoped repository search.
+- `F15.scoped-symlink-repo`: the scoped `changes` of a workspace never lists files of a repository outside it that a symlink in the workspace points to; today the nested-repository scan follows the symlink.
 - `F15.scoped-restart`: after a restart the scoped routes still resolve the conversation's workspace and return the same changes.
+- `F15.sdk-workspace`: the Python SDK's `RemoteWorkspace.git_changes` and `git_diff` join relative paths to `working_dir` and return the same results plain and scoped (`runtime_conversation_id`), and the scoped workspace refuses a path outside it with 422.
+- `F15.ts-client`: the TypeScript client's `RemoteWorkspace.gitChanges` (with `ref`) and `gitDiff` return the same results plain and with `conversationId`, the scoped one rejects a path outside the workspace, and `GitClient.searchRepositories` returns the `missing_token` page.
 - `F15.agent-changes`: after a real model run writes a file in a repository workspace, the scoped `changes` lists it as `ADDED` and the scoped `diff` shows the written text, and the event stream has the file editor's observation.
 - `F15.repo-search-token`: without a stored token, GitHub search is 200 `{"items": [], "next_page_id": null, "missing_token": true}`; a secret named `github_token` or `GH_TOKEN` is picked up (a malformed `page_id` is then validated and refused with 400), and deleting it restores `missing_token`.
 - `F15.repo-search-errors`: `gitlab` and `bitbucket` are 400 (not supported), an unknown or missing `provider` is 422, and `limit` outside 1..100 is 422.
 - `F15.repo-search-unreachable`: when GitHub cannot be reached the search is 502 with the generic masked body and no token in it.
+- `F15.repo-search-timeout`: when GitHub does not answer within 15 s the search is 504 with the masked body `GitHub repository search timed out` and no token in it.
 - `F15.repo-search-github`: with a real GitHub token, search lists the token's repositories with a `page:offset` cursor and a case-insensitive `query` filter, and an invalid token is passed through as 401.
 
 ## How to get to it (agent POV)
@@ -68,8 +72,9 @@ Routes: `GET /api/conversations/{runtime_conversation_id}/git/changes`,
   `/api/conversations/{runtime_conversation_id}/git/...`; the
   `bind_local_conversation_runtime` dependency refuses a `path` that is not
   absolute or does not resolve inside `workspace.working_dir`. Driven by
-  `F15.scoped`, `F15.scoped-guard`, `F15.scoped-restart` and
-  `F15.agent-changes`.
+  `F15.auth`, `F15.scoped`, `F15.scoped-guard`, `F15.scoped-symlink-repo`,
+  `F15.scoped-restart` and `F15.agent-changes`, and through the clients by
+  `F15.sdk-workspace` and `F15.ts-client`.
 - REST, provider search (global only):
   `GET /api/git/repositories/search?provider=github&query=...&limit=1..100&page_id=...`;
   the token comes from the server's secrets store (`PUT /api/settings/secrets`,
@@ -78,11 +83,13 @@ Routes: `GET /api/conversations/{runtime_conversation_id}/git/changes`,
   `AsyncRemoteWorkspace` versions) join a relative `path` to `working_dir` and
   call the global routes, or the scoped ones when the workspace has
   `runtime_conversation_id`. They send neither `ref` nor `commit`, and there is
-  no SDK method for `commits` or repository search.
+  no SDK method for `commits` or repository search. Driven by
+  `F15.sdk-workspace` (an `exec` program).
 - TypeScript client: `RemoteWorkspace.gitChanges(path, {ref})` and
   `gitDiff(path, {ref})` (scoped through the runtime transport when a
   `conversationId` is set); `GitClient.searchRepositories({provider, query,
-  limit, pageId})`.
+  limit, pageId})`. Driven by `F15.ts-client` (a `node` program on
+  `clients/typescript/dist`).
 - Agent Canvas (context only): the Changes tab (changes and diff), the
   Commits tab (commits, commit changes, diff with `commit`) and the
   repository picker (search).
@@ -91,8 +98,10 @@ Routes: `GET /api/conversations/{runtime_conversation_id}/git/changes`,
 
 Preconditions:
 
-- A run is live and exported, `doctor` is ok, `git` is installed and
-  `$DEEPSEEK_API_KEY` is set (only `F15.agent-changes` uses the model). No
+- A run is live and exported, `doctor` is ok, `git` and `node` are
+  installed and `$DEEPSEEK_API_KEY` is set (only `F15.agent-changes` uses the
+  model; only `F15.ts-client` uses `node`, and builds the TypeScript client
+  with `npm ci && npm run build` if `clients/typescript/dist` is missing). No
   launch flags are needed; `F15.repo-search-unreachable` restarts the run with
   a dead proxy and restores it.
 - The block below activates `deepseek-flash`, points `git` at the run's
@@ -101,11 +110,20 @@ Preconditions:
   `C1` and `Add util` = `C2`, a modified `README.md`, an untracked
   `notes.txt`) and a never-run conversation `CID` whose workspace is that
   repository. Bullets that mutate a repository work on copies under `$F`.
+  The run directory must not sit inside any git repository: the
+  non-repository bullets would silently test the enclosing one (and
+  `F15.changes-repo-below-path` would falsely pass), so the block stops with
+  the enclosing repository's path instead (see Gotchas).
   ```sh
   control-agent-server llm preset deepseek
   export GIT_CONFIG_GLOBAL="$AGENT_SERVER_VERIFY_RUN/home/.gitconfig"
   F="$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f15"
-  rm -rf "$F" && mkdir -p "$F"
+  rm -rf "$F"
+  mkdir -p "$F"
+  if ENCLOSING=$(git -C "$F" rev-parse --show-toplevel 2>/dev/null); then
+    echo "environment: $F is inside the git repository $ENCLOSING; set AGENT_SERVER_VERIFY_HOME outside it" >&2
+    exit 1
+  fi
   REPO=$(control-agent-server fixture git-repo --name qa-f15-repo --print-path)
   C1=$(git -C "$REPO" rev-parse HEAD~1)
   C2=$(git -C "$REPO" rev-parse HEAD)
@@ -113,9 +131,11 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$CID" --expect 200 --check workspace.working_dir eq "$REPO"
   ```
 
-- **Session key required (`F15.auth`).** Call every route without a key (one
-  with a wrong key).
+- **Session key required (`F15.auth`).** The run's key gets in (positive
+  control); then every route without a key (one with a wrong key).
   ```sh
+  control-agent-server api GET /api/git/changes --query path="$REPO" --expect 200 --check . len-eq 2
+  control-agent-server api GET "/api/conversations/$CID/git/changes" --query path="$REPO" --expect 200 --check . len-eq 2
   control-agent-server api GET /api/git/changes --auth none --query path="$REPO" --expect 401
   control-agent-server api GET /api/git/diff --auth none --query path="$REPO/README.md" --expect 401
   control-agent-server api GET /api/git/commits --auth bad --query path="$REPO" --expect 401
@@ -127,14 +147,16 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$CID/git/commits/$C2/changes" --auth none --query path="$REPO" \
     --expect 401 --check detail eq Unauthorized --save F15.auth/scoped-commit-changes
   ```
-  All nine answer `401 {"detail": "Unauthorized"}`.
+  With the key both views answer 200; without it all nine answer
+  `401 {"detail": "Unauthorized"}`.
 - **Working-tree changes (`F15.changes`).** The fixture as created.
   ```sh
   control-agent-server api GET /api/git/changes --query path="$REPO" --expect 200 --check . len-eq 2 \
     --check 0.status eq UPDATED --check 0.path eq README.md --check 1.status eq ADDED --check 1.path eq notes.txt \
     --save F15.changes/fixture
   git -C "$REPO" status --porcelain > "$F/status.txt"
-  grep -qx ' M README.md' "$F/status.txt" && grep -qx '?? notes.txt' "$F/status.txt"
+  grep -qx ' M README.md' "$F/status.txt"
+  grep -qx '?? notes.txt' "$F/status.txt"
   test "$(wc -l < "$F/status.txt")" -eq 2
   ```
   Exactly `[{"status": "UPDATED", "path": "README.md"}, {"status": "ADDED", "path": "notes.txt"}]`,
@@ -162,7 +184,8 @@ Preconditions:
   cp -r "$REPO" "$F/branch"
   git -C "$F/branch" checkout -qb qa-feat
   printf 'feat\n' > "$F/branch/feat.txt"
-  git -C "$F/branch" add feat.txt && git -C "$F/branch" commit -qm 'QA feat'
+  git -C "$F/branch" add feat.txt
+  git -C "$F/branch" commit -qm 'QA feat'
   control-agent-server api GET /api/git/changes --query path="$F/branch" --expect 200 --check . len-eq 3 \
     --check 1.status eq ADDED --check 1.path eq feat.txt --save F15.changes-base/feature-branch
   control-agent-server api GET /api/git/diff --query path="$F/branch/feat.txt" --expect 200 \
@@ -171,7 +194,8 @@ Preconditions:
   git clone -q "$F/origin.git" "$F/clone"
   git -C "$F/clone" checkout -qb qa-pr
   printf 'pr\n' > "$F/clone/pr.txt"
-  git -C "$F/clone" add pr.txt && git -C "$F/clone" commit -qm 'QA pr'
+  git -C "$F/clone" add pr.txt
+  git -C "$F/clone" commit -qm 'QA pr'
   git -C "$F/clone" push -q -u origin qa-pr
   control-agent-server api GET /api/git/changes --query path="$F/clone" --expect 200 --check . len-eq 1 \
     --check 0.status eq ADDED --check 0.path eq pr.txt --save F15.changes-base/pushed-clean
@@ -212,10 +236,14 @@ Preconditions:
     --check 2.status eq ADDED --check 2.path eq inner/notes.txt --check 3.path eq notes.txt \
     --save F15.changes-nested-repo/outer
   git -C "$F/outer" status --porcelain | grep -qx '?? inner/'
+  control-agent-server api GET /api/git/diff --query path="$F/outer/inner/README.md" --expect 200 \
+    --check original eq "$(git -C "$F/outer/inner" show HEAD:README.md)" --check modified eq "$(cat "$F/outer/inner/README.md")" \
+    --save F15.changes-nested-repo/inner-diff
   ```
   `git status` of the outer repository shows `?? inner/`; the API instead
   lists the inner repository's own changes under `inner/` and not the
-  directory itself.
+  directory itself, and the diff of `inner/README.md` is read from the inner
+  repository (its committed text against the edit).
 - **Repository below the requested directory (`F15.changes-repo-below-path`), known bug.**
   A plain directory that holds one repository, as a repository-backed
   conversation's workspace does (`{base}/{repo}`).
@@ -237,7 +265,8 @@ Preconditions:
   git -C "$F/names" init -q -b main
   printf 'a\n' > "$F/names/my notes.md"
   printf 'b\n' > "$F/names/café.txt"
-  git -C "$F/names" add -A && git -C "$F/names" commit -qm 'QA names'
+  git -C "$F/names" add -A
+  git -C "$F/names" commit -qm 'QA names'
   printf 'a2\n' > "$F/names/my notes.md"
   control-agent-server api GET /api/git/changes --query path="$F/names" --expect 200 --check . len-eq 1 \
     --check 0.status eq UPDATED --check 0.path eq 'my notes.md' --save F15.changes-special-names/space
@@ -311,11 +340,18 @@ Preconditions:
     --check original ne "$(cat "$REPO/README.md")" --save F15.diff/modified
   control-agent-server api GET /api/git/diff --query path="$REPO/notes.txt" --expect 200 \
     --check original eq '' --check modified eq 'untracked file' --save F15.diff/untracked
+  control-agent-server api GET /api/git/diff --query path="$REPO/src/util.py" --expect 200 \
+    --check original eq "$(cat "$REPO/src/util.py")" --check modified eq "$(cat "$REPO/src/util.py")"
+  control-agent-server api GET /api/git/diff --query path="$REPO/src/util.py" --query ref="$C1" --expect 200 \
+    --check original eq '' --check modified eq "$(cat "$REPO/src/util.py")" --save F15.diff/explicit-ref
   ```
   `original` is `# QA fixture repo\n\nCreated by control-agent-server.` (the
   committed text, read with `git show`), `modified` is the text on disk; both
   lose the final newline (the shell's `$(...)` drops it too, so the checks
-  compare like with like). An untracked file has `original` `""`.
+  compare like with like). An untracked file has `original` `""`. The
+  unchanged `src/util.py` has identical sides against the default base
+  (`HEAD`), and `ref=<C1>` (before `src/util.py` existed) moves the base so
+  `original` is `""`.
 - **Diff of one commit (`F15.diff-commit`).** The fixture's two commits, then
   a commit that deletes and renames, on a copy.
   ```sh
@@ -366,7 +402,8 @@ Preconditions:
   printf '  indented line\nbody\n' > "$F/ws-files/lead.txt"
   printf 'body\n\n\n' > "$F/ws-files/trail.txt"
   printf 'one\r\ntwo\r\n' > "$F/ws-files/crlf.txt"
-  git -C "$F/ws-files" add -A && git -C "$F/ws-files" commit -qm 'QA whitespace'
+  git -C "$F/ws-files" add -A
+  git -C "$F/ws-files" commit -qm 'QA whitespace'
   test -z "$(git -C "$F/ws-files" status --porcelain)"
   control-agent-server api GET /api/git/changes --query path="$F/ws-files" --expect 200 --check . len-eq 0
   for name in crlf lead trail; do
@@ -397,7 +434,10 @@ Preconditions:
   commit-mode diff already does for deleted files. Actual:
   `400 {"detail": "File does not exist: .../src/util.py"}`: `get_git_diff`
   checks the disk before it looks at git. The old side of a working-tree
-  rename fails the same way.
+  rename fails the same way. No route returns a working-tree-deleted file's
+  base text, so the Changes tab lists a deletion it cannot show. The SDK
+  unit test `test_get_git_diff_deleted_file` currently pins the
+  `GitPathError`, so a fix updates it too.
 - **Commit history (`F15.commits`).**
   ```sh
   control-agent-server api GET /api/git/commits --query path="$REPO" --expect 200 --check commits len-eq 2 \
@@ -407,18 +447,22 @@ Preconditions:
     --check commits.1.sha eq "$C1" --check commits.1.subject eq 'Initial commit' --save F15.commits/all
   control-agent-server api GET /api/git/commits --query path="$REPO" --query limit=1 --expect 200 --check commits len-eq 1 \
     --check commits.0.sha eq "$C2" --check has_more eq true --save F15.commits/limit-1
+  control-agent-server api GET /api/git/commits --query path="$REPO" --query limit=2 --expect 200 --check commits len-eq 2 \
+    --check has_more eq false
   control-agent-server api GET /api/git/commits --query path="$F/branch" --query limit=200 --expect 200 --check commits len-eq 3 \
     --check commits.0.subject eq 'QA feat' --check has_more eq false
   test "$(git -C "$REPO" log --format=%H | head -1)" = "$C2"
   control-agent-server api GET /api/git/commits --query path="$REPO" --query limit=0 --expect 422
   control-agent-server api GET /api/git/commits --query path="$REPO" --query limit=201 --expect 422
   ```
-  Newest first, matching `git log`; `limit=1` reports `has_more: true`; the
-  feature branch's history includes its own commit; 0 and 201 are 422.
+  Newest first, matching `git log`; `limit=1` reports `has_more: true` and
+  `limit=2` (exactly the history's length) `has_more: false`; the feature
+  branch's history includes its own commit; 0 and 201 are 422.
 - **Files of one commit (`F15.commit-changes`).**
   ```sh
   control-agent-server api GET "/api/git/commits/$C1/changes" --query path="$REPO" --expect 200 --check . len-eq 2 \
-    --check 0.status eq ADDED --check 0.path eq README.md --check 1.path eq src/app.py --save F15.commit-changes/root
+    --check 0.status eq ADDED --check 0.path eq README.md --check 1.status eq ADDED --check 1.path eq src/app.py \
+    --save F15.commit-changes/root
   control-agent-server api GET "/api/git/commits/$C2/changes" --query path="$REPO" --expect 200 --check . len-eq 1 \
     --check 0.status eq ADDED --check 0.path eq src/util.py --save F15.commit-changes/add-util
   control-agent-server api GET "/api/git/commits/${C2:0:7}/changes" --query path="$REPO" --expect 200 --check 0.path eq src/util.py
@@ -458,21 +502,29 @@ Preconditions:
   Identical bodies for changes, diff and commits; the scoped commit changes
   and commit-mode diff work the same way.
 - **Workspace guard (`F15.scoped-guard`).** A second never-run conversation
-  `CID2` on a copy, so the symlink stays out of the main fixture.
+  `CID2` on a copy, so the symlink stays out of the main fixture. The
+  workspace itself answers first (positive control), then every escape.
   ```sh
   cp -r "$REPO" "$F/guard"
+  cp -r "$REPO" "$F/guard-sibling"
   CID2=$(control-agent-server conversation start --workspace "$F/guard" --tools none --no-autotitle --print-id)
+  control-agent-server api GET "/api/conversations/$CID2/git/changes" --query path="$F/guard" --expect 200 --check . len-eq 2 \
+    --check 0.path eq README.md --check 1.path eq notes.txt --save F15.scoped-guard/workspace
+  control-agent-server api GET "/api/conversations/$CID2/git/diff" --query path="$F/guard/README.md" --expect 200 \
+    --check modified eq "$(cat "$F/guard/README.md")"
   ln -s "$REPO" "$F/guard/qa-escape"
   control-agent-server api GET "/api/conversations/$CID2/git/changes" --query path="$REPO" --expect 422 \
     --check detail eq 'path must be inside the conversation workspace' --save F15.scoped-guard/other-dir
   control-agent-server api GET "/api/conversations/$CID2/git/changes" --query path="$F/guard-sibling" --expect 422
   control-agent-server api GET "/api/conversations/$CID2/git/changes" --query path="$F/guard/../outer" --expect 422
   control-agent-server api GET "/api/conversations/$CID2/git/changes" --query path="$F/guard/qa-escape" --expect 422 \
-    --save F15.scoped-guard/symlink
+    --check detail eq 'path must be inside the conversation workspace' --save F15.scoped-guard/symlink
+  control-agent-server api GET "/api/conversations/$CID2/git/diff" --query path="$F/guard/qa-escape/README.md" --expect 422
   control-agent-server api GET "/api/conversations/$CID2/git/diff" --query path=README.md --expect 422
+  control-agent-server api GET "/api/conversations/$CID2/git/changes" --query path="$F/guard" --query path="$REPO" --expect 422 \
+    --check detail eq 'path must be inside the conversation workspace' --save F15.scoped-guard/duplicate-path
   control-agent-server api GET "/api/conversations/$CID2/git/commits" --query path="$REPO" --expect 422
   control-agent-server api GET "/api/conversations/$CID2/git/commits/$C2/changes" --query path="$REPO" --expect 422
-  control-agent-server api GET "/api/conversations/$CID2/git/changes" --query path="$F/guard" --expect 200 --check . len-eq 2
   control-agent-server api GET /api/git/changes --query path="$F/guard/qa-escape" --expect 200 --check . len-eq 2
   control-agent-server api GET /api/conversations/00000000-0000-4000-8000-000000000000/git/changes --query path="$REPO" \
     --expect 404 --check detail contains 'Conversation not found' --save F15.scoped-guard/unknown-conversation
@@ -482,13 +534,39 @@ Preconditions:
     --check 'paths./api/conversations/{runtime_conversation_id}/git/changes' exists \
     --check 'paths./api/conversations/{runtime_conversation_id}/git/repositories/search' missing
   ```
-  Another directory, a sibling sharing the workspace's name as a prefix
-  (`guard-sibling`), a `..` escape, a symlink inside the workspace that
-  resolves outside it, and a relative path are all 422 on every scoped route,
-  while the workspace itself is 200 and the global route follows the same
-  symlink. An unknown conversation is 404, a malformed id 422, and repository
-  search has no scoped variant: the OpenAPI document lists the global search
-  and the scoped `changes` but no scoped search path.
+  The workspace and a file in it are 200. Another directory, a sibling
+  sharing the workspace's name as a prefix (`guard-sibling`), a `..` escape,
+  a symlink inside the workspace that resolves outside it (as `path` and as a
+  file below it), and a relative path are all
+  `422 {"detail": "path must be inside the conversation workspace"}` on every
+  scoped route, while the global route follows the same symlink. A repeated
+  `path` (the workspace first, then an outside repository) is also 422: the
+  guard and the handler both read the last value, so the guard cannot be
+  sidestepped by sending a second `path`. An unknown
+  conversation is 404, a malformed id 422, and repository search has no
+  scoped variant: the OpenAPI document lists the global search and the scoped
+  `changes` but no scoped search path.
+- **Symlinked repository in the workspace (`F15.scoped-symlink-repo`), known bug.**
+  The `qa-escape` symlink from the previous bullet points at a repository
+  outside `CID2`'s workspace.
+  ```sh
+  control-agent-server api GET "/api/conversations/$CID2/git/changes" --query path="$F/guard" --expect 200 \
+    --raw-out "$F/guard-changes.json" --save F15.scoped-symlink-repo/workspace
+  python3 - "$F/guard-changes.json" <<'PY'
+  import json, sys
+  changes = json.load(open(sys.argv[1]))
+  leaked = [c["path"] for c in changes if c["path"].startswith("qa-escape/")]
+  assert not leaked, f"scoped changes list files of a repository outside the workspace: {leaked}"
+  PY
+  ```
+  Expected: the scoped view of the workspace lists nothing from outside it
+  (at most the symlink itself, as `git status` shows `?? qa-escape`).
+  Actual: it adds `UPDATED qa-escape/README.md` and `ADDED qa-escape/notes.txt`,
+  the outside repository's changes: the nested-repository scan
+  (`glob("./*/.git")` in `get_git_changes`) follows the symlink, while the
+  workspace guard only checks the requested `path`. The scoped diff of
+  `qa-escape/README.md` is 422 (previous bullet), so the Changes tab lists
+  files it cannot open; only names and statuses leak, not contents.
 - **After a restart (`F15.scoped-restart`).**
   ```sh
   control-agent-server restart
@@ -500,6 +578,87 @@ Preconditions:
   ```
   The restored conversation still binds its workspace; the scoped changes are
   byte-identical to before the restart.
+- **Python SDK workspace (`F15.sdk-workspace`).** `RemoteWorkspace` with
+  `working_dir` set to the fixture, once plain and once scoped to `CID`
+  (`runtime_conversation_id`), through `exec`.
+  ```sh
+  cat > "$F/sdk_git.py" <<'PY'
+  import os
+  import sys
+  from uuid import UUID
+
+  import httpx
+
+  from openhands.sdk.workspace.remote.base import RemoteWorkspace
+
+  repo, cid = sys.argv[1], sys.argv[2]
+  host, key = os.environ["AGENT_SERVER_URL"], os.environ["SESSION_API_KEY"]
+  plain = RemoteWorkspace(host=host, api_key=key, working_dir=repo)
+  scoped = RemoteWorkspace(host=host, api_key=key, working_dir=repo, runtime_conversation_id=UUID(cid))
+  for ws in (plain, scoped):
+      changes = [(c.status.value, c.path.as_posix()) for c in ws.git_changes(".")]
+      assert changes == [("UPDATED", "README.md"), ("ADDED", "notes.txt")], changes
+      diff = ws.git_diff("README.md")
+      assert diff.original == "# QA fixture repo\n\nCreated by control-agent-server.", diff
+      assert diff.modified == "# QA fixture repo\n\nModified, not committed.", diff
+  try:
+      scoped.git_changes("/")
+  except httpx.HTTPStatusError as e:
+      assert e.response.status_code == 422, e
+  else:
+      raise AssertionError("scoped git_changes('/') was not refused")
+  print("SDK_GIT_OK")
+  PY
+  control-agent-server exec --expect-output SDK_GIT_OK --save F15.sdk-workspace/program -- uv run python "$F/sdk_git.py" "$REPO" "$CID"
+  ```
+  Relative paths (`"."`, `"README.md"`) are joined to `working_dir` before
+  the call, both workspaces return the fixture's two changes and the README
+  diff, and the scoped one raises a 422 `HTTPStatusError` for `/`.
+- **TypeScript client (`F15.ts-client`).** `RemoteWorkspace.gitChanges` and
+  `gitDiff` plain and with `conversationId`, and
+  `GitClient.searchRepositories`, from the built client in
+  `clients/typescript/dist` (built here when missing).
+  ```sh
+  test -f clients/typescript/dist/clients.js || (cd clients/typescript && npm ci && npm run build)
+  cat > "$F/ts_git.mjs" <<'JS'
+  import assert from 'node:assert/strict';
+  import { resolve } from 'node:path';
+  import { pathToFileURL } from 'node:url';
+
+  const dist = (name) => pathToFileURL(resolve('clients/typescript/dist', name)).href;
+  const { RemoteWorkspace } = await import(dist('index.js'));
+  const { GitClient } = await import(dist('clients.js'));
+  const [repo, cid, c1] = process.argv.slice(2);
+  const host = process.env.AGENT_SERVER_URL;
+  const apiKey = process.env.SESSION_API_KEY;
+  for (const conversationId of [undefined, cid]) {
+    const ws = new RemoteWorkspace({ host, apiKey, workingDir: repo, conversationId });
+    assert.deepEqual(await ws.gitChanges(repo), [
+      { status: 'UPDATED', path: 'README.md' },
+      { status: 'ADDED', path: 'notes.txt' },
+    ]);
+    assert.deepEqual(await ws.gitChanges(repo, { ref: c1 }), [
+      { status: 'UPDATED', path: 'README.md' },
+      { status: 'ADDED', path: 'notes.txt' },
+      { status: 'ADDED', path: 'src/util.py' },
+    ]);
+    const diff = await ws.gitDiff(`${repo}/README.md`);
+    assert.equal(diff.modified, '# QA fixture repo\n\nModified, not committed.');
+  }
+  const scoped = new RemoteWorkspace({ host, apiKey, workingDir: repo, conversationId: cid });
+  await assert.rejects(scoped.gitChanges('/'), /422|inside the conversation workspace/);
+  const page = await new GitClient({ host, apiKey }).searchRepositories({ provider: 'github' });
+  assert.deepEqual(page, { items: [], next_page_id: null, missing_token: true });
+  console.log('TS_GIT_OK');
+  JS
+  control-agent-server exec --expect-output TS_GIT_OK --save F15.ts-client/program -- node "$F/ts_git.mjs" "$REPO" "$CID" "$C1"
+  ```
+  Both workspaces return the same changes and diff; `ref: C1` is passed
+  through (it adds `src/util.py`, which the default base `HEAD` does not
+  show, so a dropped `ref` would fail), the scoped one rejects `/` with the
+  422, and
+  `searchRepositories` returns the `missing_token` page (no token is stored
+  yet at this point).
 - **What the agent changed (`F15.agent-changes`).** A real model writes one
   file in a fresh copy of the fixture, then the scoped views show it.
   ```sh
@@ -563,14 +722,41 @@ Preconditions:
     --check detail eq 'Internal Server Error' --check exception eq '502: GitHub repository search failed' \
     --check . not-contains qa-f15-not-a-real-token --save F15.repo-search-unreachable/dead-proxy
   control-agent-server api DELETE /api/settings/secrets/github_token --expect 200
-  control-agent-server restart --env HTTPS_PROXY="${HTTPS_PROXY:-}" --env https_proxy="${https_proxy:-}" \
-    --env NO_PROXY="${NO_PROXY:-}" --env no_proxy="${no_proxy:-}"
+  control-agent-server restart --reset-config
+  control-agent-server api GET /api/git/repositories/search --query provider=github --expect 200 --check missing_token eq true
   control-agent-server doctor
   ```
   502 with the server's masked 5xx body
   (`{"detail": "Internal Server Error", "exception": "502: GitHub repository search failed"}`),
-  without the token. The second restart puts this shell's proxy settings
-  back.
+  without the token. `restart --reset-config` drops the dead proxy again
+  (the run has no launch flags to lose), and the search is back to
+  `missing_token` once the secret is deleted.
+- **GitHub timeout (`F15.repo-search-timeout`).** A local listener that
+  accepts connections and never answers stands in for the HTTPS proxy, so the
+  call to GitHub hits the server's own 15 s timeout (the timer is under test,
+  so the bullet measures the wait). The listener is plain `python3`, started
+  in the background and killed at the end.
+  ```sh
+  python3 -c 'import socket, time; s = socket.socket(); s.bind(("127.0.0.1", 0)); s.listen(8); print(s.getsockname()[1], flush=True); time.sleep(90)' \
+    > "$F/hang-port" 2>/dev/null < /dev/null &
+  HANG_PID=$!
+  for i in $(seq 50); do test -s "$F/hang-port" && break; sleep 0.1; done
+  HANG="http://127.0.0.1:$(cat "$F/hang-port")"
+  control-agent-server api PUT /api/settings/secrets --json '{"name": "github_token", "value": "qa-f15-not-a-real-token"}' --expect 200
+  control-agent-server restart --env HTTPS_PROXY="$HANG" --env https_proxy="$HANG" --env NO_PROXY=localhost --env no_proxy=localhost
+  T0=$SECONDS
+  control-agent-server api GET /api/git/repositories/search --query provider=github --expect 504 --expect-max-ms 30000 \
+    --check detail eq 'Internal Server Error' --check exception eq '504: GitHub repository search timed out' \
+    --check . not-contains qa-f15-not-a-real-token --save F15.repo-search-timeout/silent-proxy
+  test $((SECONDS - T0)) -ge 14
+  kill "$HANG_PID"
+  control-agent-server api DELETE /api/settings/secrets/github_token --expect 200
+  control-agent-server restart --reset-config
+  control-agent-server doctor
+  ```
+  504 after about 15 s (between 14 and 30), with the masked 5xx body
+  `{"detail": "Internal Server Error", "exception": "504: GitHub repository search timed out"}`
+  and no token in it.
 - **Live GitHub listing (`F15.repo-search-github`), blocked.** Needs a GitHub
   token with repository read access in `$QA_GITHUB_TOKEN` and egress that
   allows `GET https://api.github.com/user/repos`. On the machine this was
@@ -609,6 +795,14 @@ Preconditions:
 - A non-repository `path` is not an error: `changes` is `[]`, commits are
   empty and `diff` is `{"original": null, "modified": null}` (null, not `""`).
   A missing file inside a repository is 400, and so is a file over 1 MiB.
+- "Not a repository" means no ancestor holds a `.git`: git searches upward
+  and `diff` walks up in Python. A stray `.git` above the runs home (for
+  example a `git init` that ran in `/tmp`) turns every fixture into part of
+  that repository: `F15.non-repo` then lists `x.txt` as `ADDED` and
+  `F15.changes-repo-below-path` passes for the wrong reason. The
+  Preconditions block refuses such a run; launch with
+  `AGENT_SERVER_VERIFY_HOME` outside the enclosing repository (for example
+  under `/var/tmp`) or have its owner remove the stray `.git`.
 - A relative `path` on the global routes resolves against the server
   process's working directory (the run directory for `launch`); always send
   absolute paths. The SDK joins relative paths to `working_dir` before
@@ -622,7 +816,9 @@ Preconditions:
   `original` and `""` as `modified`.
 - Nested repositories are only scanned one level below a `path` that is
   itself a repository (`./*/.git`); deeper ones show up as an untracked
-  directory entry.
+  directory entry. The scan follows symlinks, unlike the archive's repository
+  search (`_resolve_git_repo_root` skips them), so a symlinked repository's
+  changes appear under the link's name (`F15.scoped-symlink-repo`).
 - `commits/{sha}/changes` keeps git's output order (renames as
   `DELETED`+`ADDED` pairs), unlike `changes`, which is sorted by path.
 - Git calls reset `idle_time` (`update_last_execution_time`), like file
@@ -634,6 +830,6 @@ Preconditions:
   Statuses from GitHub: 401 and 403 pass through, other 4xx are 400, 5xx and
   transport errors 502 (masked as `Internal Server Error` with the reason in
   `exception`), a timeout 504.
-- `restart --env` values persist for later restarts of the run; restore them
-  as `F15.repo-search-unreachable` does when a bullet points the proxy
-  somewhere else.
+- `restart --env` values persist for later restarts of the run; clear them
+  with `restart --reset-config` as `F15.repo-search-unreachable` does (that
+  also drops `Launch:` flags, which this family has none of).

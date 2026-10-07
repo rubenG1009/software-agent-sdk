@@ -40,6 +40,7 @@ Routes: `GET /api/conversations/{runtime_conversation_id}/bash/bash_events/searc
 - `F13.search`: search filters by `kind__eq`, `command_id__eq` (outputs only), a UTC `timestamp__gte`/`timestamp__lt` window, sorts with `sort_order`, pages with `limit`/`next_page_id`, and rejects bad parameters with 422.
 - `F13.timestamp-offset`: a `timestamp__gte` with a non-UTC offset selects the same instant as its UTC spelling.
 - `F13.output-chunks`: output over 1 MiB is stored as ordered `BashOutput` chunks of 1048576 characters plus a final chunk with the exit code; `order__gt` skips seen chunks, and the SDK's `RemoteWorkspace.execute_command` reassembles them.
+- `F13.order-gt-paging`: `order__gt` filters before `limit` applies, so a poller asking for outputs after order N with a small page gets them.
 - `F13.execute-large-output`: `execute_bash_command` returns the complete stdout of a command whose output is over 1 MiB.
 - `F13.timeout`: a command that outlives its `timeout` is killed with its process group and reports `exit_code` -1.
 - `F13.stop`: stopping a running command by id terminates only that command (final `exit_code` -15, process gone) while another command finishes normally.
@@ -98,7 +99,8 @@ Preconditions:
 - A baseline run is live and exported (`launch --new`), `doctor` is ok. No
   LLM is needed: the two conversations below only provide workspaces, are
   never run, and name a model that is never called.
-- `jq`, `pgrep` and `sed` are on `PATH` (used for a few negative checks).
+- `jq`, `pgrep` and `sed` are on `PATH` (file counts, the server
+  environment, and checks that a killed command's processes are gone).
 - `launch` starts the server with cwd `<run>/server`, so global commands
   without a cwd run there.
   ```sh
@@ -111,20 +113,37 @@ Preconditions:
   test -d "$WS1" && test -d "$WS2" && test -d "$SERVER_CWD"
   ```
 
-- **Auth (`F13.auth`).** No key, a wrong key, and a bad socket key.
+- **Auth (`F13.auth`).** All fourteen REST routes without a key or with a
+  wrong one, and a bad socket key followed by a command frame.
   ```sh
   control-agent-server api POST /api/bash/execute_bash_command --auth none \
     --json '{"command": "echo QA_F13_NOAUTH"}' --expect 401 --save F13.auth/execute-no-key
+  control-agent-server api POST /api/bash/start_bash_command --auth bad \
+    --json '{"command": "echo QA_F13_NOAUTH"}' --expect 401
   control-agent-server api GET /api/bash/bash_events/search --auth bad --expect 401
+  control-agent-server api GET /api/bash/bash_events/00000000000000000000000000000000 --auth none --expect 401
+  control-agent-server api GET /api/bash/bash_events/ --auth none --json '[]' --expect 401
+  control-agent-server api POST /api/bash/bash_commands/00000000000000000000000000000000/stop --auth none --expect 401
+  control-agent-server api DELETE /api/bash/bash_events --auth bad --expect 401
   control-agent-server api POST "/api/conversations/$CID/bash/start_bash_command" --auth none \
     --json '{"command": "echo QA_F13_NOAUTH"}' --expect 401
-  control-agent-server ws listen /sockets/bash-events --auth bad --duration 5 --expect-close 4001 \
-    --save F13.auth/ws-bad-key
+  control-agent-server api POST "/api/conversations/$CID/bash/execute_bash_command" --auth bad \
+    --json '{"command": "echo QA_F13_NOAUTH"}' --expect 401
+  control-agent-server api GET "/api/conversations/$CID/bash/bash_events/search" --auth none --expect 401
+  control-agent-server api GET "/api/conversations/$CID/bash/bash_events/00000000000000000000000000000000" --auth bad --expect 401
+  control-agent-server api GET "/api/conversations/$CID/bash/bash_events/" --auth none --json '[]' --expect 401
+  control-agent-server api POST "/api/conversations/$CID/bash/bash_commands/00000000000000000000000000000000/stop" --auth none --expect 401
+  control-agent-server api DELETE "/api/conversations/$CID/bash/bash_events" --auth none --expect 401
+  control-agent-server ws listen /sockets/bash-events --auth bad --send '{"command": "echo QA_F13_NOAUTH"}' \
+    --duration 5 --expect-close 4001 --save F13.auth/ws-bad-key
   control-agent-server api GET /api/bash/bash_events/search --query kind__eq=BashCommand \
     --check items not-contains QA_F13_NOAUTH --save F13.auth/nothing-ran
+  control-agent-server api GET "/api/conversations/$CID/bash/bash_events/search" --check items len-eq 0
   ```
-  Both REST calls without a valid key are 401, the socket closes with
-  `4001 Authentication failed`, and no `QA_F13_NOAUTH` command was stored.
+  Every REST call without a valid key is 401, the socket closes with
+  `4001 Authentication failed` before reading the command frame, and with
+  the run's key both searches answer 200 with no `QA_F13_NOAUTH` command in
+  either scope.
 - **Synchronous execute (`F13.execute-sync`).** Exit code, stdout and stderr
   come back in one response.
   ```sh
@@ -156,21 +175,27 @@ Preconditions:
   ```
   `pwd` prints the server's cwd, then `/tmp`; the missing directory is a
   200 whose `BashOutput` has `exit_code` -1 and the spawn error in stderr.
-- **Sanitized environment (`F13.env-sanitized`).** The run's server was
-  started with `OH_SESSION_API_KEYS_0` and `OH_SECRET_KEY`.
+- **Sanitized environment (`F13.env-sanitized`).** The run's server has
+  `OH_SESSION_API_KEYS_0` and `OH_SECRET_KEY`; a restart adds the legacy
+  `SESSION_API_KEY` (ignored for auth while `OH_SESSION_API_KEYS_0` is set),
+  so all three are really in the server's environment.
   ```sh
+  control-agent-server restart --env SESSION_API_KEY=qa-f13-legacy-not-a-key
+  control-agent-server config | jq -e '.server_env.OH_SESSION_API_KEYS_0 == "<set>" and .server_env.OH_SECRET_KEY == "<set>" and .server_env.SESSION_API_KEY == "<set>"'
   control-agent-server api POST /api/bash/execute_bash_command \
-    --json '{"command": "echo keys=${OH_SESSION_API_KEYS_0:-unset} legacy=${SESSION_API_KEY:-unset} secret=${OH_SECRET_KEY:-unset} agent=$AI_AGENT"}' \
-    --check exit_code eq 0 --check stdout eq $'keys=unset legacy=unset secret=unset agent=openhands\n' \
+    --json '{"command": "echo keys=${OH_SESSION_API_KEYS_0:-unset} legacy=${SESSION_API_KEY:-unset} secret=${OH_SECRET_KEY:-unset} agent=$AI_AGENT home=$HOME"}' \
+    --check exit_code eq 0 \
+    --check stdout eq "keys=unset legacy=unset secret=unset agent=openhands home=$AGENT_SERVER_VERIFY_RUN/home"$'\n' \
     --save F13.env-sanitized/env
   ```
-  The three credentials are unset inside the command and `AI_AGENT` is
-  `openhands`.
+  The three credentials are unset inside the command, `AI_AGENT` is
+  `openhands`, and the inherited `HOME` (the run's private home) shows the
+  rest of the server environment does reach the command.
 - **Asynchronous start (`F13.start-async`).** The start returns before the
   output exists; the socket replay waits for the final output.
   ```sh
   START_CMD=$(control-agent-server api POST /api/bash/start_bash_command \
-    --json '{"command": "sleep 2; echo QA_F13_ASYNC", "timeout": 30}' --expect 200 \
+    --json '{"command": "sleep 3; echo QA_F13_ASYNC", "timeout": 30}' --expect 200 --expect-max-ms 2000 \
     --check kind eq BashCommand --check timeout eq 30 --save F13.start-async/start --field id)
   control-agent-server api GET /api/bash/bash_events/search --query command_id__eq="$START_CMD" \
     --check items len-eq 0 --save F13.start-async/before
@@ -180,45 +205,46 @@ Preconditions:
     --query kind__eq=BashOutput --check items len-eq 1 --check items.0.exit_code eq 0 \
     --check items.0.stdout eq $'QA_F13_ASYNC\n' --save F13.start-async/after
   ```
-  Right after the start there is no output; once the `BashOutput` frame for
-  the command arrives, search shows one output with `exit_code` 0.
+  The start answers within two seconds for a three-second command, and right
+  after it there is no output; once the `BashOutput` frame for the command
+  arrives, search shows one output with `exit_code` 0.
 - **Live and replayed socket frames (`F13.ws-live`).** Capture in the
   background, start a command over REST, then replay history on a new
   connection.
   ```sh
-  control-agent-server ws start /sockets/bash-events --name f13-live --duration 120
+  control-agent-server ws start /sockets/bash-events --name f13-live --duration 120 \
+    --send '{"command": "echo QA_F13_WS_PROBE"}'
+  control-agent-server ws read f13-live --kinds BashOutput --contains QA_F13_WS_PROBE --wait 15 --show 0
   LIVE_CMD=$(control-agent-server api POST /api/bash/start_bash_command \
     --json '{"command": "echo QA_F13_LIVE"}' --field id)
-  control-agent-server ws listen /sockets/bash-events --query resend_mode=all --until-kind BashOutput \
-    --until command_id="$LIVE_CMD" --duration 20 --show 0
-  for i in $(seq 1 20); do
-    control-agent-server ws read f13-live --kinds BashOutput --contains "$LIVE_CMD" --show 0 && break
-    sleep 0.25
-  done
-  control-agent-server ws stop f13-live --kinds BashCommand --contains "$LIVE_CMD" --save F13.ws-live/live
-  control-agent-server ws read f13-live --kinds BashOutput --contains QA_F13_LIVE
+  control-agent-server ws stop f13-live --kinds BashOutput --contains "$LIVE_CMD" --wait 15 --show 0 \
+    --save F13.ws-live/live
+  control-agent-server ws read f13-live --kinds BashCommand --contains "$LIVE_CMD" --show 0
+  control-agent-server ws read f13-live --kinds BashOutput --contains QA_F13_LIVE --expect-min 1 --show 0
   control-agent-server ws listen /sockets/bash-events --query resend_mode=all --until-kind BashOutput \
     --until command_id="$EXEC_CMD" --duration 10 --show 0 --save F13.ws-live/replay
   ```
-  The live capture holds the `BashCommand` and the `BashOutput`
-  (`QA_F13_LIVE`); the replay connection receives the output of the first
-  command of this run, stored before it connected. The `ws read` loop only
-  gives the background capture time to write the last frame before it is
-  stopped.
+  The capture's own probe command comes back on it, so it is subscribed
+  before the REST start; it then holds the `BashCommand` and the
+  `BashOutput` (`QA_F13_LIVE`) of the REST command; the replay connection
+  receives the output of the first command of this run, stored before it
+  connected.
 - **Commands over the socket (`F13.ws-command`).** An invalid frame, then a
   valid one on the same connection.
   ```sh
   control-agent-server ws listen /sockets/bash-events --send '{"cmd": "echo nope"}' \
-    --until-kind BashError --duration 10 --save F13.ws-command/error
+    --until-kind BashError --until code=ValidationError --duration 10 --save F13.ws-command/error
   control-agent-server ws listen /sockets/bash-events --send '{"cmd": "echo nope"}' \
-    --send '{"command": "echo QA_F13_WS_CMD", "timeout": 30}' \
+    --send '{"command": "echo QA_F13_WS_CMD", "timeout": 30}' --expect-kind BashError \
     --until-kind BashOutput --until exit_code=0 --duration 20 --save F13.ws-command/after-error
   control-agent-server api GET /api/bash/bash_events/search --query kind__eq=BashCommand \
-    --query sort_order=TIMESTAMP_DESC --query limit=1 --check items.0.command eq 'echo QA_F13_WS_CMD'
+    --query sort_order=TIMESTAMP_DESC --query limit=1 --check items.0.command eq 'echo QA_F13_WS_CMD' \
+    --check items.0.timeout eq 30
   ```
   The first connection gets `{"kind": "BashError", "code": "ValidationError"}`;
-  on the second, the command after the invalid frame still runs
-  (`BashOutput` with `exit_code` 0) and REST search sees it.
+  the second gets the same `BashError` and then, on the same connection, the
+  command after the invalid frame still runs (`BashOutput` with `exit_code`
+  0); REST search sees it with its `timeout`.
 - **Single and batch reads (`F13.get-events`).** By hex id, then a batch
   with a missing id.
   ```sh
@@ -315,50 +341,84 @@ Preconditions:
   Search returns two chunks (1048576 characters without an exit code, then
   51436 ending in `QA_F13_TAIL` with `exit_code` 0); `order__gt=0` returns
   only the second; the SDK prints `QA_F13_SDK_BIG_OK 1100012`.
+- **Order filter and paging (`F13.order-gt-paging`), known bug.** A poller
+  that has seen order 0 asks for the next output, one per page.
+  ```sh
+  control-agent-server api GET /api/bash/bash_events/search --query command_id__eq="$BIG_CMD" \
+    --query order__gt=0 --query limit=1 --check items len-eq 1 --check items.0.order eq 1 \
+    --quiet --save F13.order-gt-paging/limit-1
+  ```
+  Expected: the page holds chunk 1. Today it is empty while `next_page_id`
+  is set: `_search_bash_events_sync` (`bash_service.py`) slices the first
+  `limit` file names and only then drops outputs with `order <= order__gt`.
+  The Python SDK polls with `order__gt` and `limit=100` and ignores
+  `next_page_id`, so `RemoteWorkspace.execute_command` never sees chunk 100
+  onwards: `yes a | head -c 106000000; echo QA_F13_HUGE_TAIL` finishes on
+  the server in about 4 s, yet the SDK (`timeout=40`) returns `exit_code` -1,
+  `timeout_occurred` true and exactly 104857600 characters after 40 s. That
+  end-to-end repro writes 100 MiB of event files, so it is not a recipe
+  here.
 - **Large output through execute (`F13.execute-large-output`), known bug.**
   The synchronous route must return everything the command printed.
   ```sh
   control-agent-server api POST /api/bash/execute_bash_command \
     --json '{"command": "yes a | head -c 1100000; echo QA_F13_TAIL", "timeout": 60}' --expect 200 \
-    --check exit_code eq 0 --check stdout len-eq 1100012 --save F13.execute-large-output/execute --field order
+    --check exit_code eq 0 --check stdout len-eq 1100012 --quiet --save F13.execute-large-output/execute
   ```
   Expected: `stdout` holds all 1,100,012 characters. Today the response is
   only the last chunk (`order` 1, 51,436 characters): the handler returns
   `page.items[-1]` (`bash_router.py` `execute_bash_command`), so the TS
   client's `RemoteWorkspace.executeCommand` and `BashClient.executeCommand`
-  silently lose the first MiB.
-- **Timeout (`F13.timeout`).** A 30 s sleep with a 1 s timeout.
+  silently lose the first MiB. Past 100 chunks it is worse: `items[-1]` of
+  the default 100-item page is chunk 99, so a command that printed 101 MiB
+  and ran `exit 7` comes back with `exit_code` null, which the TS
+  `RemoteWorkspace.executeCommand` turns into 0.
+- **Timeout (`F13.timeout`).** A 30 s sleep with a 2 s timeout. The sleep
+  is not the shell's last command, so `/bin/sh` forks it as a child; its
+  unique duration makes that child findable with `pgrep`, which proves the
+  whole process group is killed, not only the shell. The execute runs in
+  the background while `pgrep` sees the child alive.
   ```sh
-  MARK=QA_F13_TIMEOUT_$RANDOM
-  control-agent-server api POST /api/bash/execute_bash_command \
-    --json "{\"command\": \"sleep 30 # $MARK\", \"timeout\": 1}" --expect 200 --timeout 20 \
-    --check exit_code eq -1 --check stdout missing --save F13.timeout/execute
-  test -z "$(pgrep -f "$MARK" || true)"
+  SLP=30.$RANDOM
+  BODY="{\"command\": \"echo QA_F13_STARTED; sleep $SLP; echo QA_F13_NOT_REACHED\", \"timeout\": 2}"
+  ( control-agent-server api POST /api/bash/execute_bash_command --json "$BODY" \
+    --expect 200 --timeout 20 --expect-max-ms 8000 --check exit_code eq -1 \
+    --check stdout eq $'QA_F13_STARTED\n' --quiet --save F13.timeout/execute ) &
+  EXEC_JOB=$!
+  for i in $(seq 1 40); do pgrep -fx "sleep $SLP" > /dev/null && break; sleep 0.1; done
+  pgrep -fx "sleep $SLP"
+  wait "$EXEC_JOB"
+  test -z "$(pgrep -fx "sleep $SLP" || true)"
   ```
-  The call returns after about one second with `exit_code` -1, and no
-  process with the marker is left.
-- **Stop one command (`F13.stop`).** Two running commands, one stopped.
+  The child `sleep` is running during the call; the call returns after about
+  two seconds (well under eight) with `exit_code` -1 and the output printed
+  before the timeout, and the child is gone.
+- **Stop one command (`F13.stop`).** Two running commands, one stopped. As
+  in the timeout bullet, the sleep is a forked child with a unique duration.
   ```sh
-  MARK=QA_F13_STOP_$RANDOM
-  STOP_CMD=$(control-agent-server api POST /api/bash/start_bash_command \
-    --json "{\"command\": \"sleep 600 # $MARK\"}" --field id)
+  SLP=600.$RANDOM
+  BODY="{\"command\": \"sleep $SLP; echo QA_F13_NOT_REACHED\"}"
+  STOP_CMD=$(control-agent-server api POST /api/bash/start_bash_command --json "$BODY" --field id)
   OTHER_CMD=$(control-agent-server api POST /api/bash/start_bash_command \
-    --json '{"command": "sleep 3; echo QA_F13_OTHER"}' --field id)
+    --json '{"command": "sleep 5; echo QA_F13_OTHER"}' --field id)
+  for i in $(seq 1 40); do pgrep -fx "sleep $SLP" > /dev/null && break; sleep 0.1; done
+  pgrep -fx "sleep $SLP"
   control-agent-server api POST "/api/bash/bash_commands/$STOP_CMD/stop" --expect 200 \
     --check success eq true --save F13.stop/stop
-  control-agent-server ws listen /sockets/bash-events --query resend_mode=all --until-kind BashOutput \
-    --until command_id="$STOP_CMD" --duration 15 --show 0
-  control-agent-server api GET /api/bash/bash_events/search --query command_id__eq="$STOP_CMD" \
-    --check items.-1.exit_code eq -15 --save F13.stop/stopped-output
-  test -z "$(pgrep -f "$MARK" || true)"
-  control-agent-server ws listen /sockets/bash-events --query resend_mode=all --until-kind BashOutput \
-    --until command_id="$OTHER_CMD" --duration 15 --show 0
   control-agent-server api GET /api/bash/bash_events/search --query command_id__eq="$OTHER_CMD" \
-    --check items.-1.exit_code eq 0 --check items.-1.stdout eq $'QA_F13_OTHER\n' --save F13.stop/other-output
+    --check items len-eq 0
+  control-agent-server api GET /api/bash/bash_events/search --query command_id__eq="$STOP_CMD" --until-ok 15 \
+    --check items len-eq 1 --check items.0.exit_code eq -15 --check items.0.stdout missing \
+    --save F13.stop/stopped-output
+  test -z "$(pgrep -fx "sleep $SLP" || true)"
+  control-agent-server api GET /api/bash/bash_events/search --query command_id__eq="$OTHER_CMD" --until-ok 15 \
+    --check items len-eq 1 --check items.0.exit_code eq 0 --check items.0.stdout eq $'QA_F13_OTHER\n' \
+    --save F13.stop/other-output
   ```
-  The stopped command's final output has `exit_code` -15 (SIGTERM to its
-  process group) and its process is gone; the other command still prints
-  `QA_F13_OTHER` with `exit_code` 0.
+  The stopped command's only output has `exit_code` -15 (SIGTERM to its
+  process group) and no stdout, and its child `sleep` is gone; the other
+  command, still running right after the stop, prints `QA_F13_OTHER` with
+  `exit_code` 0.
 - **Stop is idempotent (`F13.stop-idempotent`).** Finished, dashed, unknown
   and malformed ids.
   ```sh
@@ -387,9 +447,11 @@ Preconditions:
     --json "{\"command\": \"pwd\", \"cwd\": \"$WS2\"}" --expect 422 \
     --check detail eq 'cwd must be inside the conversation workspace' --save F13.scoped-cwd/other-workspace
   control-agent-server api POST "/api/conversations/$CID/bash/start_bash_command" \
-    --json "{\"command\": \"pwd\", \"cwd\": \"$WS1/qa-sub/../..\"}" --expect 422
+    --json "{\"command\": \"pwd\", \"cwd\": \"$WS1/qa-sub/../..\"}" --expect 422 \
+    --check detail eq 'cwd must be inside the conversation workspace'
   control-agent-server api POST "/api/conversations/$CID/bash/execute_bash_command" \
-    --json '{"command": "pwd", "cwd": "qa-sub"}' --expect 422
+    --json '{"command": "pwd", "cwd": "qa-sub"}' --expect 422 \
+    --check detail eq 'cwd must be inside the conversation workspace'
   cat > "$AGENT_SERVER_VERIFY_RUN/fixtures/qa_f13_sdk_scoped.py" <<'PY'
   import os, sys
   from openhands.sdk.workspace import RemoteWorkspace
@@ -420,39 +482,38 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$CID/bash/bash_events/" \
     --json "[\"$SC_OUT\", \"00000000000000000000000000000000\"]" --check . len-eq 2 \
     --check 0.stdout eq $'QA_F13_SCOPED\n' --check 1 missing --save F13.scoped-routes/batch
-  MARK=QA_F13_SCOPED_STOP_$RANDOM
-  SC_LONG=$(control-agent-server api POST "/api/conversations/$CID/bash/start_bash_command" \
-    --json "{\"command\": \"sleep 600 # $MARK\"}" --check cwd eq "$WS1" --field id)
+  SLP=600.$RANDOM
+  BODY="{\"command\": \"sleep $SLP; echo QA_F13_NOT_REACHED\"}"
+  SC_LONG=$(control-agent-server api POST "/api/conversations/$CID/bash/start_bash_command" --json "$BODY" \
+    --check cwd eq "$WS1" --field id)
+  for i in $(seq 1 40); do pgrep -fx "sleep $SLP" > /dev/null && break; sleep 0.1; done
+  pgrep -fx "sleep $SLP"
   control-agent-server api POST "/api/conversations/$CID/bash/bash_commands/$SC_LONG/stop" --expect 200 \
     --check success eq true --save F13.scoped-routes/stop
-  for i in $(seq 1 20); do
-    control-agent-server api GET "/api/conversations/$CID/bash/bash_events/search" \
-      --query command_id__eq="$SC_LONG" --check items.-1.exit_code exists > /dev/null && break
-    sleep 0.5
-  done
-  control-agent-server api GET "/api/conversations/$CID/bash/bash_events/search" \
-    --query command_id__eq="$SC_LONG" --check items.-1.exit_code eq -15 --save F13.scoped-routes/stopped
-  test -z "$(pgrep -f "$MARK" || true)"
+  control-agent-server api GET "/api/conversations/$CID/bash/bash_events/search" --query command_id__eq="$SC_LONG" \
+    --until-ok 15 --check items len-eq 1 --check items.0.exit_code eq -15 --save F13.scoped-routes/stopped
+  test -z "$(pgrep -fx "sleep $SLP" || true)"
   ```
   The command wrote `scoped.txt` in the workspace; search, get (with
   `cwd` set to the workspace) and batch read it back; the scoped stop ends
-  the sleeping command with `exit_code` -15. No socket carries scoped events,
-  so the loop polls search until the final output is written.
+  the sleeping command with `exit_code` -15 and its child `sleep` is gone.
+  No socket carries scoped events, so `--until-ok` polls search until the
+  final output is written.
 - **Scope isolation (`F13.scoped-isolation`).** A scoped command seen from
   every other scope.
   ```sh
-  control-agent-server ws start /sockets/bash-events --name f13-iso --duration 120
+  control-agent-server ws start /sockets/bash-events --name f13-iso --duration 120 \
+    --send '{"command": "echo QA_F13_ISO_PROBE"}'
+  control-agent-server ws read f13-iso --kinds BashOutput --contains QA_F13_ISO_PROBE --wait 15 --show 0
   MARK=QA_F13_ISO_$RANDOM
   ISO_CMD=$(control-agent-server api POST "/api/conversations/$CID/bash/execute_bash_command" \
     --json "{\"command\": \"echo $MARK\"}" --check exit_code eq 0 --field command_id)
   FLUSH_CMD=$(control-agent-server api POST /api/bash/execute_bash_command \
     --json '{"command": "echo QA_F13_FLUSH"}' --field command_id)
-  for i in $(seq 1 20); do
-    control-agent-server ws read f13-iso --kinds BashOutput --contains "$FLUSH_CMD" --show 0 && break
-    sleep 0.25
-  done
-  control-agent-server ws stop f13-iso --kinds BashOutput --contains "$FLUSH_CMD" --save F13.scoped-isolation/global-socket
-  test "$(control-agent-server ws read f13-iso --contains "$MARK" --show 0 | jq .matching)" = 0
+  control-agent-server ws stop f13-iso --kinds BashOutput --contains "$FLUSH_CMD" --wait 15 --show 0 \
+    --save F13.scoped-isolation/global-socket
+  control-agent-server ws read f13-iso --contains "$MARK" --expect-none --show 0
+  control-agent-server ws read f13-iso --contains "$ISO_CMD" --expect-none --show 0
   control-agent-server api GET /api/bash/bash_events/search --query kind__eq=BashCommand \
     --query sort_order=TIMESTAMP_DESC --check items not-contains "$MARK" --save F13.scoped-isolation/global-search
   control-agent-server api GET "/api/bash/bash_events/$ISO_CMD" --expect 404
@@ -460,12 +521,14 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$CID2/bash/bash_events/search" --check items len-eq 0 \
     --save F13.scoped-isolation/other-conversation
   control-agent-server api GET "/api/conversations/$CID2/bash/bash_events/$ISO_CMD" --expect 404
-  ls "$AGENT_SERVER_VERIFY_RUN/server/workspace/conversations/${CID//-/}/bash_events/"*"_BashCommand_$ISO_CMD"
+  control-agent-server state ls "bash_events/*_BashCommand_$ISO_CMD" --conversation "$CID" --expect-count 1
+  control-agent-server state ls "server/workspace/bash_events/*$ISO_CMD*" --expect-count 0
   ```
-  The global socket saw the flush command but no frame with the scoped
-  marker; the global search, get and stop and the second conversation do not
-  know the command; its event file sits under the conversation's
-  `bash_events` directory.
+  The global socket was subscribed (its probe came back) and saw the flush
+  command, but no frame with the scoped marker or command id; the global
+  search, get and stop and the second conversation do not know the command;
+  its event file sits under the conversation's `bash_events` directory and
+  not in the global one.
 - **Unknown conversation (`F13.scoped-unknown`).** Every scoped route with a
   well-formed id that names no conversation.
   ```sh
@@ -497,22 +560,28 @@ Preconditions:
   are all still readable, and a stop of the finished command still finds it.
 - **Clear (`F13.clear`).** Global first, then the conversation's history.
   ```sh
-  control-agent-server api DELETE /api/bash/bash_events --expect 200 --check cleared_count ge 20 \
+  N_GLOBAL=$(control-agent-server state ls 'server/workspace/bash_events/*' | jq .count)
+  test "$N_GLOBAL" -ge 20
+  control-agent-server api DELETE /api/bash/bash_events --expect 200 --check cleared_count eq "$N_GLOBAL" \
     --save F13.clear/global
   control-agent-server api GET /api/bash/bash_events/search --check items len-eq 0 --save F13.clear/global-empty
+  control-agent-server state ls 'server/workspace/bash_events/*' --expect-count 0
   control-agent-server api POST "/api/bash/bash_commands/$EXEC_CMD/stop" --expect 404
   control-agent-server api GET "/api/conversations/$CID/bash/bash_events/search" --query command_id__eq="$SC_EXEC" \
     --check items len-eq 1
+  N_SCOPED=$(control-agent-server state ls 'bash_events/*' --conversation "$CID" | jq .count)
+  test "$N_SCOPED" -ge 8
   control-agent-server api DELETE "/api/conversations/$CID/bash/bash_events" --expect 200 \
-    --check cleared_count ge 8 --save F13.clear/scoped
+    --check cleared_count eq "$N_SCOPED" --save F13.clear/scoped
   control-agent-server api GET "/api/conversations/$CID/bash/bash_events/search" --check items len-eq 0
-  test -z "$(ls -A "$AGENT_SERVER_VERIFY_RUN/server/workspace/conversations/${CID//-/}/bash_events")"
+  control-agent-server state ls 'bash_events/*' --conversation "$CID" --expect-count 0
   control-agent-server api DELETE /api/bash/bash_events --check cleared_count eq 0
   ```
-  The global clear reports every stored global event, leaves search empty and
-  makes the finished `EXEC_CMD` unknown to stop (404), while the scoped output
-  survives; the scoped clear empties the conversation's directory and leaves
-  nothing new in the global store.
+  The global clear reports exactly the number of global event files, leaves
+  search and the directory empty and makes the finished `EXEC_CMD` unknown
+  to stop (404), while the scoped output survives; the scoped clear reports
+  and deletes every file in the conversation's directory and leaves nothing
+  new in the global store.
 - **Retention (`F13.retention`).** The server's own purge window is under
   test, so this bullet sleeps past it.
   ```sh
@@ -578,16 +647,25 @@ Preconditions:
   control-agent-server ws listen /sockets/bash-events --run "$DORM" --auth none \
     --send "{\"command\": \"touch $DORM/fixtures/qa-f13-dormant-ran\"}" --duration 5 --save F13.ws-dormant-gate/frames
   test ! -e "$DORM/fixtures/qa-f13-dormant-ran"
+  control-agent-server api POST /api/init --run "$DORM" --auth none \
+    --header "X-Init-API-Key: $(cat "$DORM/private/secret_key")" --json '{}' --expect 200
+  control-agent-server ws listen /sockets/bash-events --run "$DORM" --auth none \
+    --send "{\"command\": \"touch $DORM/fixtures/qa-f13-ready-ran\"}" --until-kind BashOutput --until exit_code=0 \
+    --duration 15 --save F13.ws-dormant-gate/after-init
+  test -e "$DORM/fixtures/qa-f13-ready-ran"
   ```
-  Expected: REST answers 503 and the socket runs nothing. Today the REST
-  route is 503 but the socket accepts the unauthenticated connection, runs
-  the command (a `BashOutput` with `exit_code` 0 comes back) and the marker
-  file exists: `bash_events_socket` falls back to the module-level
-  `BashEventService` when `app.state.bash_event_service` is unset, and
-  `/sockets/*` is outside the `require_initialized` gate. With session keys
-  configured before init (plain `--deferred-init`), the socket still checks
-  the key but then runs commands for a valid one; the config documents that
-  the bash routers return 503 until `POST /api/init`.
+  Expected: REST answers 503 and the socket runs nothing while dormant; after
+  `POST /api/init` (the bootstrap key is the run's secret key; `--auth init`
+  sends nothing on a `--no-auth` run) the same frame runs and creates its
+  file. Today the REST route is 503 but the dormant socket accepts the
+  unauthenticated connection, runs the command (a `BashOutput` with
+  `exit_code` 0 comes back) and the marker file exists: `bash_events_socket`
+  falls back to the module-level `BashEventService` when
+  `app.state.bash_event_service` is unset, and `/sockets/*` is outside the
+  `require_initialized` gate. With session keys configured before init
+  (plain `--deferred-init`), the socket still checks the key but then runs
+  commands for a valid one; the config documents that the bash routers
+  return 503 until `POST /api/init`.
 
 ## Gotchas
 
@@ -603,8 +681,9 @@ Preconditions:
   slash; browsers' `fetch` cannot send it (the TS client's `batchGetEvents`
   works under Node only).
 - An unknown `page_id` silently restarts at the first page, and `order__gt`
-  is applied after paging, so a page can hold fewer than `limit` items while
-  `next_page_id` is still set.
+  is applied after paging, so a page can hold fewer than `limit` items (even
+  none) while `next_page_id` is still set (`F13.order-gt-paging`); follow
+  `next_page_id` until it is `null`.
 - `timestamp__gte`/`__lt` compare against UTC file-name prefixes: send `Z`
   times (see `F13.timestamp-offset`).
 - Exit codes: the real code, `-1` for a timeout or a spawn error (missing

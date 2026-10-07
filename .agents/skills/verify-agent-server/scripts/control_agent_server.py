@@ -2802,6 +2802,11 @@ def check_family(path: Path, routes: Sequence[dict[str, Any]] | None) -> list[st
     for row in ids:
         if f"`{row['id']}`" not in driving and f"({row['id']})" not in driving:
             problems.append(f"{row['id']} is never referenced in the Driving section")
+    unknown_needs = [n for n in family_needs(path) if n not in NEEDS]
+    if unknown_needs:
+        problems.append(
+            f"Needs: unknown tokens {unknown_needs}; use {', '.join(NEEDS)}"
+        )
     flags = launch_flags(path)
     if flags:
         error = validate_command(
@@ -3053,6 +3058,75 @@ def driving_bullets(path: Path) -> list[Bullet]:
     return bullets
 
 
+NEEDS = ("llm", "tmux", "git", "node", "uvx", "docker", "chromium", "vscode")
+
+
+def family_needs(path: Path) -> list[str]:
+    """Tokens from the family's optional `Needs:` line."""
+    for line in path.read_text().splitlines():
+        if line.startswith("Needs:"):
+            return [t for t in re.split(r"[\s,`]+", line[len("Needs:") :]) if t]
+    return []
+
+
+def machine_capabilities() -> dict[str, dict[str, Any]]:
+    browsers = Path(os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "/nonexistent"))
+    chromium = (
+        shutil.which("chromium")
+        or shutil.which("google-chrome")
+        or next((str(p) for p in browsers.glob("chromium*")), None)
+    )
+    vscode = shutil.which("openvscode-server") or next(
+        (str(p) for p in Path("/openhands").glob(".openvscode-server*")), None
+    )
+    docker = Path("/var/run/docker.sock").exists() or bool(
+        os.environ.get("DOCKER_HOST")
+    )
+    key = next(
+        (n for n in ("DEEPSEEK_API_KEY", "LLM_API_KEY") if os.environ.get(n)), None
+    )
+    found = {
+        "llm": (key is not None, key or "set DEEPSEEK_API_KEY"),
+        "tmux": (bool(shutil.which("tmux")), shutil.which("tmux")),
+        "git": (bool(shutil.which("git")), shutil.which("git")),
+        "node": (
+            bool(shutil.which("node") and shutil.which("npm")),
+            shutil.which("node"),
+        ),
+        "uvx": (bool(shutil.which("uvx")), shutil.which("uvx")),
+        "docker": (docker, "docker daemon socket" if docker else "no docker daemon"),
+        "chromium": (chromium is not None, chromium),
+        "vscode": (vscode is not None, vscode or "no openvscode-server binary"),
+    }
+    return {
+        name: {"available": ok, "detail": detail}
+        for name, (ok, detail) in found.items()
+    }
+
+
+def cmd_capabilities(args: argparse.Namespace) -> dict[str, Any]:
+    del args
+    machine = machine_capabilities()
+    families = []
+    for path in family_files():
+        needs = family_needs(path)
+        missing = [n for n in needs if not machine.get(n, {}).get("available")]
+        families.append(
+            {
+                "file": path.name,
+                "needs": needs,
+                "missing": missing,
+                "drivable": not missing,
+            }
+        )
+    return {
+        "ok": True,
+        "machine": machine,
+        "families": families,
+        "blocked_families": [f["file"] for f in families if f["missing"]],
+    }
+
+
 def launch_flags(path: Path) -> list[str]:
     """Flags from the family's optional `Launch:` line (for `map run --fresh`)."""
     for line in path.read_text().splitlines():
@@ -3088,7 +3162,23 @@ def cmd_map_run(args: argparse.Namespace) -> dict[str, Any]:
                 example=f"{CLI} map run --all --fresh --record",
             )
         reports = []
+        machine = machine_capabilities()
         for path in family_files():
+            missing = [
+                n for n in family_needs(path) if not machine.get(n, {}).get("available")
+            ]
+            if missing:
+                reports.append(
+                    {
+                        "ok": True,
+                        "file": path.name,
+                        "summary": None,
+                        "run": None,
+                        "error": None,
+                        "blocked": missing,
+                    }
+                )
+                continue
             family_args = argparse.Namespace(
                 **{**vars(args), "all": False, "file": path.stem}
             )
@@ -3099,11 +3189,13 @@ def cmd_map_run(args: argparse.Namespace) -> dict[str, Any]:
             reports.append(
                 {k: report.get(k) for k in ("ok", "file", "summary", "run", "error")}
             )
+        blocked = [r["file"] for r in reports if r.get("blocked")]
         failing = [r["file"] for r in reports if not r["ok"]]
         return {
             "ok": not failing,
             "families": len(reports),
             "failing": failing,
+            "blocked_by_machine": blocked,
             "reports": reports,
         }
     if not args.file:
@@ -3120,20 +3212,40 @@ def cmd_map_run(args: argparse.Namespace) -> dict[str, Any]:
     if not args.fresh:
         return replay_family(resolve_run(args.run), path, args)
     flags = launch_flags(path)
-    launched = self_command(
-        "launch",
-        "--new",
-        "--name",
-        f"map-{path.stem[:3].lower()}",
-        "--print-run",
-        *flags,
-    )
-    run_dir = launched["last_line"].strip()
-    try:
-        report = replay_family(load_run(Path(run_dir)), path, args)
-    finally:
-        self_command("stop", "--run", run_dir)
-    return {**report, "run": run_dir, "launch_flags": flags}
+    if args.checkout:
+        flags = [*flags, "--checkout", str(Path(args.checkout).resolve())]
+    attempts = []
+    for _ in range(max(1, args.repeat)):
+        launched = self_command(
+            "launch",
+            "--new",
+            "--name",
+            f"map-{path.stem[:3].lower()}",
+            "--print-run",
+            *flags,
+        )
+        run_dir = launched["last_line"].strip()
+        try:
+            report = replay_family(load_run(Path(run_dir)), path, args)
+        finally:
+            self_command("stop", "--run", run_dir)
+        attempts.append({**report, "run": run_dir})
+    if len(attempts) == 1:
+        return {**attempts[0], "launch_flags": flags}
+    return {
+        "ok": all(a["ok"] for a in attempts),
+        "file": path.name,
+        "launch_flags": flags,
+        "attempts": [
+            {
+                "run": a["run"],
+                "ok": a["ok"],
+                "summary": a["summary"],
+                "statuses": {b["bullet"]: b.get("status") for b in a["bullets"]},
+            }
+            for a in attempts
+        ],
+    }
 
 
 def replay_family(run: Run, path: Path, args: argparse.Namespace) -> dict[str, Any]:
@@ -3428,6 +3540,7 @@ Driving:
   sink          read: what an HTTP sink (webhooks, telemetry, credentials) received
   state         ls | cat: files the server persisted (settings, secrets, conversations)
   config        the run's config file and server environment, secrets masked
+  capabilities  what this machine can drive (keys, binaries) and which families are blocked
   exec          Run an SDK/TypeScript-client program against the run (env injected)
 
 Proof and map:
@@ -4053,6 +4166,18 @@ bash_events, default project), fixtures/, worktrees/. Output is redacted.""",
 
     sub(
         commands,
+        "capabilities",
+        "What this machine can drive: binaries, keys, and which families are blocked.",
+        f"""\
+  {CLI} capabilities
+
+Families declare their prerequisites on a `Needs:` line ({", ".join(NEEDS)});
+`map run --all --fresh` reports families with unmet needs as blocked instead
+of running them.""",
+        cmd_capabilities,
+    )
+    sub(
+        commands,
         "config",
         "Show the run's server config file and environment (secrets masked).",
         f"""\
@@ -4172,6 +4297,7 @@ bash_events, default project), fixtures/, worktrees/. Output is redacted.""",
   {CLI} map run --file F04 --dry-run           # print the scripts without running
   {CLI} map run --file F03 --fresh --record    # own run with the family's Launch: flags
   {CLI} map run --all --fresh --record         # the whole map, one fresh run per family
+  {CLI} map run --file F08 --only F08.x --fresh --repeat 2 --checkout ../base   # baseline of a fix
 
 Each bullet's ```sh blocks run in `bash -c` with `set -eo pipefail`, from the
 repository root, with this run exported. Shell variables assigned in one
@@ -4191,6 +4317,15 @@ reported and not executed. Transcripts are saved under <run>/evidence/map-run/."
         help="launch a new run with the family's `Launch:` flags, replay, stop it",
     )
     mrun.add_argument("--all", action="store_true", help="every family (needs --fresh)")
+    mrun.add_argument(
+        "--checkout", help="with --fresh: launch this checkout (a baseline worktree)"
+    )
+    mrun.add_argument(
+        "--repeat",
+        type=int,
+        default=1,
+        help="with --fresh: replay N times, each on its own fresh run",
+    )
     mrun.add_argument("--only", help="comma-separated sub-feature IDs")
     mrun.add_argument(
         "--keep-going", action="store_true", help="run later bullets after a failure"

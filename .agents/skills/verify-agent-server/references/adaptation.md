@@ -1,7 +1,9 @@
 # Where this workflow comes from
 
 This is an independently written adaptation of ideas from poteto's
-MIT-licensed [pstack](https://github.com/cursor/plugins/tree/main/pstack) and
+MIT-licensed pstack ([backnotprop/pstack](https://github.com/backnotprop/pstack),
+a harness-neutral mirror of
+[cursor/plugins/pstack](https://github.com/cursor/plugins/tree/main/pstack)) and
 the [cursor-team-kit](https://github.com/cursor/plugins/tree/main/cursor-team-kit)
 control skills, by way of the sibling `verify-openhands` skill in
 [`OpenHands/OpenHands`](https://github.com/OpenHands/OpenHands/tree/main/.agents/skills/verify-openhands),
@@ -21,6 +23,11 @@ which applies the same method to the Agent Canvas UI:
   and [control-cli](https://github.com/cursor/plugins/blob/main/cursor-team-kit/skills/control-cli/SKILL.md):
   build the tool that drives and proves the work; one action per step,
   deterministic waits over sleeps, clean up what you started.
+- [Benny's control-adapter contract and verify-existing-fix](https://github.com/backnotprop/pstack/tree/main/automations/benny/skills/reproduce-and-fix-issues/references):
+  report capabilities and which map sections are drivable or blocked before
+  starting, translate the environment before declaring a block, and confirm a
+  fix only when the baseline reproduces twice and the patched build resolves
+  it twice.
 - [cli-for-agents](https://github.com/cursor/plugins/blob/main/cli-for-agent/skills/cli-for-agents/SKILL.md):
   non-interactive flags, layered `--help` with examples, actionable errors,
   idempotent commands, machine-readable output.

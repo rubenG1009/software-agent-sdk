@@ -89,6 +89,10 @@ behavior, then:
 - one `Source:` line with the main implementation paths in backticks (routers,
   services, models; `map owners` uses these prefixes to route changed files to
   families, so list directories or files, not symbols), and
+- an optional `Needs:` line naming machine prerequisites from a fixed
+  vocabulary (`llm`, `tmux`, `git`, `node`, `uvx`, `docker`, `chromium`,
+  `vscode`), so `control-agent-server capabilities` and `map run --all` can
+  tell a blocked family from a failing one,
 - an optional `Launch:` line with the `launch --new` flags the family needs
   (`` Launch: `--deferred-init` `` or `` Launch: `--webhook-sink --config-json '{"max_concurrent_runs": 1}'` ``);
   `map run --fresh` and `map run --all --fresh` launch the family's run with
@@ -229,6 +233,12 @@ cheaper routes earlier mappers missed:
   `--config-json`, `restart --env`.
 - When a path is "blocked because every X needs Y", list every X by its real
   attributes first; one of them usually does not need Y.
+- Translate the environment before giving up: restate the behavior without
+  platform nouns ("a Docker sandbox" may only mean "a runtime that is not
+  local"; "GitHub" may only mean "a git remote") and test it with the
+  stand-in when the stand-in exercises the same code path. Label such
+  bullets as translated in prose; when the missing environment is itself the
+  behavior under test, it is genuinely blocked.
 
 ## 5. Check the map
 

@@ -22,7 +22,9 @@ expected and actual result and the evidence paths.
 
 Below the table:
 
-1. **Product bugs**: one block each, with the failing sub-feature IDs, the
+1. **Product bugs**: a bug counts as confirmed only when it reproduces twice,
+   each time on a fresh run (`map run --only <ID> --fresh --repeat 2`). One
+   block each, with the failing sub-feature IDs, the
    exact command sequence that reproduces it on a fresh `launch --new`, the
    observed vs expected result, the evidence paths, and the issue you filed or
    found (or "not filed: <reason>").

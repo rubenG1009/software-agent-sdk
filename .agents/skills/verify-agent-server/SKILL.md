@@ -159,6 +159,14 @@ missing prerequisite; never substitute a mock and call it a pass.
   change needs a regression test as well (usually in
   `tests/cross/test_remote_conversation_live_server.py`); the recipe is the
   live proof, not a substitute for that test.
+- **Verify an existing fix** (an open PR or a merged commit that claims to fix
+  a `known bug` bullet): reproduce on the baseline twice and the fix twice,
+  with the same flags and fixtures:
+  `control-agent-server map run --file Fnn --only Fnn.x --fresh --repeat 2 --checkout <base worktree>`
+  must report the bullet `xfail` in both attempts, and the same command
+  without `--checkout` (the fix) `xpass` in both. Then drop the marker in the
+  same PR. Baseline not reproducing twice means "inconclusive", never
+  "fixed".
 - **Create or extend the map**: follow [references/mapping.md](references/mapping.md).
   `control-agent-server map coverage` measures which routes no family owns or
   drives.
@@ -187,6 +195,8 @@ missing prerequisite; never substitute a mock and call it a pass.
   result to bless broken behavior.
 - **Blocked**: name the missing prerequisite (key, account, Docker, binary, OS)
   and the route you attempted. Unreachable is never a pass.
+  `control-agent-server capabilities` says what this machine can drive and
+  which families' `Needs:` are unmet.
 
 ## How this fits with the tests
 

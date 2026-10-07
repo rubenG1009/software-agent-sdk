@@ -840,11 +840,11 @@ def cmd_restart(args: argparse.Namespace) -> dict[str, Any]:
         (run.private / "previous_secret_key").write_text(old_secret)
         (run.private / "secret_key").write_text(secrets.token_urlsafe(32))
         run.register_secrets()
-    if args.env:
-        run.data.setdefault("extra_env", {}).update(parse_kv(args.env, "--env"))
     if args.reset_config:
         run.data["config_overrides"] = {}
         run.data["extra_env"] = {}
+    if args.env:
+        run.data.setdefault("extra_env", {}).update(parse_kv(args.env, "--env"))
     if args.config_json:
         run.data.setdefault("config_overrides", {}).update(json.loads(args.config_json))
     write_server_config(run, run.data.get("config_overrides", {}))
@@ -1320,9 +1320,9 @@ def cmd_api(args: argparse.Namespace) -> dict[str, Any]:
         result["checks"] = checks
     if args.until_ok:
         result["attempts"] = attempts
-    if args.expect_max_ms is not None and elapsed > args.expect_max_ms:
+    slow = args.expect_max_ms is not None and elapsed > args.expect_max_ms
+    if slow:
         result["ok"] = ok = False
-        result["hint"] = f"took {elapsed} ms, limit {args.expect_max_ms} ms"
     if args.quiet:
         result["request"] = {k: v for k, v in result["request"].items() if k != "body"}
         result["response"] = {
@@ -1337,7 +1337,15 @@ def cmd_api(args: argparse.Namespace) -> dict[str, Any]:
     if args.save:
         result["saved"] = str(save_evidence(run, args.save, exchange))
     if not ok:
-        result["hint"] = f"expected {args.expect or '<400'}, got {response.status_code}"
+        failed = [c["check"] for c in checks if not c["ok"]]
+        if not status_matches(response.status_code, args.expect):
+            result["hint"] = (
+                f"expected {args.expect or '<400'}, got {response.status_code}"
+            )
+        elif failed:
+            result["hint"] = "failed check: " + "; ".join(failed)
+        elif slow:
+            result["hint"] = f"took {elapsed} ms, limit {args.expect_max_ms} ms"
     if args.print_header is not None:
         header = response.headers.get(args.print_header)
         if header is None or not ok:

@@ -314,7 +314,7 @@ EOF
     --check agent.llm.model eq deepseek/deepseek-flash --check stats.usage_to_metrics.default.model_name exists --save F04.run-real/get
   control-agent-server ws listen "/sockets/events/$RID" --query resend_mode=all --until key=execution_status --until value=finished \
     --duration 20 --save F04.run-real/replay
-  control-agent-server conversation events "$RID" --kinds MessageEvent --contains 'single word: pong' --expect-kind MessageEvent
+  control-agent-server conversation events "$RID" --kinds MessageEvent --contains 'single word: pong'
   control-agent-server api GET "/api/conversations/$RID/events/count" --query source=user --check . eq 1
   control-agent-server api GET "/api/conversations/$RID/agent_final_response" --expect 200 --check response matches '\S' --save F04.run-real/final-response
   for _ in $(seq 60); do control-agent-server api GET "/api/conversations/$RID" --check title exists >/dev/null && break; sleep 1; done
@@ -332,7 +332,7 @@ EOF
   control-agent-server api GET "/api/conversations/$FID/agent_final_response" --expect 200 --check response eq '' --save F04.final-response/empty
   control-agent-server conversation send "$FID" --text 'Finish now.' --wait --until finished --timeout 60
   control-agent-server api GET "/api/conversations/$FID/agent_final_response" --expect 200 --check response eq QA_F04_DONE --save F04.final-response/finish
-  control-agent-server conversation events "$FID" --kinds ActionEvent --contains FinishAction --expect-kind ActionEvent
+  control-agent-server conversation events "$FID" --kinds ActionEvent --contains FinishAction
   control-agent-server api GET "/api/conversations/$FID" --check execution_status eq finished --check title missing
   control-agent-server api GET "/api/conversations/$NOPE/agent_final_response" --expect 404
   control-agent-server api GET "/api/conversations/$FID/agent_final_response" --auth none --expect 401
@@ -519,7 +519,9 @@ EOF
 - A create with `initial_message` always starts a run (`initial_message.run`
   is ignored), and the create response is composed right after the run is
   scheduled, so it may still say `idle`. Wait with `conversation wait`. To
-  create without running, omit `initial_message`.
+  create without running, omit `initial_message` (so
+  `conversation start --prompt ... --no-run`, which sends `"run": false`,
+  still runs; send the message afterwards with `conversation send --no-run`).
 - `GET`, `search` and the batch get read the autosaved `base_state.json`
   snapshot (plus `meta.json`), not live memory. Changes applied in place
   without an autosave (start-time secrets, `POST .../secrets`) stay invisible
@@ -561,6 +563,10 @@ EOF
   (the run's `server/`), not the caller's.
 - `conversation start --title` does not set a title (the start request has no
   title field); rename with PATCH.
+- Harness traps: `conversation events --contains X` asserts only without
+  `--expect-kind` (which checks the whole log and ignores `--contains`), and
+  `ws stop|read --contains` filters the display without failing, so the tags
+  bullet greps the capture file and replays with `ws listen --until`.
 - A create reserves one `max_concurrent_runs` slot while it initializes, so a
   full server answers 429 even for a create without a prompt (driven in the
   run family).

@@ -389,13 +389,15 @@ Preconditions:
   DORMANT=$(control-agent-server launch --new --deferred-init --name f02-dormant --print-run)
   trap 'control-agent-server stop --run "$DORMANT" >/dev/null' EXIT
   control-agent-server api GET /api/init --run "$DORMANT" --auth none --expect 200 --check state eq dormant
-  control-agent-server api POST /api/auth/workspace-session --run "$DORMANT" --expect 503 --check exception contains 'POST /api/init' --save F02.workspace-session-dormant/mint
+  control-agent-server api POST /api/auth/workspace-session --run "$DORMANT" --expect 503 --save F02.workspace-session-dormant/mint
   control-agent-server api DELETE /api/auth/workspace-session --run "$DORMANT" --expect 503 --save F02.workspace-session-dormant/delete
   control-agent-server api POST /api/auth/workspace-session --run "$DORMANT" --auth none --expect 401
   control-agent-server stop --run "$DORMANT"
   ```
-  With the launch key both routes are 503 and name `POST /api/init`;
-  without a key the auth check runs first and answers 401.
+  With the launch key both routes are 503; without a key the auth check runs
+  first and answers 401. The 5xx handler rewrites the body (`detail` becomes
+  `Internal Server Error`, the reason moves to `exception`), so clients rely
+  on the status code.
 - **JSON-list keys leak into commands (`F02.keys-json-form`), known bug.** A
   second server whose keys come from `OH_SESSION_API_KEYS='[...]'`.
   ```sh
@@ -472,7 +474,11 @@ Preconditions:
 - In a real warm pool the keys usually arrive in the `POST /api/init` body,
   so a dormant pod may have no keys yet: then a request without a header gets
   503, not 401. The launcher passes the run's key at start, which is why the
-  dormant bullet sees 401.
+  dormant bullet sees 401. WebSockets are not behind the dormant gate: on a
+  dormant server without keys (`launch --new --deferred-init --no-auth`),
+  `/sockets/bash-events` accepts an unauthenticated client and runs its
+  commands while every `/api/*` route is 503 (a product bug that belongs to
+  the deferred-init family).
 - Stripping the key variables from command environments is defense in depth:
   commands run as the server's user and can read `/proc/<server pid>/environ`.
 - `restart --env` values persist for later restarts of the same run; this

@@ -477,14 +477,18 @@ Preconditions:
   control-agent-server api GET /api/conversations/00000000-0000-4000-8000-000000000000/git/changes --query path="$REPO" \
     --expect 404 --check detail contains 'Conversation not found' --save F15.scoped-guard/unknown-conversation
   control-agent-server api GET /api/conversations/not-a-uuid/git/changes --query path="$REPO" --expect 422
-  control-agent-server api GET "/api/conversations/$CID2/git/repositories/search" --query provider=github --expect 404
+  control-agent-server api GET /openapi.json --auth none --expect 200 --quiet \
+    --check 'paths./api/git/repositories/search' exists \
+    --check 'paths./api/conversations/{runtime_conversation_id}/git/changes' exists \
+    --check 'paths./api/conversations/{runtime_conversation_id}/git/repositories/search' missing
   ```
   Another directory, a sibling sharing the workspace's name as a prefix
   (`guard-sibling`), a `..` escape, a symlink inside the workspace that
   resolves outside it, and a relative path are all 422 on every scoped route,
   while the workspace itself is 200 and the global route follows the same
   symlink. An unknown conversation is 404, a malformed id 422, and repository
-  search has no scoped variant (404 `Not Found`).
+  search has no scoped variant: the OpenAPI document lists the global search
+  and the scoped `changes` but no scoped search path.
 - **After a restart (`F15.scoped-restart`).**
   ```sh
   control-agent-server restart

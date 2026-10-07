@@ -446,7 +446,7 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   control-agent-server conversation events "$SID" --kinds ObservationEvent --contains 'token=<secret-hidden>' \
     --save F08.secrets-terminal/observation
   control-agent-server sink read --name qa-f08-secret --contains 'token=<secret-hidden>' --expect-min 1
-  ! grep -q qa-f08-token-value "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f08-secret.jsonl"
+  if grep -q qa-f08-token-value "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f08-secret.jsonl"; then exit 1; fi
   control-agent-server state grep qa-f08-token-value --glob 'server/**/*' --expect-none
   control-agent-server api GET "/api/conversations/$SID" --check secret_registry.secret_sources.QA_F08_TOKEN.kind eq StaticSecret
   ```
@@ -515,8 +515,8 @@ OBSERVATION_KIND=openhands.sdk.event.llm_convertible.observation.ObservationEven
   with no save after it. After the restart the server is healthy and
   `QA_F08_TOKEN` (saved encrypted with the run's `OH_SECRET_KEY`) is
   injected again.
-- **Unsaved secret across a restart (`F08.secrets-unsaved-restart`), known
-  bug.** `QA_F08_UNSAVED` was posted to `$KID` right before the restart.
+- **Unsaved secret restart (`F08.secrets-unsaved-restart`), known bug.**
+  `QA_F08_UNSAVED` was posted to `$KID` right before the restart.
   ```sh
   control-agent-server api PATCH "/api/conversations/$KID" --json '{"tags": {"qa": "f08-after-restart"}}' --expect 200
   control-agent-server api GET "/api/conversations/$KID" --check secret_registry.secret_sources.QA_F08_PLAIN exists \

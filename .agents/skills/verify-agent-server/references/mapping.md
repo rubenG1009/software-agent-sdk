@@ -89,6 +89,10 @@ behavior, then:
 - one `Source:` line with the main implementation paths in backticks (routers,
   services, models; `map owners` uses these prefixes to route changed files to
   families, so list directories or files, not symbols), and
+- an optional `Launch:` line with the `launch --new` flags the family needs
+  (`` Launch: `--deferred-init` `` or `` Launch: `--webhook-sink --config-json '{"max_concurrent_runs": 1}'` ``);
+  `map run --fresh` and `map run --all --fresh` launch the family's run with
+  them, and
 - one `Routes:` line listing every route this family owns, each in backticks
   exactly as `map routes` prints it (`GET /api/conversations/{conversation_id}`,
   `WS /sockets/events/{conversation_id}`), or `Routes: none` for a
@@ -188,9 +192,14 @@ the next agent will run them that way:
 Execute every command you wrote, in order, on a fresh `launch --new` (or a run
 you have doctored since its last surprise). Before you hand the file over, run
 the whole file once more from the top, exactly as written, with
-`control-agent-server map run --file Fnn --record` on a fresh run; it must
-pass end to end. A family that restarts the server or changes its config may
-use a fresh run for that part, and says so in `Preconditions:`.
+`control-agent-server map run --file Fnn --fresh --record`; it launches a
+fresh run with the family's `Launch:` flags, replays every bullet, stops the
+run, and must pass end to end. Model-backed families run
+`control-agent-server llm preset deepseek` in a `sh` block under
+`Preconditions:`, so a fresh replay needs nothing but the key in the
+environment. A bullet that needs a second server launches it inside its own
+`sh` block (`B=$(control-agent-server launch --new --print-run ...)`, then
+`--run "$B"`) and stops it before the bullet ends.
 
 For each sub-feature record
 `control-agent-server evidence add --feature <ID> --result pass|fail|blocked|not-run`

@@ -164,8 +164,11 @@ missing prerequisite; never substitute a mock and call it a pass.
   drives.
 - **Re-prove the map**: every family's recipes are fenced `sh` blocks whose
   commands assert their own expectations, so
-  `control-agent-server map run --file Fnn --record` replays a family on a
-  fresh run and writes ledger rows; only failing bullets need judgment.
+  `control-agent-server map run --file Fnn --fresh --record` replays a family
+  on its own fresh run (with the family's `Launch:` flags) and writes ledger
+  rows, and `control-agent-server map run --all --fresh --record` replays the
+  whole map. Only failing bullets need judgment; `known bug` bullets report as
+  expected failures until the bug is fixed.
 - **Maintain the map (periodic or weekly)**: follow
   [references/maintenance.md](references/maintenance.md): a frozen BASE/TARGET,
   a route diff, a PR-intent ledger, a source wave, one live pass over every

@@ -2802,6 +2802,13 @@ def check_family(path: Path, routes: Sequence[dict[str, Any]] | None) -> list[st
     for row in ids:
         if f"`{row['id']}`" not in driving and f"({row['id']})" not in driving:
             problems.append(f"{row['id']} is never referenced in the Driving section")
+    flags = launch_flags(path)
+    if flags:
+        error = validate_command(
+            " ".join([CLI, "launch", "--new", *map(shlex.quote, flags)])
+        )
+        if error:
+            problems.append(f"Launch: flags do not parse: {error}")
     for bullet in driving_bullets(path):
         blocked = "blocked" in bullet.label.lower()
         if (
@@ -3046,14 +3053,90 @@ def driving_bullets(path: Path) -> list[Bullet]:
     return bullets
 
 
+def launch_flags(path: Path) -> list[str]:
+    """Flags from the family's optional `Launch:` line (for `map run --fresh`)."""
+    for line in path.read_text().splitlines():
+        if line.startswith("Launch:"):
+            return shlex.split(line[len("Launch:") :].replace("`", " "))
+    return []
+
+
+def self_command(*argv: str) -> dict[str, Any]:
+    completed = subprocess.run(
+        [sys.executable, str(Path(__file__).resolve()), *argv],
+        capture_output=True,
+        text=True,
+    )
+    lines = completed.stdout.strip().splitlines()
+    if completed.returncode != 0 or not lines:
+        raise CliError(
+            f"`{CLI} {' '.join(argv)}` failed",
+            exit_code=3,
+            data={
+                "stdout": completed.stdout[-1500:],
+                "stderr": completed.stderr[-1500:],
+            },
+        )
+    return {"stdout": completed.stdout, "last_line": lines[-1]}
+
+
 def cmd_map_run(args: argparse.Namespace) -> dict[str, Any]:
-    run = resolve_run(args.run)
+    if args.all:
+        if not args.fresh:
+            usage_error(
+                "--all needs --fresh (one fresh run per family)",
+                example=f"{CLI} map run --all --fresh --record",
+            )
+        reports = []
+        for path in family_files():
+            family_args = argparse.Namespace(
+                **{**vars(args), "all": False, "file": path.stem}
+            )
+            try:
+                report = cmd_map_run(family_args)
+            except CliError as exc:
+                report = {"ok": False, "file": path.name, "error": str(exc), **exc.data}
+            reports.append(
+                {k: report.get(k) for k in ("ok", "file", "summary", "run", "error")}
+            )
+        failing = [r["file"] for r in reports if not r["ok"]]
+        return {
+            "ok": not failing,
+            "families": len(reports),
+            "failing": failing,
+            "reports": reports,
+        }
+    if not args.file:
+        usage_error(
+            "map run needs --file (or --all --fresh)",
+            example=f"{CLI} map run --file F01",
+        )
     files = family_files(args.file)
     if len(files) != 1:
         usage_error(
             "map run needs exactly one --file", example=f"{CLI} map run --file F01"
         )
     path = files[0]
+    if not args.fresh:
+        return replay_family(resolve_run(args.run), path, args)
+    flags = launch_flags(path)
+    launched = self_command(
+        "launch",
+        "--new",
+        "--name",
+        f"map-{path.stem[:3].lower()}",
+        "--print-run",
+        *flags,
+    )
+    run_dir = launched["last_line"].strip()
+    try:
+        report = replay_family(load_run(Path(run_dir)), path, args)
+    finally:
+        self_command("stop", "--run", run_dir)
+    return {**report, "run": run_dir, "launch_flags": flags}
+
+
+def replay_family(run: Run, path: Path, args: argparse.Namespace) -> dict[str, Any]:
     bullets = driving_bullets(path)
     if args.only:
         wanted = set(args.only.split(","))
@@ -4087,6 +4170,8 @@ bash_events, default project), fixtures/, worktrees/. Output is redacted.""",
   {CLI} map run --file F04 --record            # also append ledger rows per bullet
   {CLI} map run --file F04 --only F04.pause    # Preconditions + the named bullets
   {CLI} map run --file F04 --dry-run           # print the scripts without running
+  {CLI} map run --file F03 --fresh --record    # own run with the family's Launch: flags
+  {CLI} map run --all --fresh --record         # the whole map, one fresh run per family
 
 Each bullet's ```sh blocks run in `bash -c` with `set -eo pipefail`, from the
 repository root, with this run exported. Shell variables assigned in one
@@ -4099,7 +4184,13 @@ reported and not executed. Transcripts are saved under <run>/evidence/map-run/."
     )
     add_run_flag(mrun)
     mrun.set_defaults(func=cmd_map_run)
-    mrun.add_argument("--file", required=True)
+    mrun.add_argument("--file")
+    mrun.add_argument(
+        "--fresh",
+        action="store_true",
+        help="launch a new run with the family's `Launch:` flags, replay, stop it",
+    )
+    mrun.add_argument("--all", action="store_true", help="every family (needs --fresh)")
     mrun.add_argument("--only", help="comma-separated sub-feature IDs")
     mrun.add_argument(
         "--keep-going", action="store_true", help="run later bullets after a failure"

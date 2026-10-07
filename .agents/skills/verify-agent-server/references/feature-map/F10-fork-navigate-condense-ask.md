@@ -36,15 +36,16 @@ Routes: `POST /api/conversations/{conversation_id}/ask_agent`,
 - `F10.navigate-errors`: an unknown `event_id` is 404 `Unknown event_id: ...` and an unknown conversation 404, a missing body 422, a missing key 401; none of them moves HEAD.
 - `F10.navigate-final-response`: after navigating back before the agent's answer, `agent_final_response` reports the active branch (empty), not the abandoned answer.
 - `F10.condense-llm`: on a finished DeepSeek conversation `POST /condense` answers 200 `{"success": true}` after recording one `CondensationRequest` and one `Condensation` with a summary, pushed live on the events socket; the status stays `finished`.
-- `F10.condense-no-condenser`: an agent without a request-handling condenser (condenser disabled, or `no_op`) gets an error, and no `CondensationRequest` or other event is recorded.
+- `F10.condense-no-condenser`: an agent without a request-handling condenser (condenser disabled, or `no_op`) gets an error naming the cause, and no `CondensationRequest` or other event is recorded.
 - `F10.condense-status`: that refusal is a client error (4xx), not a 500.
 - `F10.condense-llm-failure`: when the condenser's model is unreachable, condense answers 500 with an `error_id`, leaves the `CondensationRequest` pending and records no `Condensation`.
 - `F10.condense-errors`: an unknown id is 404 `Conversation not found`, a malformed id 422, a missing key 401 (and records nothing).
 - `F10.ask-agent`: `POST /ask_agent` answers a question about the conversation with DeepSeek (200 `{"response": ...}`), records no message and pushes no message on the socket, and leaves the status unchanged.
 - `F10.ask-agent-errors`: a missing `question` is 422, a missing key 401, and an unreachable model 500 with an `error_id`.
+- `F10.ask-agent-running`: while a run waits on its model, `ask_agent` answers at once (it does not wait for the step), records nothing and leaves the status `running`.
 - `F10.ask-agent-unknown`: an unknown conversation id is 404, as the route documents.
-- `F10.restart-persist`: after a restart, forks keep their lineage, title, tags, HEAD and events, and a navigated empty HEAD stays empty (the next message is still a new root).
-- `F10.restart-cold-calls`: after a restart, condense and ask_agent work on a conversation whose agent has not been initialized yet.
+- `F10.restart-persist`: after a restart, forks keep their lineage, title, tags, HEAD and events, a fork id that names a persisted but not yet loaded conversation is still 409, and a navigated empty HEAD stays empty (the next message is still a new root).
+- `F10.restart-cold-calls`: after a restart, condense and ask_agent work on a conversation whose agent has not been initialized yet, and ask_agent still sees the history (the codename).
 
 ## How to get to it (agent POV)
 
@@ -62,8 +63,10 @@ Routes: `POST /api/conversations/{conversation_id}/ask_agent`,
 - Second views used here: `GET /api/conversations/{conversation_id}`,
   `.../events/search`, `.../events/count`, `.../events/{event_id}`,
   `.../agent_final_response` (other families), the conversation's
-  `meta.json` and `base_state.json` (`state cat --conversation`), and the
-  events socket `/sockets/events/{conversation_id}`.
+  `meta.json` and `base_state.json` (`state cat --conversation`), the
+  requests an `llm-stub` received (`sink read`), and the events socket
+  `/sockets/events/{conversation_id}`. `POST .../interrupt` (the run family)
+  only ends the stub run in `F10.ask-agent-running`.
 - SDK: `RemoteConversation.fork(title=, tags=, reset_metrics=,
   from_event_id=, conversation_id=)` returns a `RemoteConversation` on the
   fork (passing `agent=` raises `NotImplementedError`);
@@ -92,9 +95,12 @@ Preconditions:
   on; `S`, a conversation on an unreachable placeholder model with two user
   messages that never runs (`$E1` = `QA_F10_M1`, `$E2` = `QA_F10_M2`); `A`, a
   DeepSeek flash conversation told a codename and run to `finished`; `NC` and
-  `NOOP`, offline agents whose condenser is disabled or `no_op`; and `OFF`, an
-  offline agent with the default summarizing condenser. Only `A` calls a
-  model here.
+  `NOOP`, offline agents whose condenser is disabled or `no_op`; `OFF`, an
+  offline agent with the default summarizing condenser; and an `llm-stub`
+  (`$SIDE_AGENT`) whose first call hangs for 300 s and whose later calls
+  answer `QA_F10_SIDE` (a run that waits on its model cannot be held open
+  with a real model). Only `A` calls a model here; the `F10.ask-agent-running`
+  bullet starts its stub conversation itself, right before it needs it.
 
 ```sh
 control-agent-server llm preset deepseek
@@ -112,6 +118,8 @@ control-agent-server api GET "/api/conversations/$A" --check execution_status eq
 NC=$(control-agent-server conversation start --body-json "{\"agent_settings\": {\"agent_kind\": \"openhands\", \"llm\": $OFFLINE_LLM, \"tools\": [], \"condenser\": {\"enabled\": false}}}" --no-autotitle --no-run --prompt QA_F10_NC --print-id)
 NOOP=$(control-agent-server conversation start --body-json "{\"agent_settings\": {\"agent_kind\": \"openhands\", \"llm\": $OFFLINE_LLM, \"tools\": [], \"condenser\": {\"condenser_kind\": \"no_op\"}}}" --no-autotitle --no-run --prompt QA_F10_NOOP --print-id)
 OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle --no-run --prompt QA_F10_OFFLINE --print-id)
+SIDE=$(control-agent-server fixture llm-stub --name qa-f10-side --step hang:300 --step reply:QA_F10_SIDE --print-path)
+SIDE_AGENT="{\"llm\": {\"model\": \"openai/qa-stub\", \"api_key\": \"qa-stub-key\", \"base_url\": \"$SIDE/v1\", \"num_retries\": 0}, \"tools\": []}"
 ```
 
 - **Fork the whole log (`F10.fork-whole`).** Fork `S` with no body.
@@ -234,15 +242,16 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   Fork the finished DeepSeek conversation `A` and ask the fork what only the
   source was told.
   ```sh
+  N_A_MSG=$(control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$MSG --field .)
   AF=$(control-agent-server api POST "/api/conversations/$A/fork" --json '{"title": "QA F10 memory fork"}' --expect 201 --field id)
   control-agent-server conversation send "$AF" --text 'What is the project codename I told you? Answer with the codename only.' --wait --until finished,error --timeout 180
   control-agent-server api GET "/api/conversations/$AF" --quiet --check execution_status eq finished --save F10.fork-run-memory/status
   control-agent-server api GET "/api/conversations/$AF/agent_final_response" --check response matches '(?i)pelican' --save F10.fork-run-memory/final
-  control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$MSG --check . eq 2
+  control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$MSG --check . eq "$N_A_MSG"
   ```
   Expected: the fork runs to `finished`, its answer names the codename from
   the copied history (a fact only the source was told, not wording), and `A`
-  still has its two messages. Today the fork's run ends in `error` within
+  gains no message from the fork's run. Today the fork's run ends in `error` within
   seconds with a `ConversationErrorEvent` `LLMAuthenticationError` ("Your LLM
   API key appears to be invalid or has expired."), because the fork lost the
   model key (`F10.fork-keeps-credentials`). Any fork of a conversation whose
@@ -264,6 +273,7 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   navigating and appending.
   ```sh
   control-agent-server ws start "/sockets/events/$S" --name qa-f10-branch --duration 120
+  control-agent-server ws read qa-f10-branch --wait 15 --kinds ConversationStateUpdateEvent --contains full_state --expect-min 1
   control-agent-server api POST "/api/conversations/$S/navigate" --json "{\"event_id\": \"$E1\"}" --expect 200 --quiet
   control-agent-server api POST "/api/conversations/$S/events" --json '{"role": "user", "content": [{"type": "text", "text": "QA_F10_M3"}], "run": false}' --expect 200 --quiet
   control-agent-server ws stop qa-f10-branch --wait 15 --kinds MessageEvent --contains "\"parent_id\": \"$E1\"" --expect-min 1 --save F10.navigate-branch/frames
@@ -331,6 +341,7 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   ```sh
   control-agent-server api GET "/api/conversations/$A" --quiet --check agent.condenser.kind eq LLMSummarizingCondenser
   control-agent-server ws start "/sockets/events/$A" --name qa-f10-condense --duration 180
+  control-agent-server ws read qa-f10-condense --wait 15 --kinds ConversationStateUpdateEvent --contains full_state --expect-min 1
   control-agent-server api POST "/api/conversations/$A/condense" --expect 200 --check success eq true --timeout 180 --save F10.condense-llm/condense
   control-agent-server ws stop qa-f10-condense --wait 30 --kinds Condensation --expect-min 1 --save F10.condense-llm/frames
   control-agent-server ws read qa-f10-condense --kinds CondensationRequest --expect-min 1
@@ -350,8 +361,8 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   control-agent-server api GET "/api/conversations/$NOOP" --quiet --check agent.condenser.kind eq NoOpCondenser
   N_NC=$(control-agent-server api GET "/api/conversations/$NC/events/count" --field .)
   N_NOOP=$(control-agent-server api GET "/api/conversations/$NOOP/events/count" --field .)
-  control-agent-server api POST "/api/conversations/$NC/condense" --expect 4xx,5xx --save F10.condense-no-condenser/disabled
-  control-agent-server api POST "/api/conversations/$NOOP/condense" --expect 4xx,5xx --save F10.condense-no-condenser/no-op
+  control-agent-server api POST "/api/conversations/$NC/condense" --expect 4xx,5xx --check . matches 'No condenser configured' --save F10.condense-no-condenser/disabled
+  control-agent-server api POST "/api/conversations/$NOOP/condense" --expect 4xx,5xx --check . matches 'NoOpCondenser does not handle condensation requests' --save F10.condense-no-condenser/no-op
   control-agent-server api GET "/api/conversations/$NC/events/count" --check . eq "$N_NC"
   control-agent-server api GET "/api/conversations/$NOOP/events/count" --check . eq "$N_NOOP"
   control-agent-server api GET "/api/conversations/$NOOP/events/count" --query kind=$CREQ --check . eq 0
@@ -359,7 +370,9 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   ```
   Both calls fail, naming the cause (`Cannot condense conversation: No
   condenser configured` / `Condenser NoOpCondenser does not handle
-  condensation requests`), and neither conversation gains an event.
+  condensation requests`; the check reads the whole body, so it holds
+  whether the cause is in `exception` today or in `detail` once
+  `F10.condense-status` is fixed), and neither conversation gains an event.
 - **Refusal status (`F10.condense-status`), known bug.** A missing condenser
   is the caller's configuration, not a server fault.
   ```sh
@@ -400,19 +413,19 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   ```sh
   N_MSG=$(control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$MSG --field .)
   control-agent-server ws start "/sockets/events/$A" --name qa-f10-ask --duration 120
+  control-agent-server ws read qa-f10-ask --wait 15 --kinds ConversationStateUpdateEvent --contains full_state --expect-min 1
   control-agent-server api POST "/api/conversations/$A/ask_agent" --json '{"question": "What is the project codename? Answer with the codename only."}' \
     --expect 200 --check response matches '(?i)pelican' --timeout 120 --save F10.ask-agent/ask
   control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$MSG --check . eq "$N_MSG" --save F10.ask-agent/messages
   control-agent-server api GET "/api/conversations/$A/events/count" --query body=PELICAN --query source=agent --check . eq 0
   control-agent-server api GET "/api/conversations/$A" --quiet --check execution_status eq finished
   control-agent-server ws stop qa-f10-ask --kinds MessageEvent,ActionEvent --expect-none --save F10.ask-agent/frames
-  control-agent-server ws read qa-f10-ask --kinds ConversationStateUpdateEvent --contains full_state --expect-min 1
   ```
   The answer names the codename, which only the conversation's history holds
   (the check is on that fact, not the wording). No message is recorded or
-  pushed: the socket was live (it received its `full_state` snapshot, and the
-  same socket delivered `Condensation` frames in `F10.condense-llm`), and `A`
-  is still `finished`.
+  pushed: the socket was live before the call (its `full_state` snapshot had
+  arrived, and the same kind of socket delivered `Condensation` frames in
+  `F10.condense-llm`), and `A` is still `finished`.
 - **Bad input, no key, unreachable model (`F10.ask-agent-errors`).**
   ```sh
   control-agent-server api POST "/api/conversations/$A/ask_agent" --json '{}' --expect 422 --check detail.0.loc.1 eq question --save F10.ask-agent-errors/missing-question
@@ -423,6 +436,31 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   ```
   422 naming `question`, 401, and 500 with an `error_id` whose `exception`
   carries the provider's connection error; `OFF` stays `idle`.
+- **Side question during a run (`F10.ask-agent-running`).** Start `R` on the
+  hanging stub, wait until its step is blocked on the model, then ask.
+  `sink read` has no `--wait`, so a bounded loop polls for the stub's first
+  call.
+  ```sh
+  R=$(control-agent-server conversation start --body-json "{\"agent\": $SIDE_AGENT}" --no-autotitle --prompt QA_F10_BUSY --print-id)
+  control-agent-server conversation wait "$R" --until running --timeout 30
+  for i in $(seq 1 60); do control-agent-server sink read --name qa-f10-side --expect-min 1 > /dev/null 2>&1 && break; sleep 0.5; done
+  control-agent-server sink read --name qa-f10-side --expect-min 1 --expect-max 1
+  N_R=$(control-agent-server api GET "/api/conversations/$R/events/count" --field .)
+  control-agent-server api POST "/api/conversations/$R/ask_agent" --json '{"question": "QA_F10_SIDE_Q"}' --expect 200 \
+    --check response eq QA_F10_SIDE --expect-max-ms 15000 --timeout 60 --save F10.ask-agent-running/ask
+  control-agent-server api GET "/api/conversations/$R" --quiet --check execution_status eq running --save F10.ask-agent-running/still-running
+  control-agent-server api GET "/api/conversations/$R/events/count" --check . eq "$N_R"
+  control-agent-server sink read --name qa-f10-side --contains QA_F10_SIDE_Q --expect-min 1 --expect-max 1
+  control-agent-server api POST "/api/conversations/$R/interrupt" --expect 200 --quiet
+  control-agent-server conversation wait "$R" --until paused --timeout 30
+  control-agent-server api GET "/api/conversations/$R/events/count" --query body=QA_F10_SIDE --check . eq 0
+  ```
+  The stub's first call (the run's step) is still hanging when the question
+  arrives; the second call carries the question and answers `QA_F10_SIDE`
+  within a fraction of a second, so `ask_agent` neither takes the state lock
+  the step holds nor waits for it. `R` is still `running`, its event count is
+  unchanged, and after the interrupt (which frees the run slot) no event
+  carries the side answer.
 - **Unknown conversation (`F10.ask-agent-unknown`), known bug.** The route
   documents 404, like condense and navigate.
   ```sh
@@ -438,6 +476,8 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   forks and `S`'s empty HEAD back.
   ```sh
   control-agent-server restart
+  control-agent-server api POST "/api/conversations/$S/fork" --json "{\"id\": \"$FE\"}" --expect 409 \
+    --check detail eq "Conversation with id $FE already exists" --save F10.restart-persist/taken-by-unloaded
   control-agent-server api GET "/api/conversations/$FN" --quiet --check forked_from_conversation_id eq "$S" \
     --check title eq 'QA F10 named fork' --check tags.qa eq f10 --check execution_status eq idle --save F10.restart-persist/named-fork
   control-agent-server api GET "/api/conversations/$FE" --quiet --check forked_from_event_id eq "$E1" --check leaf_event_id eq "$E1"
@@ -448,20 +488,24 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   control-agent-server api GET "/api/conversations/$S/events/search" --query kind=$MSG --query body=QA_F10_ROOT2 --check items.0.parent_id eq __root__
   control-agent-server doctor
   ```
-  The forks come back with their lineage, title, tags, HEAD and events; `S`'s
-  HEAD is still empty, so the first message after the restart is a new root.
+  Right after the restart nothing has loaded `FE` yet, and a fork that asks
+  for `FE`'s id is still 409 (the server checks its catalog of persisted
+  conversations, not only the loaded ones), leaving `FE` intact. The forks
+  come back with their lineage, title, tags, HEAD and events; `S`'s HEAD is
+  still empty, so the first message after the restart is a new root.
 - **Condense and ask on a cold conversation (`F10.restart-cold-calls`).**
   After the restart nothing has initialized `A`'s agent yet.
   ```sh
   N_COND=$(control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$COND --field .)
   control-agent-server api POST "/api/conversations/$A/condense" --expect 200 --check success eq true --timeout 180 --save F10.restart-cold-calls/condense
   control-agent-server api GET "/api/conversations/$A/events/count" --query kind=$COND --check . eq $((N_COND + 1))
-  control-agent-server api POST "/api/conversations/$A/ask_agent" --json '{"question": "Reply with one word."}' \
-    --expect 200 --check response matches '\S' --timeout 120 --save F10.restart-cold-calls/ask
+  control-agent-server api POST "/api/conversations/$A/ask_agent" --json '{"question": "What is the project codename? Answer with the codename only."}' \
+    --expect 200 --check response matches '(?i)pelican' --timeout 120 --save F10.restart-cold-calls/ask
   control-agent-server api GET "/api/conversations/$A" --quiet --check execution_status eq finished
   ```
-  A second `Condensation` is recorded and ask_agent answers; `A` stays
-  `finished`.
+  A second `Condensation` is recorded and ask_agent still names the codename
+  from the reloaded history (the condenser keeps the first two events, the
+  system prompt and the user's message); `A` stays `finished`.
 
 ## Gotchas
 
@@ -493,8 +537,13 @@ OFF=$(control-agent-server conversation start --placeholder-agent --no-autotitle
   the state lock), so it can take as long as one model call. It needs a model:
   without one that answers, it is a 500 that leaves a pending
   `CondensationRequest` in the log.
-- `ask_agent` initializes the agent first, so on a conversation that never
-  ran it appends the `SystemPromptEvent` the first run would have written.
+- `ask_agent` initializes the agent first, so on a conversation with no
+  events yet (created without a message) it appends the `SystemPromptEvent`
+  the first run would have written, even when the model call then fails. A
+  conversation created with a message already has that event. During a run
+  it does not wait for the step (`F10.ask-agent-running`), unlike `condense`,
+  `fork` and `navigate`, which take the state lock (from source; not driven
+  here).
   Its model cost can surface as a `stats` `ConversationStateUpdateEvent`
   (seen on the first call after a restart). It passes the agent's tools to
   the model and returns the first text block, so on a conversation with no

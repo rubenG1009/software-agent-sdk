@@ -14,7 +14,7 @@ LLM's `usage_id`.
 
 Source: `openhands-agent-server/openhands/agent_server/conversation_router.py`, `openhands-agent-server/openhands/agent_server/event_service.py`, `openhands-agent-server/openhands/agent_server/_secrets_exposure.py`, `openhands-sdk/openhands/sdk/conversation/impl/local_conversation.py`, `openhands-sdk/openhands/sdk/llm/llm_registry.py`, `openhands-sdk/openhands/sdk/llm/llm_profile_store.py`, `openhands-sdk/openhands/sdk/marketplace/`, `openhands-sdk/openhands/sdk/plugin/`, `openhands-sdk/openhands/sdk/agent/acp_agent.py`
 
-Needs: `llm`
+Needs: `llm`, `tmux`
 
 Routes: `POST /api/conversations/{conversation_id}/switch_profile`,
 `POST /api/conversations/{conversation_id}/switch_llm`,
@@ -31,6 +31,8 @@ Routes: `POST /api/conversations/{conversation_id}/switch_profile`,
 - `F09.switch-llm-provider-connection`: a switch that references a saved provider connection instead of a key runs the next turn with the connection's key; `GET` shows the `provider_connection_id` and no key.
 - `F09.switch-llm-registered-usage-id`: after the agent initialized, a switch whose `usage_id` is already registered (the `default` a saved profile's config carries) either installs the posted LLM or is refused, never a silent 200 no-op.
 - `F09.switch-llm-before-first-run`: a switch before the conversation's first run is used by that run, and the run's token usage is recorded under the switched LLM's `usage_id`.
+- `F09.switch-llm-mid-run`: a `switch_llm` while a turn is running (the agent is inside a 20 s tool call) answers 200, the socket pushes the new `agent`, and the same run's next LLM call already uses the switched LLM (usage under both `usage_id`s) and the run finishes.
+- `F09.switch-llm-mid-run-get`: right after a mid-run switch answers 200, `GET` and `base_state.json` show the switched LLM, as the socket already does.
 - `F09.switch-profile`: `switch_profile` to the saved `deepseek-pro` profile answers 200, installs it under `usage_id` `profile:deepseek-pro`, and the next turn runs on `deepseek/deepseek-v4-pro` with its usage recorded under that id.
 - `F09.switch-profile-errors`: an unknown profile is 404 `Profile '<name>' not found`, an invalid name and a corrupted profile file are 400, a missing `profile_name` is 422 and an unknown conversation 404; the installed LLM is unchanged.
 - `F09.switch-profile-edited`: switching to a profile again after it was edited installs the edited config, not the copy cached at the first switch.
@@ -41,7 +43,7 @@ Routes: `POST /api/conversations/{conversation_id}/switch_profile`,
 - `F09.acp-model-live`: on an ACP conversation with a live session, `switch_acp_model` switches the subprocess's model in place (`session/set_model`) and `current_model_id` follows; a provider that cannot switch is 400 and a server that never answers is 504.
 - `F09.load-plugin`: `load_plugin` with `<plugin>@<marketplace>` from a local marketplace registered on the agent's `agent_context` answers 200 and merges the plugin's skill, its command and its hooks into the live agent, visible in `GET`, `base_state.json` and on the socket.
 - `F09.load-plugin-hook-runs`: after a runtime load, the next user turn runs the plugin's `UserPromptSubmit` hook (a `HookExecutionEvent` with its output) and finishes.
-- `F09.load-plugin-errors`: no registered marketplaces and no agent context are 400, an unknown marketplace or plugin is 404, empty and malformed refs are 400, a missing `plugin_ref` is 422 and an unknown conversation 404; a bare plugin name resolves across the registered marketplaces.
+- `F09.load-plugin-errors`: no registered marketplaces and no agent context are 400, a registered marketplace whose source is missing is 400, an unknown marketplace or plugin is 404, empty and malformed refs are 400, a missing `plugin_ref` is 422 and an unknown conversation 404; a bare plugin name resolves across the registered marketplaces.
 - `F09.load-plugin-twice`: loading the same plugin twice leaves one copy of its hooks, so they still run once per message.
 - `F09.restart-persist`: after a restart the switched LLM, the switched profile (which the next turn runs on), the deferred ACP model and the loaded plugin's skills and hooks are still in place.
 - `F09.load-plugin-restart-hooks`: a runtime-loaded plugin's hook still runs on the first user turn after a restart.
@@ -84,7 +86,8 @@ Routes: `POST /api/conversations/{conversation_id}/switch_profile`,
 Preconditions:
 
 - A baseline run is live and exported (`launch --new`), `doctor` is ok,
-  `$DEEPSEEK_API_KEY` is set and `jq` is on `PATH`. The block below saves the
+  `$DEEPSEEK_API_KEY` is set, `jq` is on `PATH` and `tmux` is installed (the
+  mid-run bullets give the agent the terminal tool). The block below saves the
   DeepSeek preset (`deepseek-flash` active, `deepseek-pro`), reads the
   `deepseek-flash` key back as a cipher token (`ENC`), creates the local
   marketplace fixture `qa-f09-mkt` (one plugin with a skill, a command and a
@@ -139,6 +142,7 @@ Preconditions:
   control-agent-server api POST "/api/conversations/$CID/switch_llm" \
     --json '{"llm": {"model": "openai/qa-f09-ws", "api_key": "sk-qa-f09-ws", "base_url": "http://127.0.0.1:9/v1", "usage_id": "qa-f09-ws"}}' --expect 200
   control-agent-server ws read qa-f09-switch --kinds ConversationStateUpdateEvent --contains openai/qa-f09-ws --expect-min 1 --wait 20 --save F09.switch-llm-ws/frames
+  control-agent-server ws read qa-f09-switch --kinds ConversationStateUpdateEvent --contains '"key": "agent"' --expect-min 1
   control-agent-server ws stop qa-f09-switch --contains sk-qa-f09-ws --expect-none
   control-agent-server api GET "/api/conversations/$CID" --quiet --check agent.llm.model eq openai/qa-f09-ws --check agent.llm.usage_id eq qa-f09-ws
   ```
@@ -261,7 +265,11 @@ Preconditions:
   `LocalConversation.switch_profile` looks up `profile:<name>` in the
   conversation's LLM registry first and only reads the profile file on a
   miss, so a fixed key or model never reaches a conversation that used the
-  profile before. The profile is deleted on exit.
+  profile before. The SDK docstring states the cache ("cached in the
+  registry under `profile:{profile_name}` after first load"), but the route
+  documents nothing and offers no way to refresh, so a REST consumer can
+  only apply the edit with `switch_llm` and a fresh `usage_id`. The profile
+  is deleted on exit.
 - **Switch onto a registered usage id (`F09.switch-llm-registered-usage-id`), known bug.**
   Forward the saved `deepseek-pro` profile's config, read with
   `X-Expose-Secrets: encrypted` (the per-conversation model switch the
@@ -275,7 +283,7 @@ Preconditions:
   KID=$(control-agent-server conversation start --placeholder-agent --tools none --no-autotitle --prompt 'Reply with the single word: ok' --no-run --print-id)
   control-agent-server api GET "/api/conversations/$KID" --quiet --check agent.llm.usage_id eq default --check execution_status eq idle
   ST=$(control-agent-server api POST "/api/conversations/$KID/switch_llm" --json "{\"llm\": $PRO}" \
-    --expect 200,409,422 --save F09.switch-llm-registered-usage-id/switch | jq -r .status)
+    --expect 200,400,409,422 --save F09.switch-llm-registered-usage-id/switch | jq -r .status)
   test "$ST" != 200 || control-agent-server api GET "/api/conversations/$KID" --quiet --check agent.llm.model eq deepseek/deepseek-v4-pro --save F09.switch-llm-registered-usage-id/get
   ```
   The profile config carries `usage_id: default`, and the fresh conversation
@@ -284,8 +292,11 @@ Preconditions:
   `{"success": true}` and `GET` still shows `openai/qa-placeholder`: once the
   agent initialized, `default` is in the conversation's LLM registry, and
   `switch_llm` reuses the registered LLM for a known `usage_id`
-  (first-write-wins) and drops the posted one. Any conversation that has
-  received a message silently ignores such a switch; a fresh `usage_id`
+  (first-write-wins) and drops the posted one. `LocalConversation.switch_llm`
+  documents that contract, but the route answers `{"success": true}` and its
+  docstring offers it for forwarding profile configs, which carry `default`
+  (also the `LLM` default when `usage_id` is omitted). Any conversation that
+  has received a message silently ignores such a switch; a fresh `usage_id`
   works (as in `F09.switch-llm-encrypted-key`).
 - **Switch before the first run (`F09.switch-llm-before-first-run`), known bug.**
   Start from an agent whose model is unreachable, switch to DeepSeek before
@@ -308,6 +319,54 @@ Preconditions:
   registered, so the switched LLM is never added to `ConversationStats` and
   the conversation's cost and token totals miss every call it makes. The
   same switch after one message (`F09.switch-llm-encrypted-key`) is counted.
+- **Switch during a running turn (`F09.switch-llm-mid-run`).** Start a run
+  whose first action is a 20 s command, switch once that action exists,
+  and let the run finish.
+  ```sh
+  MID=$(control-agent-server conversation start --tools terminal --no-autotitle --prompt 'Run this exact shell command and nothing else: sleep 20' --print-id)
+  control-agent-server ws start "/sockets/events/$MID" --name qa-f09-midrun --duration 300
+  control-agent-server ws read qa-f09-midrun --kinds ActionEvent --contains 'sleep 20' --expect-min 1 --wait 120
+  control-agent-server api POST "/api/conversations/$MID/switch_llm" \
+    --json "{\"llm\": {\"model\": \"deepseek/deepseek-flash\", \"api_key\": \"$ENC\", \"usage_id\": \"qa-f09-midrun\", \"num_retries\": 0}}" \
+    --expect 200 --check success eq true --save F09.switch-llm-mid-run/switch
+  control-agent-server conversation wait "$MID" --until finished,error --timeout 240
+  control-agent-server ws stop qa-f09-midrun --kinds ConversationStateUpdateEvent --contains qa-f09-midrun --expect-min 1 --wait 20 --save F09.switch-llm-mid-run/frames
+  control-agent-server api GET "/api/conversations/$MID" --until-ok 60 --quiet --check execution_status eq finished \
+    --check agent.llm.usage_id eq qa-f09-midrun \
+    --check stats.usage_to_metrics.default.accumulated_token_usage.prompt_tokens gt 0 \
+    --check stats.usage_to_metrics.qa-f09-midrun.accumulated_token_usage.prompt_tokens gt 0 --save F09.switch-llm-mid-run/stats
+  ```
+  The switch is 200 while `sleep 20` runs (today at once, without waiting
+  for the tool), the socket carries a state update with `qa-f09-midrun`, and
+  the run finishes. Both `usage_id`s have tokens: the call that chose
+  `sleep 20` ran on `default`, the call after its observation on
+  `qa-f09-midrun`, so the switch applied inside the same run.
+- **GET right after a mid-run switch (`F09.switch-llm-mid-run-get`), known bug.**
+  The same situation, read back at once.
+  ```sh
+  GID=$(control-agent-server conversation start --tools terminal --no-autotitle --prompt 'Run this exact shell command and nothing else: sleep 20' --print-id)
+  control-agent-server ws start "/sockets/events/$GID" --name qa-f09-midget --duration 150
+  control-agent-server ws read qa-f09-midget --kinds ActionEvent --contains 'sleep 20' --expect-min 1 --wait 120
+  control-agent-server api POST "/api/conversations/$GID/switch_llm" \
+    --json "{\"llm\": {\"model\": \"deepseek/deepseek-flash\", \"api_key\": \"$ENC\", \"usage_id\": \"qa-f09-midget\", \"num_retries\": 0}}" \
+    --expect 200 --save F09.switch-llm-mid-run-get/switch
+  control-agent-server api GET "/api/conversations/$GID" --quiet --check agent.llm.usage_id eq qa-f09-midget --save F09.switch-llm-mid-run-get/get
+  control-agent-server state cat "server/workspace/conversations/${GID//-/}/base_state.json" --max-chars 200 --check agent.llm.usage_id eq qa-f09-midget
+  control-agent-server conversation wait "$GID" --until finished,error --timeout 240
+  control-agent-server ws stop qa-f09-midget
+  ```
+  Expected: once the switch has answered 200, `GET` shows `qa-f09-midget`.
+  Today `GET` (and `base_state.json`, which it serves) keep `default` until
+  the running step ends, about 20 s later, although the socket pushed the
+  new `agent` at once and the in-memory agent already switched. The route
+  calls `LocalConversation.switch_llm` on the event-loop thread; `arun()`
+  holds the reentrant state lock on that same thread during the step, so the
+  switch re-enters it and its autosave is deferred to the step's exit (the
+  `arun()` comment says unrelated mutators must go through
+  `run_in_executor`; `load_plugin` and `switch_acp_model` do). A consumer
+  that verifies the switch with `GET` sees the old model for as long as the
+  tool runs, and a `restart --hard` in that window loses the acknowledged
+  switch (seen live: `GET` shows `default` after the restart).
 - **ACP switch on a regular conversation (`F09.acp-model-native`).** `CID`
   runs an OpenHands `Agent`.
   ```sh
@@ -352,15 +411,17 @@ Preconditions:
   ```sh
   AID3=$(control-agent-server conversation start --no-autotitle --body-json '{"agent_settings": {"agent_kind": "acp", "acp_server": "claude-code", "acp_model": "sonnet"}}' --print-id)
   control-agent-server api GET "/api/conversations/$AID3" --quiet --check agent.llm.usage_id eq acp-managed --check agent.llm.model eq sonnet
-  control-agent-server api POST "/api/conversations/$AID3/switch_profile" --json '{"profile_name": "deepseek-pro"}' --expect 400 --save F09.switch-llm-acp-refused/switch-profile
+  control-agent-server api POST "/api/conversations/$AID3/switch_profile" --json '{"profile_name": "deepseek-pro"}' --expect 400,409,422 --save F09.switch-llm-acp-refused/switch-profile
   control-agent-server api POST "/api/conversations/$AID3/switch_llm" \
     --json '{"llm": {"model": "openai/qa-f09-acp", "api_key": "sk-qa-f09-acp", "base_url": "http://127.0.0.1:9/v1", "usage_id": "qa-f09-acp"}}' \
-    --expect 400 --save F09.switch-llm-acp-refused/switch-llm
+    --expect 400,409,422 --save F09.switch-llm-acp-refused/switch-llm
   control-agent-server api GET "/api/conversations/$AID3" --quiet --check agent.llm.usage_id eq acp-managed --check agent.acp_model eq sonnet
   ```
   The ACP agent starts with `usage_id` `acp-managed` and the model name
-  `sonnet`. Expected: both switches are refused (the ACP subprocess makes
-  its own model calls; `switch_acp_model` is the route for it). Today both
+  `sonnet`. Expected: both switches are refused with a 4xx (400 would mirror
+  `switch_acp_model` on a regular conversation; the ACP subprocess makes
+  its own model calls and `LocalConversation.switch_acp_model` says
+  `switch_llm` would not affect it). Today both
   answer 200 and replace the placeholder in `base_state.json` with the
   posted LLM (`GET` still shows `model: sonnet`, because the ACP agent
   overwrites the model name with `acp_model` when it is loaded, but
@@ -420,7 +481,7 @@ Preconditions:
   ```sh
   control-agent-server conversation send "$PID" --text 'Reply with the single word: ok' --wait --until finished,error --timeout 240
   control-agent-server api GET "/api/conversations/$PID" --quiet --check execution_status eq finished
-  control-agent-server conversation events "$PID" --kinds HookExecutionEvent --contains QA_PLUGIN_HOOK --expect-count 1 --save F09.load-plugin-hook-runs/hook-events
+  control-agent-server conversation events "$PID" --kinds HookExecutionEvent --contains '"stdout": "QA_PLUGIN_HOOK' --expect-count 1 --save F09.load-plugin-hook-runs/hook-events
   ```
   One `HookExecutionEvent` (`hook_event_type` `UserPromptSubmit`, `stdout`
   `QA_PLUGIN_HOOK`) precedes the turn, which finishes.
@@ -433,6 +494,11 @@ Preconditions:
     --expect 400 --check detail contains 'No marketplaces registered' --save F09.load-plugin-errors/no-marketplaces
   control-agent-server api POST "/api/conversations/$AID/load_plugin" --json '{"plugin_ref": "qa-f09-mkt-plugin"}' \
     --expect 400 --check detail contains 'No agent context available' --save F09.load-plugin-errors/no-agent-context
+  GONE=$(printf '%s' "$AS" | jq -c --arg m "$MKT-gone" '.agent_context.registered_marketplaces = [{"name": "qa-f09-gone", "source": $m}]')
+  NID=$(control-agent-server conversation start --no-autotitle --body-json "{\"agent_settings\": $GONE, \"secrets_encrypted\": true}" --print-id)
+  control-agent-server api POST "/api/conversations/$NID/load_plugin" --json '{"plugin_ref": "qa-f09-mkt-plugin@qa-f09-gone"}' \
+    --expect 400 --check detail contains 'Local plugin path does not exist' --save F09.load-plugin-errors/unfetchable-marketplace
+  control-agent-server api GET "/api/conversations/$NID" --query include_skills=true --quiet --check agent.agent_context.skills len-eq 0 --check hook_config missing
   QID=$(control-agent-server conversation start --no-autotitle --body-json "{\"agent_settings\": $AS, \"secrets_encrypted\": true}" --print-id)
   control-agent-server api POST "/api/conversations/$QID/load_plugin" --json '{"plugin_ref": "qa-f09-mkt-plugin@qa-f09-other"}' \
     --expect 404 --check detail eq "Marketplace 'qa-f09-other' is not registered" --save F09.load-plugin-errors/unknown-marketplace
@@ -450,7 +516,9 @@ Preconditions:
     --check agent.agent_context.skills contains qa-f09-mkt-plugin-skill --check hook_config.user_prompt_submit len-eq 1
   ```
   400 without marketplaces (`CID`) and without an agent context (the ACP
-  `AID`), 404 for an unregistered marketplace and an unknown plugin (with or
+  `AID`), 400 `Local plugin path does not exist: ...` when the only
+  registered marketplace points at a missing directory (`NID`, which stays
+  without skills or hooks), 404 for an unregistered marketplace and an unknown plugin (with or
   without a marketplace), 400 for an empty or half ref, 422 without the
   field, 404 for the unknown conversation; none of them changed `QID`, and
   the bare name `qa-f09-mkt-plugin` then resolves through the only
@@ -490,7 +558,7 @@ Preconditions:
   ```sh
   control-agent-server conversation send "$PID" --text 'Reply with the single word: ok' --wait --until finished,error --timeout 240
   control-agent-server api GET "/api/conversations/$PID" --quiet --check execution_status eq finished --check hook_config.user_prompt_submit len-eq 1
-  control-agent-server conversation events "$PID" --kinds HookExecutionEvent --contains QA_PLUGIN_HOOK --expect-count 2 --save F09.load-plugin-restart-hooks/hook-events
+  control-agent-server conversation events "$PID" --kinds HookExecutionEvent --contains '"stdout": "QA_PLUGIN_HOOK' --expect-count 2 --save F09.load-plugin-restart-hooks/hook-events
   ```
   The turn finishes and `GET` still lists the hook. Expected: a second
   `HookExecutionEvent`. Today there is still only the one from before the
@@ -504,8 +572,11 @@ Preconditions:
 
 - Every switch answers `{"success": true}` and nothing else; read the result
   back with `GET /api/conversations/{id}` (which serves the autosaved
-  `base_state.json`, so it shows a switch immediately) or the
-  `ConversationStateUpdateEvent` with key `agent`.
+  `base_state.json`, so on an idle conversation it shows a switch
+  immediately) or the `ConversationStateUpdateEvent` with key `agent`.
+  While a step is running, `GET` keeps the old LLM until the step ends
+  (`F09.switch-llm-mid-run-get`); the socket and the run itself switch at
+  once, so wait for the run (or read the socket) before asserting on `GET`.
 - The LLM registry of a conversation is first-write-wins per `usage_id`:
   `switch_llm` with a `usage_id` that is already registered (the default
   `default` once the agent initialized, or any id used before) silently
@@ -550,7 +621,9 @@ Preconditions:
   provider's capability (`supports_runtime_model_switch`) and
   `available_models` are unknown (`false`, `[]`) until a session started. A
   504 from a live switch has its `detail` rewritten to `Internal Server
-  Error`; read `exception`.
+  Error`; read `exception`. The TypeScript client's `switchAcpModel`
+  docstrings still say the server returns 409 before the first message; the
+  server answers 200 and defers (`F09.acp-model-deferred`).
 - Placeholder conversations (`conversation start --placeholder-agent`) point
   at `http://127.0.0.1:9/v1`, so a run that finishes after a switch proves
   the switched model ran.

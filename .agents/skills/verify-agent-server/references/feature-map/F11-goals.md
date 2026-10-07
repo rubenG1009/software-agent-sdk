@@ -47,8 +47,9 @@ Routes: `POST /api/conversations/{conversation_id}/goal`,
 - `F11.goal-restart-resume`: an interrupted goal's status survives a restart and `/goal/resume` continues it afterwards.
 - `F11.goal-run-error`: a round whose model provider is unreachable ends the conversation in `error` (with a `ConversationErrorEvent`) and the goal `interrupted`, which stays resumable.
 - `F11.goal-judge-error`: a judge call that fails after a successful round records `interrupted` and leaves the conversation `finished`.
-- `F11.goal-capacity`: the loop holds its run slot between rounds, so with the capacity full `/goal` and `/goal/resume` elsewhere return 429 and record nothing; stopping the loop frees the slot.
-- `F11.goal-cap-overrun`: an audit whose judge call fails is not counted as a completed round, so a resumed goal never reports more rounds than `max_iterations`.
+- `F11.goal-capacity`: between rounds (conversation `finished`, judge call in flight) the loop stays busy (409 on its own conversation) and holds its run slot, so with the capacity full `/goal` and `/goal/resume` elsewhere return 429 and record nothing; stopping the loop frees the slot.
+- `F11.goal-delete-active`: deleting a conversation whose loop is active answers 200 promptly, the conversation is gone, and the loop's run slot is returned (the next `/goal` elsewhere is admitted, not 429).
+- `F11.goal-cap-overrun`: a goal resumed after its last round's judge call failed never reports more rounds than `max_iterations` (no goal status has `iteration` above the cap).
 - `F11.goal-restart-active`: a loop that was active when the server restarted is reported `interrupted` (`active: false`) after the restart instead of `running`.
 
 ## How to get to it (agent POV)
@@ -80,7 +81,9 @@ Routes: `POST /api/conversations/{conversation_id}/goal`,
   `POST /api/conversations/{conversation_id}/events` or a message frame on
   the events socket, stops the active loop (`F11.goal-superseded`,
   `F11.goal-superseded-socket`); `/interrupt` ends the current round and the
-  loop with it.
+  loop with it; `DELETE /api/conversations/{conversation_id}` and a graceful
+  shutdown close the loop without recording a status
+  (`F11.goal-delete-active`, `F11.goal-restart-active`).
 - TypeScript client: `ConversationClient.startGoal(conversationId,
   {objective, max_iterations})`, `stopGoal(conversationId)`,
   `resumeGoal(conversationId)`
@@ -115,7 +118,7 @@ Preconditions:
   strictly in order and each one that holds the slot frees it (the loop ends,
   or `/interrupt`) before it ends. `F11.goal-capacity` depends on the limit
   of 1.
-- The block below creates an unknown id `$NOPE`, six stubs and twelve
+- The block below creates an unknown id `$NOPE`, six stubs and thirteen
   conversations without an initial message (an initial message starts a run,
   and creating a conversation needs a free slot). Stubs: `qa-f11-no` always
   answers the verdict `{"score": 0.2, "complete": false, "missing":
@@ -127,7 +130,7 @@ Preconditions:
   DeepSeek flash with the `terminal` tool; `X` and `W` on `qa-f11-no`; `H`,
   `U`, `V`, `I` on `qa-f11-hang`; `E` on a provider that refuses
   connections (`127.0.0.1:9`); `J` on `qa-f11-judge`; `K` on `qa-f11-slot`;
-  `J2` on `qa-f11-judge2`; `R` on `qa-f11-park`. Every stub agent has
+  `J2` on `qa-f11-judge2`; `D` and `R` on `qa-f11-park`. Every stub agent has
   `tools: []` and `num_retries: 0`.
 
 ```sh
@@ -157,8 +160,9 @@ E=$(control-agent-server conversation start --body-json "{\"agent\": $OFFLINE_AG
 J=$(control-agent-server conversation start --body-json "{\"agent\": $JUDGE_AGENT}" --no-autotitle --print-id)
 K=$(control-agent-server conversation start --body-json "{\"agent\": $SLOT_AGENT}" --no-autotitle --print-id)
 J2=$(control-agent-server conversation start --body-json "{\"agent\": $JUDGE2_AGENT}" --no-autotitle --print-id)
+D=$(control-agent-server conversation start --body-json "{\"agent\": $PARK_AGENT}" --no-autotitle --print-id)
 R=$(control-agent-server conversation start --body-json "{\"agent\": $PARK_AGENT}" --no-autotitle --print-id)
-control-agent-server api GET /api/conversations/count --query status=idle --check . eq 12
+control-agent-server api GET /api/conversations/count --query status=idle --check . eq 13
 ```
 
 - **Invalid goal requests (`F11.goal-validation`).** Bad bodies on `X`,
@@ -292,14 +296,14 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   control-agent-server conversation wait "$H" --until running --timeout 30
   control-agent-server api POST "/api/conversations/$H/goal" --json '{"objective": "QA_F11 second objective", "max_iterations": 1}' --expect 409 --check detail eq 'Conversation run or goal loop already running.' --save F11.goal-busy/second-goal
   control-agent-server api POST "/api/conversations/$H/goal/resume" --expect 409 --check detail eq 'Conversation run or goal loop already running.' --save F11.goal-busy/resume
-  control-agent-server api POST "/api/conversations/$H/run" --expect 409 --save F11.goal-busy/run
+  control-agent-server api POST "/api/conversations/$H/run" --expect 409 --check detail eq 'Conversation already running. Wait for completion or pause first.' --save F11.goal-busy/run
   control-agent-server conversation events "$H" --key goal --contains '"active": true, "status": "running", "iteration": 0, "max_iterations": 10, "objective": "QA_F11 busy objective"' --expect-count 1
   control-agent-server conversation events "$H" --key goal --expect-count 1 --save F11.goal-busy/goal-events
-  control-agent-server sink read --name qa-f11-hang --expect-max 1
+  control-agent-server sink read --name qa-f11-hang --expect-min 1 --expect-max 1
   ```
   The second `/goal`, `/goal/resume` and `/run` are 409, the only goal
-  status is the first loop's `running` with the default cap of 10, and no
-  second model call was made.
+  status is the first loop's `running` with the default cap of 10, and the
+  stub saw exactly one model call (the one still hanging).
 - **Stop an active loop (`F11.goal-stop`).**
   ```sh
   control-agent-server api POST "/api/conversations/$H/goal/stop" --expect 200 --check success eq true --expect-max-ms 3000 --save F11.goal-stop/stop
@@ -334,7 +338,7 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   ```sh
   control-agent-server api POST "/api/conversations/$V/goal" --json '{"objective": "QA_F11 socket objective", "max_iterations": 3}' --expect 200
   control-agent-server conversation wait "$V" --until running --timeout 30
-  control-agent-server ws listen "/sockets/events/$V" --send '{"role": "user", "content": [{"type": "text", "text": "QA_F11_SOCKET_INTERJECTION"}], "run": true}' --until value.status=interrupted --duration 20 --save F11.goal-superseded-socket/frames
+  control-agent-server ws listen "/sockets/events/$V" --send '{"role": "user", "content": [{"type": "text", "text": "QA_F11_SOCKET_INTERJECTION"}], "run": true}' --until-kind ConversationStateUpdateEvent --until value.status=interrupted --duration 20 --save F11.goal-superseded-socket/frames
   control-agent-server conversation events "$V" --key goal --contains '"active": false, "status": "interrupted", "iteration": 0, "max_iterations": 3, "objective": "QA_F11 socket objective"' --expect-count 1 --save F11.goal-superseded-socket/goal-events
   control-agent-server api GET "/api/conversations/$V/events/count" --query source=user --query body=QA_F11_SOCKET_INTERJECTION --check . eq 1
   control-agent-server api POST "/api/conversations/$V/interrupt" --expect 200
@@ -435,6 +439,8 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   control-agent-server ws start "/sockets/events/$K" --name f11-k --duration 300
   control-agent-server api POST "/api/conversations/$K/goal" --json '{"objective": "QA_F11 slot objective", "max_iterations": 3}' --expect 200
   control-agent-server conversation wait "$K" --until finished --timeout 60
+  control-agent-server api POST "/api/conversations/$K/goal" --json '{"objective": "QA_F11 second objective", "max_iterations": 1}' --expect 409 --check detail eq 'Conversation run or goal loop already running.' --save F11.goal-capacity/own-goal-409
+  control-agent-server api POST "/api/conversations/$K/goal/resume" --expect 409 --check detail eq 'Conversation run or goal loop already running.'
   NE=$(control-agent-server api GET "/api/conversations/$E/events/count" --field .)
   control-agent-server api POST "/api/conversations/$W/goal" --json '{"objective": "QA_F11 refused objective", "max_iterations": 1}' --expect 429 --check detail eq 'Conversation run limit reached. Retry the request later.' --save F11.goal-capacity/goal-429
   control-agent-server api POST "/api/conversations/$E/goal/resume" --expect 429 --save F11.goal-capacity/resume-429
@@ -449,19 +455,39 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   control-agent-server ws stop f11-k
   control-agent-server ws stop f11-w
   ```
-  While the judge call runs, `/goal` on `W` and `/goal/resume` on `E` are
-  429 and record nothing. The stop returns at once (the judge call is
+  While the judge call runs, `K` is `finished` but its own `/goal` and
+  `/goal/resume` are 409 (the loop is still active), and `/goal` on `W` and
+  `/goal/resume` on `E` are 429 and record nothing. The stop returns at once (the judge call is
   abandoned), and the same `/goal` on `W` is then admitted and runs its one
   round to `capped`.
-- **A failed audit counts as a round (`F11.goal-cap-overrun`), known bug.**
+- **Delete a conversation with an active loop (`F11.goal-delete-active`).**
+  `D`'s round hangs; deleting `D` closes its loop, and the only run slot
+  must come back.
+  ```sh
+  control-agent-server api POST "/api/conversations/$D/goal" --json '{"objective": "QA_F11 delete objective", "max_iterations": 3}' --expect 200
+  control-agent-server conversation wait "$D" --until running --timeout 30
+  control-agent-server api DELETE "/api/conversations/$D" --expect 200 --expect-max-ms 5000 --save F11.goal-delete-active/delete
+  control-agent-server api GET "/api/conversations/$D" --expect 404
+  control-agent-server ws start "/sockets/events/$W" --name f11-w2 --duration 120
+  control-agent-server api POST "/api/conversations/$W/goal" --json '{"objective": "QA_F11 after delete objective", "max_iterations": 1}' --expect 200 --save F11.goal-delete-active/goal-after-delete
+  control-agent-server ws read f11-w2 --contains '"key": "goal", "value": {"active": false, "status": "capped", "iteration": 1, "max_iterations": 1, "objective": "QA_F11 after delete objective"' --wait 60
+  control-agent-server ws stop f11-w2
+  ```
+  The delete answers 200 within 5 s (about 0.1 s; teardown cancels the loop
+  and the hanging round), `D` is 404, and with one run slot the next
+  `/goal` on `W` is admitted and runs to `capped`: the deleted loop did not
+  keep its slot. Nothing is recorded for `D` (it no longer exists).
+- **A resume after a failed last audit overruns the cap (`F11.goal-cap-overrun`), known bug.**
   `J2`'s judge fails on a one-round goal; then its stub answers an
-  incomplete verdict and the goal is resumed. `GoalStatus.iteration` is
-  documented as "audit rounds completed so far" and `max_iterations` as the
-  hard cap, so the interrupted status should say `iteration: 0` and the
-  resumed loop should end `capped` at 1 of 1. Today the failed audit is
-  counted (`interrupted` at 1 of 1, the same after a `/goal/stop` during the
-  judge call) and the resumed loop runs a second round, ending `capped` at 2
-  of 1.
+  incomplete verdict and the goal is resumed. `max_iterations` is documented
+  as the hard cap on audit rounds and `GoalStatus.iteration` as "audit rounds
+  completed so far", so whatever the resume does, no status may report more
+  rounds than the cap; the resumed loop should end `capped` at 1 of 1 (or
+  cap at once). Today `GoalController.on_run_finished` counts the round
+  before the judge call, so the failed audit is recorded as `interrupted`
+  at 1 of 1 (a unit test pins the same count for a `/goal/stop` during the
+  judge call), and the resume runs another agent round and audit and ends
+  `capped` at 2 of 1.
   ```sh
   control-agent-server ws start "/sockets/events/$J2" --name f11-j2 --duration 120
   control-agent-server api POST "/api/conversations/$J2/goal" --json '{"objective": "QA_F11 overrun objective", "max_iterations": 1}' --expect 200
@@ -470,12 +496,11 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   control-agent-server api POST "/api/conversations/$J2/goal/resume" --expect 200 --save F11.goal-cap-overrun/resume
   control-agent-server ws read f11-j2 --contains '"key": "goal", "value": {"active": false, "status": "capped"' --wait 60
   control-agent-server ws stop f11-j2
-  control-agent-server conversation events "$J2" --key goal --show 10 --full --save F11.goal-cap-overrun/goal-events | jq -e '[.events[].value | select(.iteration > .max_iterations)] | length == 0'
-  control-agent-server conversation events "$J2" --key goal --contains '"active": false, "status": "interrupted", "iteration": 0' --expect-count 1
+  control-agent-server conversation events "$J2" --key goal --expect-min 3 --show 10 --full --save F11.goal-cap-overrun/goal-events | jq -e '[.events[].value | select(.iteration > .max_iterations)] | length == 0'
   ```
-  Both assertions fail today: the last status is `capped` with
-  `iteration: 2, max_iterations: 1`, and the interrupted one has
-  `iteration: 1`.
+  The `jq` check fails today: the `capped` status has `iteration: 2,
+  max_iterations: 1` (the four statuses are `running` 0/1, `interrupted`
+  1/1, `running` 1/1, `capped` 2/1).
 - **A loop active at a restart stays "running" (`F11.goal-restart-active`), known bug.**
   A graceful shutdown cancels the loop but skips the `interrupted` status
   (`_closing` is set), so after the restart the last goal status still says
@@ -508,6 +533,9 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
 - `/goal/stop` is 200 even when nothing was active, and it cancels only the
   loop: a round in flight keeps running (and keeps its run slot) until it
   ends or is interrupted. Use `/interrupt` to stop the agent too.
+- Between rounds only `/goal` and `/goal/resume` treat the live loop as busy
+  (409); `/run` on the `finished` conversation is accepted (200), makes no
+  model call and does not stop the loop.
 - Any ordinary user message (REST `POST /events` with `run` true or false,
   or a socket message frame) cancels the active loop first. A socket message
   also asks for a run, which is refused while the old round is in flight.
@@ -521,8 +549,10 @@ control-agent-server api GET /api/conversations/count --query status=idle --chec
   and `error` do (`interrupted`). The goal is resumable after `interrupted`
   (and after a stale `running`), never after `complete` or `capped`.
 - `/goal/resume` sends a fixed resume prompt, not the objective, and keeps
-  the stored iteration count, so a resumed loop has fewer rounds left. A
-  failed or stopped audit is counted as a round (`F11.goal-cap-overrun`).
+  the stored iteration count, so a resumed loop has fewer rounds left. The
+  round is counted before its judge call, so a failed or stopped audit
+  counts too, and resuming from the last round runs one more round past
+  the cap (`F11.goal-cap-overrun`).
 - The loop reserves a run slot when it starts and keeps it until it ends,
   including judge calls between rounds; with `max_concurrent_runs` reached,
   `/goal` and `/goal/resume` are 429 and record nothing. Creating a

@@ -16,7 +16,7 @@ conversation's workspace and refuses folders outside it). They are header-only.
 
 Source: `openhands-agent-server/openhands/agent_server/workspace_router.py`, `openhands-agent-server/openhands/agent_server/vscode_router.py`, `openhands-agent-server/openhands/agent_server/vscode_service.py`, `openhands-agent-server/openhands/agent_server/runtime_router.py`, `openhands-agent-server/openhands/agent_server/dependencies.py`, `openhands-agent-server/openhands/agent_server/docker_runtime/routers.py`, `clients/typescript/src/client/vscode-client.ts`, `clients/typescript/src/workspace/remote-workspace.ts`
 
-Needs: `llm`
+Needs: `llm`, `git`
 
 Routes: `GET /api/conversations/{conversation_id}/workspace`,
 `GET /api/conversations/{conversation_id}/workspace/{file_path:path}`,
@@ -38,7 +38,8 @@ Routes: `GET /api/conversations/{conversation_id}/workspace`,
 - `F16.unknown-conversation`: an unknown conversation id is 404 `Conversation not found: <id>` on both routes, a non-UUID id is 422, and the dashless hex form of a real id works.
 - `F16.workspace-dir-missing`: a conversation whose workspace directory was removed answers 404 `Workspace directory does not exist`, and serves again once the directory is back.
 - `F16.deleted-conversation`: after `DELETE /api/conversations/{id}` its workspace is no longer served (404 `Conversation not found`), although the files stay on disk.
-- `F16.auth`: without a key or with a wrong one both routes are 401 (also for an unknown conversation); the header works, and so does the workspace cookie alone.
+- `F16.worktree-served`: a `worktree: true` conversation is served from its own git worktree: files written there and the committed content, not the source checkout's uncommitted edit or untracked file.
+- `F16.auth`: without a key or with a wrong one both routes are 401 (also for an unknown conversation); the header works, and so does the workspace cookie alone, but not a cookie with a wrong value.
 - `F16.agent-artifact`: an HTML file the agent writes with the file editor is served at the conversation's workspace URL, and the events socket shows the observation that created it.
 - `F16.restart`: after a server restart the same conversation's workspace is served again, with the header and with the cookie minted before the restart.
 - `F16.vscode-disabled`: with VS Code off (the launcher's default), both status routes answer `{"running": false, "enabled": false, "message": "VSCode is disabled in configuration"}` and both URL routes 503.
@@ -47,7 +48,8 @@ Routes: `GET /api/conversations/{conversation_id}/workspace`,
 - `F16.vscode-enabled-status`: with `enable_vscode` on and VS Code unable to start (its port taken, or no binary), both status routes answer `{"running": false, "enabled": true}` and the server keeps serving.
 - `F16.vscode-url-shape`: the URL is `http://localhost:<vscode_port>/?tkn=<first session key>&folder=workspace`; `base_url` replaces the origin, `workspace_dir` sets the folder, the scoped route defaults the folder to the conversation's `workspace.working_dir`, and `vscode_base_path` is inserted after the origin.
 - `F16.vscode-url-not-running`: a VS Code that is not running must not be advertised: `url` is null while `running` is false (known bug: a keyed server returns a URL carrying the session key).
-- `F16.vscode-url-no-key`: a server without session keys, with VS Code enabled but not running, answers `{"url": null}` on both URL routes.
+- `F16.vscode-url-no-key`: a server without session keys, with VS Code enabled but not running (no binary), answers `{"url": null}` on both URL routes.
+- `F16.vscode-url-after-init`: a deferred-init server that receives its session key through `POST /api/init`, with VS Code enabled but not running (no binary), answers `{"url": null}`.
 - `F16.vscode-folder-encoding`: the URL's `folder` parameter decodes back to the workspace path even when the path contains `&` or `#` (known bug: the value is not URL-encoded).
 - `F16.docker-root-cookie`: in Docker runtime mode the slashless workspace root accepts the workspace cookie like the slashed form does (known bug: it falls into the header-only proxy and answers 401).
 - `F16.vscode-running`: with the OpenVSCode Server binary installed and its port free, status reports `running: true` and the URL opens the editor (blocked on this machine: no binary).
@@ -80,22 +82,25 @@ Routes: `GET /api/conversations/{conversation_id}/workspace`,
   server, off in `launch` unless `--vscode`), `vscode_port`
   (`OH_VSCODE_PORT`, default 8001; `launch` picks a free one),
   `vscode_base_path` (`OH_VSCODE_BASE_PATH`), and the session keys (the first
-  is the VS Code token). `OH_CONVERSATION_RUNTIME=docker` swaps the workspace
-  file route for a proxy into the conversation's container.
+  is the VS Code token; on a deferred-init server they arrive with
+  `POST /api/init`, F03). `OH_CONVERSATION_RUNTIME=docker` swaps the workspace
+  file route for a proxy into the conversation's container. A conversation
+  started with `worktree: true` (F04) is served from its worktree.
 - Agent Canvas embeds workspace files in iframes after minting the cookie, and
   opens VS Code from the URL route (context only).
 - Recipes drive every route with `api`, use `api --jar` for the cookie,
   `restart --config-json` to turn VS Code on, an `http-sink` fixture to hold the
   VS Code port, a model conversation plus `ws start`/`ws stop` for the agent's
-  artifact, and second runs (`--no-auth --vscode`, Docker runtime) for the other
-  modes.
+  artifact, a `git-repo` fixture for the worktree, and second runs
+  (`--no-auth --vscode`, `--no-auth --deferred-init --vscode`, Docker runtime)
+  for the other modes.
 
 ## Driving it with control-agent-server
 
 Preconditions:
 
 - A run is live and exported (`launch --new`, no extra flags), `doctor` is ok,
-  `$DEEPSEEK_API_KEY` is set, and `jq` and `python3` are on `PATH`.
+  `$DEEPSEEK_API_KEY` is set, and `git`, `jq` and `python3` are on `PATH`.
 - The block below activates `deepseek-flash` (only `F16.agent-artifact` runs
   the model) and builds the run-owned workspace `$F/ws`: an `index.html`, a
   subdirectory with its own `index.html`, a directory without one, files of
@@ -155,12 +160,15 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$CID/workspace/style.css" --expect 200 --check-header content-type eq 'text/css; charset=utf-8' --save F16.content-types/css
   control-agent-server api GET "/api/conversations/$CID/workspace/data.json" --expect 200 --check-header content-type eq application/json --check qa eq f16
   control-agent-server api GET "/api/conversations/$CID/workspace/pic.svg" --expect 200 --check-header content-type eq image/svg+xml --save F16.content-types/svg
-  control-agent-server api GET "/api/conversations/$CID/workspace/img.png" --expect 200 --check-header content-type eq image/png
+  control-agent-server api GET "/api/conversations/$CID/workspace/img.png" --expect 200 --check-header content-type eq image/png \
+    --check-header content-disposition missing
   control-agent-server api GET "/api/conversations/$CID/workspace/sub/docs/notes.txt" --expect 200 --check-header content-type eq 'text/plain; charset=utf-8'
-  control-agent-server api GET "/api/conversations/$CID/workspace/blob.qaunknown" --expect 200 --check-header content-type eq application/octet-stream --save F16.content-types/unknown
+  control-agent-server api GET "/api/conversations/$CID/workspace/blob.qaunknown" --expect 200 --check-header content-type eq application/octet-stream \
+    --check-header content-disposition missing --save F16.content-types/unknown
   ```
   Each type matches its extension; the unknown extension falls back to
-  `application/octet-stream`. None of them carries `Content-Disposition`.
+  `application/octet-stream`. Even the image and the unknown type carry no
+  `Content-Disposition`, so nothing is forced into a download.
 - **Directory index and missing files (`F16.dir-index`).** A directory with
   an `index.html`, one without, a workspace root without one, and a missing
   file.
@@ -277,8 +285,29 @@ Preconditions:
   ```
   The workspace URL stops serving with the conversation (404), while the
   user-provided directory and its file stay on disk.
+- **Worktree conversation (`F16.worktree-served`).** Start a `worktree: true`
+  conversation on a git fixture whose checkout has an uncommitted edit to
+  `README.md` and an untracked `notes.txt`, then write a file into the
+  worktree.
+  ```sh
+  REPO=$(control-agent-server fixture git-repo --name qa-f16-repo --print-path)
+  WT=$(control-agent-server conversation start --no-run --tools none --no-autotitle --workspace "$REPO" --body-json '{"worktree": true}' --print-id)
+  WTD=$(control-agent-server api GET "/api/conversations/$WT" --field workspace.working_dir)
+  test "$WTD" != "$REPO" && test -f "$WTD/README.md" && test -f "$REPO/notes.txt"
+  printf '<p>qa-f16-wt</p>\n' > "$WTD/qa-f16-wt.html"
+  control-agent-server api GET "/api/conversations/$WT/workspace/qa-f16-wt.html" --expect 200 --check . contains qa-f16-wt --save F16.worktree-served/worktree-file
+  git -C "$REPO" show HEAD:README.md > "$F/readme-head.md"
+  if cmp -s "$F/readme-head.md" "$REPO/README.md"; then exit 1; fi
+  control-agent-server api GET "/api/conversations/$WT/workspace/README.md" --expect 200 --raw-out "$F/readme-served.md" --save F16.worktree-served/committed
+  cmp "$F/readme-served.md" "$F/readme-head.md"
+  control-agent-server api GET "/api/conversations/$WT/workspace/notes.txt" --expect 404 --check detail eq 'File not found' --save F16.worktree-served/untracked
+  ```
+  The working directory is the worktree, not the fixture; the file written
+  there is served; `README.md` comes back as committed (the checkout's edit
+  differs and is not served), and the untracked `notes.txt` is 404 although
+  it exists in the source checkout.
 - **Header or cookie (`F16.auth`).** No key, a wrong key, the header, then
-  the cookie alone in a browser-like jar.
+  the cookie alone in a browser-like jar, and a cookie with a wrong value.
   ```sh
   control-agent-server api GET "/api/conversations/$CID/workspace" --auth none --expect 401 --check detail eq Unauthorized --save F16.auth/no-key
   control-agent-server api GET "/api/conversations/$CID/workspace/data.json" --auth bad --expect 401 --check detail eq Unauthorized
@@ -287,10 +316,11 @@ Preconditions:
   control-agent-server api POST /api/auth/workspace-session --jar qa-f16 --expect 204 --check-header set-cookie contains oh_workspace_session_key=
   control-agent-server api GET "/api/conversations/$CID/workspace" --auth none --jar qa-f16 --expect 200 --check . contains qa-f16-root --save F16.auth/cookie-root
   control-agent-server api GET "/api/conversations/$CID/workspace/data.json" --auth none --jar qa-f16 --expect 200 --check qa eq f16 --save F16.auth/cookie-file
+  control-agent-server api GET "/api/conversations/$CID/workspace/data.json" --auth none --cookie 'oh_workspace_session_key=qa-f16-wrong' --expect 401 --save F16.auth/wrong-cookie
   ```
   Missing and wrong keys are 401 `Unauthorized` before the conversation is
   looked up; the header and the cookie alone (no header) each open both
-  routes.
+  routes, and a cookie whose value is not a session key is 401.
 - **The agent's own artifact (`F16.agent-artifact`).** A tiny model run
   writes an HTML file; the events socket is captured live and the workspace
   route serves the file.
@@ -407,12 +437,16 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$CID/vscode/url" --expect 200 --check url missing
   ```
   `running` is false, so the URL should be null, as the service intends
-  ("so no URL is advertised for a VSCode that never started",
-  `tests/agent_server/test_vscode_service.py`) and as a keyless server
-  answers (`F16.vscode-url-no-key`). A keyed server instead returns
+  (`VSCodeService.set_connection_token`: a server that is not running keeps
+  its token "so `get_vscode_url` doesn't advertise a server that isn't there
+  (for example, in images without VSCode)"), as a keyless server answers
+  (`F16.vscode-url-no-key`), and as a server that receives the very same key
+  through `POST /api/init` answers (`F16.vscode-url-after-init`). A server
+  booted with the key instead returns
   `http://localhost:<port>/?tkn=<session key>&folder=...`, because
   `get_vscode_service()` seeds the token from `session_api_keys[0]` before
   `start()` fails. Consumers that show an "open VS Code" link get a dead one.
+  Low severity: the URL only reaches callers that already hold the key.
 - **Folder with `&` and `#` (`F16.vscode-folder-encoding`), known bug.**
   Parse the scoped URL as a browser would, first for the normal workspace,
   then for a workspace named `qa f16&x=1#frag`.
@@ -441,9 +475,29 @@ Preconditions:
   control-agent-server api GET "/api/conversations/$NC/vscode/url" --run "$NK" --auth none --expect 200 --check url missing
   control-agent-server stop --run "$NK"
   ```
-  With no key there is no token until VS Code starts, so both URL routes
-  answer `{"url": null}` while `running` is false. The second run's evidence
-  lands under its own run directory.
+  With no key and no binary there is no token, so both URL routes answer
+  `{"url": null}` while `running` is false (see Gotchas for a machine with
+  the binary). The second run's evidence lands under its own run directory.
+- **Key delivered by init, no URL (`F16.vscode-url-after-init`).** A
+  deferred-init server booted without keys, VS Code enabled on the held port,
+  then initialized with a session key, as a warm pool does.
+  ```sh
+  DI=$(control-agent-server launch --new --no-auth --deferred-init --vscode --name f16-deferred --config-json '{"vscode_port": '"$VPORT"'}' --print-run)
+  trap 'control-agent-server stop --run "$DI" >/dev/null' EXIT
+  control-agent-server api POST /api/init --run "$DI" --auth none --header "X-Init-API-Key: $(cat "$DI/private/secret_key")" \
+    --json '{"session_api_keys": ["qa-f16-init-key"]}' --expect 200 --check state eq ready
+  control-agent-server api GET /api/vscode/url --run "$DI" --auth none --expect 401
+  control-agent-server api GET /api/vscode/status --run "$DI" --auth none --header 'X-Session-API-Key: qa-f16-init-key' --expect 200 \
+    --check enabled eq true --check running eq false --save F16.vscode-url-after-init/status
+  control-agent-server api GET /api/vscode/url --run "$DI" --auth none --header 'X-Session-API-Key: qa-f16-init-key' --expect 200 \
+    --check url missing --save F16.vscode-url-after-init/url
+  control-agent-server stop --run "$DI"
+  ```
+  The delivered key is enforced (401 without it) and status is
+  `{"running": false, "enabled": true}`. The URL is null: `/api/init` hands
+  the key to VS Code only when it is running (`set_connection_token`), so this
+  server and the keyed boot of `F16.vscode-url-not-running` answer
+  differently for the same configuration.
 - **Docker-mode root and the cookie (`F16.docker-root-cookie`), known bug.**
   A second server with `OH_CONVERSATION_RUNTIME=docker`. Translated: no
   Docker daemon is needed, because the route table and its auth groups are
@@ -455,12 +509,14 @@ Preconditions:
   Z=00000000-0000-4000-8000-0000000000f6
   control-agent-server api GET "/api/conversations/$Z/workspace/" --run "$DK" --expect 404 --check detail eq 'Conversation not found'
   control-agent-server api GET "/api/conversations/$Z/workspace" --run "$DK" --expect 404 --check detail eq 'Conversation not found'
+  control-agent-server api GET "/api/conversations/$Z/workspace/" --run "$DK" --auth none --expect 401
   control-agent-server api POST /api/auth/workspace-session --run "$DK" --jar qa-f16-docker --expect 204
   control-agent-server api GET "/api/conversations/$Z/workspace/" --run "$DK" --auth none --jar qa-f16-docker --expect 404 --save F16.docker-root-cookie/slash
   control-agent-server api GET "/api/conversations/$Z/workspace" --run "$DK" --auth none --jar qa-f16-docker --expect 404 --save F16.docker-root-cookie/slashless
   control-agent-server stop --run "$DK"
   ```
-  With the header both forms reach the Docker routes (404). With only the
+  With the header both forms reach the Docker routes (404); with nothing,
+  `workspace/` is 401. With only the
   cookie, `workspace/` passes the workspace auth group (404), but the
   slashless `workspace` answers 401: `docker_workspace_router` only defines
   `/{conversation_id}/workspace/{file_path:path}`, so the root falls into the
@@ -502,6 +558,13 @@ Preconditions:
   not running (see `F16.vscode-url-not-running`). When that bug is fixed, the
   shape is only observable with the binary installed; move those checks into
   `F16.vscode-running` at the same time.
+- `F16.vscode-url-no-key` and `F16.vscode-url-after-init` hold for a machine
+  without the OpenVSCode binary (like this one). With the binary, `start()`
+  mints a random token before its port check
+  (`tests/agent_server/test_vscode_service.py::test_start_port_unavailable`),
+  so a keyless or deferred server whose VS Code failed on the held port also
+  advertises a URL for a server that is not running; on such a machine those
+  two bullets fail on the same defect as `F16.vscode-url-not-running`.
 - The scoped VS Code routes run the conversation lookup and the
   `workspace_dir` guard before the enabled check, so their 404 and 422 answers
   do not depend on configuration. The global `/api/vscode/url` does not check

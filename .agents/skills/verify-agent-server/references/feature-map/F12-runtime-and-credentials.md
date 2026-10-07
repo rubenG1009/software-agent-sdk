@@ -509,10 +509,13 @@ control-agent-server api GET "/api/conversations/$R" --check execution_status eq
   control-agent-server state grep qa-f12-second --glob 'home/**/*' --expect-none
   control-agent-server state grep qa-f12-first --glob 'server/**/*' --expect-none
   control-agent-server state grep qa-f12-first --glob 'home/**/*' --expect-none
+  control-agent-server logs --grep "$A" --expect-min 1
+  control-agent-server logs --grep 'qa-f12-first|qa-f12-second' --expect-none
   ```
   The same URL re-authorizes the live binding (204, probed with the new
   header); another URL is 409 with the generic "too late" message; no header
-  value is written to the server's state or its `HOME`.
+  value is written to the server's state, its `HOME` or its log (which does
+  name the conversation).
 - **Required after a pause (`F12.binding-required-after-pause`).** Pause,
   then every way in.
   ```sh

@@ -36,7 +36,7 @@ Routes: `GET /api/agent-profiles`, `GET /api/agent-profiles/{name}`,
 - `F21.save-validation`: a missing `llm_profile_ref`, a field of the other kind or an unknown field, an invalid `acp_server` or `agent_kind`, a too-new `schema_version` and a non-object body are 422 with a reason, and nothing is stored.
 - `F21.name-rules`: names must match `^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$` on every name route and in `new_name`; 64 characters are accepted, 65, a leading dot or dash and a space are 422.
 - `F21.not-found`: GET, rename and stored materialize of an unknown name are 404 `Agent profile '<name>' not found`, activate of an unknown id or of a name is 404, and DELETE of an unknown name is 200.
-- `F21.activate`: `POST /api/agent-profiles/{profile_id}/activate` sets only `active_agent_profile_id` (`agent_settings_applied` false): the list and settings show the id and `agent_settings` is byte-for-byte unchanged.
+- `F21.activate`: `POST /api/agent-profiles/{profile_id}/activate` sets only `active_agent_profile_id` (`agent_settings_applied` false): the list and settings show the id and `agent_settings` is unchanged.
 - `F21.rename`: rename moves the profile to the new name with the same `id` and `revision`, keeps the active pointer, frees the old name (404), answers 200 "unchanged" for the same name and 409 when the target exists.
 - `F21.delete`: DELETE removes the profile file; deleting another profile leaves the pointer alone, deleting the active one clears it (and a non-empty store is not reseeded).
 - `F21.delete-active-acp-reset`: deleting the active profile while `agent_settings` are ACP resets them to OpenHands defaults and keeps the server's `mcp_config`.
@@ -632,6 +632,13 @@ printf -- '---\nname: qa-f21-skill\ndescription: QA F21 user skill\n---\nQA_F21_
   restart, but `GET /api/conversations/{id}` shows an empty
   `secret_registry` until the conversation's state is saved again (a run,
   a tag edit); the secret-scope bullet edits a tag first, as F08 does.
+- A profile file that is valid JSON but not a valid profile is listed
+  (summaries read raw JSON) yet is 400 on GET. Through other families'
+  routes the same profile is a deliberate 500 `Could not load agent
+  profile` on `POST /api/conversations`, and an unhandled 500 on
+  `GET /api/settings/secrets?agent_profile_id=` (F18), which also answers
+  500 instead of 503 while the store is busy: it loads the profile outside
+  the store error mapping.
 - 5xx responses (the busy 503) carry `detail: "Internal Server Error"` and
   the real message in `exception`; 4xx carry `detail` directly.
 - `--check` has no list projection, so recipes that look for a name in the

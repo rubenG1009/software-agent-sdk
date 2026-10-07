@@ -34,10 +34,11 @@ Routes: `GET /api/workspaces`, `POST /api/workspaces`, `DELETE /api/workspaces`,
 - `F17.lists-independent`: one path can be both a workspace and a parent; each delete route looks only at its own list (404 for a path that is only in the other) and deleting from one leaves the other.
 - `F17.persist-restart`: both lists, in order and with every field, read back identically after a server restart.
 - `F17.auth-required`: with a session key configured, all five routes answer 401 to a missing or wrong `X-Session-API-Key`, before validating the request, and change nothing.
-- `F17.concurrent-adds`: parallel `POST`s of different workspaces and parents all land, and parallel `DELETE`s of all of them all apply; no write is lost to a read-modify-write race.
+- `F17.concurrent-adds`: parallel `POST`s of different workspaces and parents to one server all land, and parallel `DELETE`s of all of them all apply.
+- `F17.shared-dir`: two servers on one persistence directory share the registry: each sees the other's writes on its next request (nothing is cached), and parallel adds and deletes split across both servers all land (the `.workspaces.lock` file lock serializes them across processes).
 - `F17.ts-client`: the TypeScript `WorkspacesClient` lists, adds and deletes workspaces and parents through these routes, and its delete of an unknown path rejects with the server's 404.
-- `F17.corrupted-file`: with an unparsable `workspaces.json`, all five routes answer 409 `Workspaces file is corrupted` and leave the file byte for byte; restoring the file restores the lists.
-- `F17.future-schema`: a valid document with a `schema_version` newer than 1, or one that is not an integer, or with a wrongly typed list, is 409 on reads and writes and is not overwritten.
+- `F17.corrupted-file`: with an unparsable or empty `workspaces.json`, all five routes answer 409 `Workspaces file is corrupted` and leave the file byte for byte; restoring the file restores the lists.
+- `F17.future-schema`: a valid document with a `schema_version` newer than 1, or one that is not an integer, or with a wrongly typed list, is 409 on reads and writes and is not overwritten; the same kind of hand-written document without `schema_version` is read, and the next write stamps `schema_version` 1.
 - `F17.io-error`: when the file cannot be read (a directory in its place), every route answers 500 with `exception` naming the failed step (`Failed to read workspaces`, `Failed to save workspaces`, `Failed to update workspaces`), writes nothing, and the registry works again once the file is back.
 - `F17.persistence-location`: without `OH_PERSISTENCE_DIR` the registry lives in `<conversations_path>/../.openhands/workspaces.json`, separate from the one under `OH_PERSISTENCE_DIR`.
 
@@ -59,7 +60,8 @@ Routes: `GET /api/workspaces`, `POST /api/workspaces`, `DELETE /api/workspaces`,
 - SDK: no Python consumer; `RemoteWorkspace` does not call these routes.
 - Configuration: `OH_PERSISTENCE_DIR` chooses the directory of
   `workspaces.json`; without it the file sits next to the conversations
-  directory (`F17.persistence-location`).
+  directory (`F17.persistence-location`). Servers pointed at one directory
+  share one registry (`F17.shared-dir`).
 - Agent Canvas: the workspace picker reads and edits these lists and offers
   each parent's subdirectories from `GET /api/file/search_subdirs` (context
   only; that route belongs to the files family and is used here as a second
@@ -84,7 +86,8 @@ Preconditions:
   program. `WS` is the stored file under the run's `OH_PERSISTENCE_DIR`.
 - Bullets run in order and build on each other's lists; each states the list
   it leaves. `F17.persist-restart` and `F17.persistence-location` restart the
-  run; the last one restores the launch environment.
+  run; the last one restores the launch environment. `F17.shared-dir`
+  launches a second server on this run's persistence directory and stops it.
 
   ```sh
   F17="$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f17"
@@ -430,6 +433,55 @@ Preconditions:
   ```
   Every parallel call succeeds (each `wait` returns its exit status); after
   the adds the lists hold 13 and 10 entries, after the deletes 5 and 2 again.
+  One process runs these handlers one at a time (they are `async` and block
+  the event loop while they read and write the file), so this bullet proves
+  that parallel callers lose nothing on one server, not that the file lock
+  works; `F17.shared-dir` puts a second process on the same file.
+- **Two servers, one file (`F17.shared-dir`).** A second server whose
+  `OH_PERSISTENCE_DIR` is this run's, then parallel writes split across both.
+  ```sh
+  SHARED=$(control-agent-server launch --new --name f17-shared --print-run \
+    --env OH_PERSISTENCE_DIR="$AGENT_SERVER_VERIFY_RUN/home/.openhands")
+  trap 'control-agent-server stop --run "$SHARED" >/dev/null' EXIT
+  BEFORE=$(control-agent-server api GET /api/workspaces --field .)
+  control-agent-server api GET /api/workspaces --run "$SHARED" --expect 200 --check . eq "$BEFORE"
+  control-agent-server api POST /api/workspaces --run "$SHARED" --expect 200 --check workspaces len-eq 6 \
+    --json '{"workspaces": [{"id": "/qa-f17/from-b", "name": "qa-f17-from-b", "path": "/qa-f17/from-b"}]}'
+  control-agent-server api GET /api/workspaces --expect 200 --check workspaces len-eq 6 \
+    --check workspaces.5.path eq /qa-f17/from-b --save F17.shared-dir/a-reads-b
+  control-agent-server api DELETE /api/workspaces --query path=/qa-f17/from-b --expect 200 --check deleted eq true
+  control-agent-server api GET /api/workspaces --run "$SHARED" --expect 200 --check . eq "$BEFORE"
+  PIDS=""
+  for i in 1 2 3 4 5 6 7 8; do
+    (control-agent-server api POST /api/workspaces --quiet --expect 200 \
+      --json "{\"workspaces\": [{\"id\": \"/qa-f17/via-a-$i\", \"name\": \"qa-f17-via-a-$i\", \"path\": \"/qa-f17/via-a-$i\"}]}" > "$F17/shared-a-$i.json") &
+    PIDS="$PIDS $!"
+    (control-agent-server api POST /api/workspaces --run "$SHARED" --quiet --expect 200 \
+      --json "{\"workspaces\": [{\"id\": \"/qa-f17/via-b-$i\", \"name\": \"qa-f17-via-b-$i\", \"path\": \"/qa-f17/via-b-$i\"}]}" > "$F17/shared-b-$i.json") &
+    PIDS="$PIDS $!"
+  done
+  for p in $PIDS; do wait "$p"; done
+  control-agent-server api GET /api/workspaces --check workspaces len-eq 21 --check workspaces contains /qa-f17/via-a-8 \
+    --check workspaces contains /qa-f17/via-b-8 --save F17.shared-dir/after-adds
+  control-agent-server api GET /api/workspaces --run "$SHARED" --check workspaces len-eq 21
+  PIDS=""
+  for i in 1 2 3 4 5 6 7 8; do
+    (control-agent-server api DELETE /api/workspaces --run "$SHARED" --quiet --query "path=/qa-f17/via-a-$i" --expect 200 > "$F17/shared-del-a-$i.json") &
+    PIDS="$PIDS $!"
+    (control-agent-server api DELETE /api/workspaces --quiet --query "path=/qa-f17/via-b-$i" --expect 200 > "$F17/shared-del-b-$i.json") &
+    PIDS="$PIDS $!"
+  done
+  for p in $PIDS; do wait "$p"; done
+  control-agent-server api GET /api/workspaces --expect 200 --check . eq "$BEFORE" --save F17.shared-dir/after-deletes
+  control-agent-server stop --run "$SHARED"
+  ```
+  The second server lists this run's registry as is; an entry it adds is
+  listed here on the next `GET`, and one deleted here is gone there. All
+  sixteen parallel adds (eight through each server) land, each server's list
+  has 21 entries, and deleting every entry through the other server returns
+  the registry to `BEFORE`. A lost update would show as a missing entry after
+  the adds or a leftover one after the deletes. The second server is stopped
+  at the end of the bullet (and by the `trap` if a check fails).
 - **TypeScript client (`F17.ts-client`).** Every `WorkspacesClient` method
   from the built client.
   ```sh
@@ -456,12 +508,18 @@ Preconditions:
     --json '{"parents": [{"id": "/qa-f17/c", "name": "qa-f17-c", "path": "/qa-f17/c"}]}'
   control-agent-server api DELETE /api/workspaces/parents --query "path=$PLAIN" --expect 409 --check detail eq 'Workspaces file is corrupted'
   printf '{"workspaces": [qa-f17-corrupt\n' | cmp - "$WS"
+  : > "$WS"
+  control-agent-server api GET /api/workspaces --expect 409 --check detail eq 'Workspaces file is corrupted' --save F17.corrupted-file/empty-get
+  control-agent-server api POST /api/workspaces --expect 409 \
+    --json '{"workspaces": [{"id": "/qa-f17/c", "name": "qa-f17-c", "path": "/qa-f17/c"}]}'
+  test -f "$WS" && test ! -s "$WS"
   cp "$F17/workspaces.good.json" "$WS"
   control-agent-server api GET /api/workspaces --expect 200 --check workspaces len-eq 5 --check workspaces.0.path eq "$REPO" \
     --check workspaceParents.1.path eq "$PLAIN" --save F17.corrupted-file/restored
   ```
   All five routes are 409 `Workspaces file is corrupted`, `cmp` finds the
-  broken bytes untouched, and the restored file lists everything again.
+  broken bytes untouched, a zero-byte file is refused the same way and stays
+  empty, and the restored file lists everything again.
 - **Future or invalid schema (`F17.future-schema`).** Valid JSON the server
   must not interpret: a newer `schema_version`, a string `schema_version`, a
   wrongly typed list.
@@ -481,11 +539,22 @@ Preconditions:
   control-agent-server api GET /api/workspaces --expect 409 --check detail eq 'Workspaces file is corrupted'
   control-agent-server api DELETE /api/workspaces --query "path=$REPO" --expect 409
   printf '{"schema_version": 1, "workspaces": "qa-f17-not-a-list"}\n' | cmp - "$WS"
+  control-agent-server logs --grep 'Failed to load workspaces' --expect-min 7
+  printf '{"workspaces": [{"id": "/qa-f17/legacy", "name": "qa-f17-legacy", "path": "/qa-f17/legacy"}]}\n' > "$WS"
+  control-agent-server api GET /api/workspaces --expect 200 --check workspaces len-eq 1 --check workspaces.0.path eq /qa-f17/legacy \
+    --check workspaceParents len-eq 0 --save F17.future-schema/unversioned
+  control-agent-server api DELETE /api/workspaces --query path=/qa-f17/legacy --expect 200 --check deleted eq true
+  control-agent-server state cat home/.openhands/workspaces.json --check schema_version eq 1 --check workspaces len-eq 0
   cp "$F17/workspaces.good.json" "$WS"
   control-agent-server api GET /api/workspaces --expect 200 --check workspaces len-eq 5 --save F17.future-schema/restored
   ```
   Each variant is 409 on reads and writes and `cmp` shows the file was not
-  rewritten; restoring the backup restores the lists.
+  rewritten. Each of the seven refused loads logs `Failed to load workspaces`
+  with a traceback, so `doctor`'s optional `log-tracebacks` check reports
+  them after this bullet (without failing `doctor`). The positive control, a
+  hand-written document without `schema_version`, is read normally, and the
+  delete stamps `schema_version` 1 on it; restoring the backup restores the
+  lists.
 - **Unreadable file (`F17.io-error`).** Put an empty directory where the file
   was (permissions would not stop a root server), call every route, then put
   the file back.
@@ -501,17 +570,19 @@ Preconditions:
     --json '{"parents": [{"id": "/qa-f17/io", "name": "qa-f17-io", "path": "/qa-f17/io"}]}'
   control-agent-server api DELETE /api/workspaces/parents --query "path=$PLAIN" --expect 500 --check exception contains 'Failed to update workspaces'
   control-agent-server state ls 'home/.openhands/workspaces.tmp*' --expect-count 0
+  control-agent-server logs --grep 'Cannot access workspaces file' --expect-min 5
   rmdir "$WS"
   mv "$F17/workspaces.moved.json" "$WS"
   control-agent-server api GET /api/workspaces --expect 200 --check workspaces len-eq 5 --check workspaces.0.path eq "$REPO" \
     --check . not-contains /qa-f17/io --save F17.io-error/restored
   ```
   Every route is 500 with `detail` `Internal Server Error` (the server's 5xx
-  rewrite) and the step in `exception`; `rmdir` succeeds because nothing was
-  written into the directory, no temporary file is left next to it, and the
-  restored file lists everything again. The server log carries a traceback
-  per 500, so `doctor`'s optional `log-tracebacks` check fails (without
-  failing `doctor`) after this bullet.
+  rewrite) and the step in `exception` (`500: Failed to read workspaces`);
+  `rmdir` succeeds because nothing was written into the directory, no
+  temporary file is left next to it, and the restored file lists everything
+  again. The log has one `Cannot access workspaces file: [Errno 21] Is a
+  directory` ERROR line per call and no traceback: the 500 is a deliberate
+  `HTTPException`, which the server logs without a stack.
 - **Location without `OH_PERSISTENCE_DIR` (`F17.persistence-location`).**
   Restart with the variable empty, write, then restore the launch
   environment.
@@ -539,13 +610,24 @@ Preconditions:
   life of the process: changing `OH_PERSISTENCE_DIR` needs a restart.
   Without it, the location follows `conversations_path`, which for the
   default relative `workspace/conversations` is `./workspace/.openhands`
-  under the server's working directory.
-- Every write route rewrites the whole file, also when nothing changed: an
-  idempotent re-add and a `DELETE` that answers 404 both save the document
+  under the server's working directory. The contents are not cached: every
+  request reads the file, so a hand edit or another server on the same
+  directory shows up on the next call (`F17.shared-dir`).
+- Every write route rewrites the whole file, also when nothing changed
+  (`FileWorkspacesStore.update` saves whatever the route's `apply` returns):
+  an idempotent re-add and a `DELETE` that answers 404 both save the document
   again, and on a fresh persistence directory a 404 `DELETE` creates
-  `workspaces.json` (empty lists) and `.workspaces.lock`. Only `GET` and the
-  401/422 rejections leave the disk alone, which is why `F17.list-empty`
-  must run before any other call.
+  `workspaces.json` (empty lists) and `.workspaces.lock`. On a directory the
+  server cannot write (reproduced with `chattr +i`, standing in for a
+  read-only mount), `GET` still answers 200 but a `DELETE` of an unknown path
+  is 500 `Failed to update workspaces` instead of 404, and re-posting a
+  registered path is 500 instead of 200. A low-severity product quirk, not
+  a map bullet, because reaching it needs root and `chattr`. Only `GET` and
+  the refusals (401, 422, the 409 of a corrupted or too-new document and the
+  500 of an unreadable file) leave the disk alone, which is why
+  `F17.list-empty` must run before any other call. A zero-byte
+  `workspaces.json` counts as corrupted: the registry stays 409 until
+  someone fixes or removes the file.
 - Matching is exact string comparison on `path`: no normalization, no
   existence check, relative paths allowed. `/x` and `/x/` are separate
   entries, and the `id` is not unique-checked (two entries may share an id
@@ -568,4 +650,7 @@ Preconditions:
   init family). They emit no WebSocket events and no webhooks, so the only
   second views are `GET /api/workspaces` and the file.
 - The TypeScript client checks `/server_info` before every call and throws
-  `AgentServerVersionError` for servers older than 1.23.0.
+  `AgentServerVersionError` for servers older than 1.23.0. `F17.ts-client`
+  imports the built `clients/typescript/dist` and builds it only when it is
+  missing: after changing `clients/typescript/src`, run `npm run build`
+  there first or the bullet tests the old client.

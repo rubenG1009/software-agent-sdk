@@ -1260,6 +1260,16 @@ def parse_sse(text: str) -> list[Any]:
     return frames
 
 
+def parse_headers(items: Sequence[str] | None) -> dict[str, str]:
+    headers: dict[str, str] = {}
+    for item in items or []:
+        if ":" not in item:
+            usage_error("--header must look like 'Name: value'")
+        name, value = item.split(":", 1)
+        headers[name.strip()] = value.strip()
+    return headers
+
+
 def frame_kind(frame: Any) -> str:
     if isinstance(frame, dict):
         return str(frame.get("kind") or frame.get("type") or "?")
@@ -1282,9 +1292,10 @@ def ws_session(
     until: dict[str, str],
     count: int | None,
     sink: Callable[[dict[str, Any]], None],
+    extra_headers: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     params = dict(query)
-    headers: dict[str, str] = {}
+    headers: dict[str, str] = dict(extra_headers or {})
     key = run.session_key
     if auth == "query" and key:
         params["session_api_key"] = key
@@ -1379,6 +1390,7 @@ def cmd_ws_listen(args: argparse.Namespace) -> dict[str, Any]:
         until=parse_kv(args.until, "--until"),
         count=args.count,
         sink=sink,
+        extra_headers=parse_headers(args.header),
     )
     if out_file:
         out_file.close()
@@ -1439,6 +1451,8 @@ def cmd_ws_start(args: argparse.Namespace) -> dict[str, Any]:
         command += ["--query", item]
     for message in args.send or []:
         command += ["--send", message]
+    for header in args.header or []:
+        command += ["--header", header]
     log = (run.dir / "captures" / f"{name}.log").open("ab")
     process = subprocess.Popen(
         command,
@@ -4278,7 +4292,9 @@ under <run>/evidence/FEATURE/NAME.json.""",
   {CLI} ws start /sockets/events/<id> --name live
   {CLI} conversation send <id> --text 'say hi'
   {CLI} ws stop live --expect-kind MessageEvent
-  {CLI} ws listen /sockets/bash-events --auth bad --expect-close 4001""",
+  {CLI} ws listen /sockets/bash-events --auth bad --expect-close 4001
+  {CLI} ws listen /app-backends/qa-backend/ws --auth none --header 'Origin: http://127.0.0.1:8000' \
+      --header "Cookie: oh_app_backend_session=$TOKEN" --send hello --count 1""",
     )
     add_run_flag(ws)
     ws_sub = ws.add_subparsers(dest="ws_command", metavar="<listen|start|read|stop>")
@@ -4304,6 +4320,12 @@ under <run>/evidence/FEATURE/NAME.json.""",
         default="first-frame",
     )
     wl.add_argument("--query", "-q", action="append", metavar="K=V")
+    wl.add_argument(
+        "--header",
+        action="append",
+        metavar="'Name: value'",
+        help="extra handshake header",
+    )
     wl.add_argument(
         "--send",
         action="append",
@@ -4343,6 +4365,7 @@ under <run>/evidence/FEATURE/NAME.json.""",
     )
     wst.add_argument("--query", "-q", action="append", metavar="K=V")
     wst.add_argument("--send", action="append", metavar="JSON")
+    wst.add_argument("--header", action="append", metavar="'Name: value'")
     wst.add_argument("--duration", type=float, default=600)
     wst.add_argument(
         "--settle", type=float, default=1.0, help="seconds to wait after connecting"

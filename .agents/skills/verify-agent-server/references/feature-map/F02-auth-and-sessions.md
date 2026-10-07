@@ -27,7 +27,7 @@ Routes: `POST /api/auth/workspace-session`, `DELETE /api/auth/workspace-session`
 - `F02.ws-auth-timeout`: a socket that sends no first frame is closed with 4001 after about 10 seconds.
 - `F02.ws-legacy-key`: the deprecated `session_api_key` query parameter and `X-Session-API-Key` header still open a socket, and a redundant auth frame sent after them is ignored.
 - `F02.ws-legacy-reject`: a wrong legacy key rejects the handshake itself (HTTP 403, no close frame), even when a correct first frame would follow.
-- `F02.workspace-session-mint`: `POST /api/auth/workspace-session` answers 204 with an HttpOnly `oh_workspace_session_key` cookie on `Path=/api/conversations`, `SameSite=none; Secure; Partitioned` on a loopback host, and 401 without a valid header.
+- `F02.workspace-session-mint`: `POST /api/auth/workspace-session` answers 204 with an HttpOnly `oh_workspace_session_key` cookie on `Path=/api/conversations`, `SameSite=none; Secure; Partitioned` on a loopback host, and 401 with no cookie without a valid header (the cookie itself cannot mint another).
 - `F02.workspace-session-secure-context`: over plain HTTP to a non-loopback host the cookie has no `Secure` or `Partitioned`; `X-Forwarded-Proto: https` adds both.
 - `F02.workspace-cookie-access`: the minted cookie alone (a cookie jar, no header) loads workspace files, also after a restart; a bogus cookie or no credential gets 401.
 - `F02.workspace-session-delete`: `DELETE /api/auth/workspace-session` answers 204 with a `Max-Age=0` cookie on the same path, which drops the cookie from the jar so workspace files are 401 again; 401 without a header.
@@ -43,6 +43,7 @@ Routes: `POST /api/auth/workspace-session`, `DELETE /api/auth/workspace-session`
 - `F02.keys-json-form`: keys given as a JSON list (`OH_SESSION_API_KEYS='[...]'`) authenticate and, like the indexed form, stay out of the environment of commands the server runs.
 - `F02.empty-key-rejected`: an empty configured key (`OH_SESSION_API_KEYS_0=`) never authenticates anyone, on HTTP or on WebSockets.
 - `F02.workspace-cookie-root-path`: behind a path prefix (`OH_WEB_URL` with a path), a cookie minted through the prefixed URL is sent back by the browser to the prefixed workspace file URLs.
+- `F02.workspace-session-ipv6-loopback`: a mint reached through the IPv6 loopback (`Host: [::1]:PORT`) gets `Secure; Partitioned`, like `localhost` and `127.0.0.1`.
 
 ## How to get to it (agent POV)
 
@@ -168,7 +169,8 @@ Preconditions:
   type, missing key, not an object, and a wrong key for a conversation that
   does not exist.
   ```sh
-  control-agent-server ws listen "/sockets/events/$CID" --auth bad --expect-close 4001 --duration 10 --save F02.ws-first-frame-reject/events-wrong-key
+  control-agent-server ws listen "/sockets/events/$CID" --auth bad --expect-close 4001 --duration 10 --save F02.ws-first-frame-reject/events-wrong-key \
+    | jq -e '.close.reason == "Authentication failed"'
   control-agent-server ws listen "/sockets/session/$CID" --auth bad --expect-close 4001 --duration 10
   control-agent-server ws listen /sockets/bash-events --auth bad --expect-close 4001 --duration 10
   control-agent-server ws listen /sockets/bash-events --auth none --send '{"type":"hello","session_api_key":"x"}' --expect-close 4001 --duration 10 --save F02.ws-first-frame-reject/wrong-type
@@ -187,20 +189,28 @@ Preconditions:
   T0=$SECONDS
   control-agent-server ws listen /sockets/bash-events --auth none --expect-close 4001 --duration 25 --save F02.ws-auth-timeout/silent
   test $((SECONDS - T0)) -ge 9
+  test $((SECONDS - T0)) -le 16
   ```
-  The close arrives with 4001 after about 10 seconds, not at once.
+  The close arrives with 4001 after about 10 seconds, not at once and not
+  at the end of the 25-second capture.
 - **Deprecated query and header keys (`F02.ws-legacy-key`).** Authenticate
-  with `?session_api_key=` or the header, then send a redundant auth frame
-  with a wrong key before a command.
+  with `?session_api_key=` or the header and send a command as the very
+  first frame, then send a redundant auth frame with a wrong key before a
+  command.
   ```sh
-  control-agent-server ws listen /sockets/bash-events --auth query --expect-open --duration 3 --save F02.ws-legacy-key/query
-  control-agent-server ws listen /sockets/bash-events --auth header --expect-open --duration 3 --save F02.ws-legacy-key/header
+  control-agent-server ws listen /sockets/bash-events --auth query --send '{"command":"echo qa-f02-query"}' --until-kind BashOutput --duration 20 --save F02.ws-legacy-key/query
+  control-agent-server ws listen /sockets/bash-events --auth header --send '{"command":"echo qa-f02-header"}' --until-kind BashOutput --duration 20 --save F02.ws-legacy-key/header
   control-agent-server ws listen /sockets/bash-events --auth query --send '{"type":"auth","session_api_key":"qa-f02-ignored"}' --send '{"command":"echo qa-f02-legacy"}' --until-kind BashOutput --duration 20 --save F02.ws-legacy-key/redundant-frame
   control-agent-server ws listen "/sockets/events/$CID" --auth header --until-kind ConversationStateUpdateEvent --duration 15
   ```
-  Both legacy forms keep the socket open; the redundant auth frame is
+  Both legacy forms authenticate at the handshake: a command sent as the
+  first frame runs (were the legacy key ignored, that frame would be read as
+  a failed auth frame and closed with 4001). The redundant auth frame is
   skipped (its key is never checked) and the command still runs. The server
-  logs `session_api_key passed via query param or header is deprecated`.
+  logs `session_api_key passed via query param or header is deprecated`
+  (wrapped over several log lines). A socket that merely stays open for a
+  few seconds proves nothing: an unauthenticated one waits up to 10 seconds
+  for its auth frame.
 - **Wrong legacy key fails the handshake (`F02.ws-legacy-reject`).** A wrong
   query key, and a wrong query key followed by a correct first frame.
   ```sh
@@ -212,16 +222,23 @@ Preconditions:
   4001 close frame, and a present legacy key is never overridden by a
   correct first frame.
 - **Mint the workspace cookie (`F02.workspace-session-mint`).** Mint with
-  the key, without it, with a wrong one, and with an ignored body.
+  the key, without it, with a wrong one, with only the cookie, and with an
+  ignored body.
   ```sh
   control-agent-server api POST /api/auth/workspace-session --expect 204 --save F02.workspace-session-mint/loopback \
     | jq -e '.response.headers["set-cookie"] | startswith("oh_workspace_session_key=") and contains("HttpOnly") and contains("Max-Age=315360000") and contains("Path=/api/conversations") and contains("SameSite=none") and contains("Secure") and contains("Partitioned")'
-  control-agent-server api POST /api/auth/workspace-session --auth none --expect 401 --check detail eq Unauthorized --save F02.workspace-session-mint/no-key
-  control-agent-server api POST /api/auth/workspace-session --auth bad --expect 401 --check detail eq Unauthorized
+  control-agent-server api POST /api/auth/workspace-session --auth none --expect 401 --check detail eq Unauthorized --save F02.workspace-session-mint/no-key \
+    | jq -e '.response.headers["set-cookie"] == null'
+  control-agent-server api POST /api/auth/workspace-session --auth bad --expect 401 --check detail eq Unauthorized | jq -e '.response.headers["set-cookie"] == null'
+  KEY=$(cat "$AGENT_SERVER_VERIFY_RUN/private/session_api_key")
+  control-agent-server api POST /api/auth/workspace-session --auth none --cookie "oh_workspace_session_key=$KEY" --expect 401 --save F02.workspace-session-mint/cookie-only
+  unset KEY
   control-agent-server api POST /api/auth/workspace-session --json '{"ignored": true}' --expect 204
   ```
   The cookie value is the session key itself (the CLI prints it redacted);
-  the 401 responses set no cookie.
+  the 401 responses set no cookie. The route sits in the header-only group,
+  so a cross-site request that carries only the cookie cannot mint or renew
+  it.
 - **Secure context (`F02.workspace-session-secure-context`).** Mint as if
   the browser had reached the server by a remote name over plain HTTP, then
   behind a TLS-terminating proxy.
@@ -258,7 +275,7 @@ Preconditions:
     | jq -e '.response.headers["set-cookie"] | startswith("oh_workspace_session_key=\"\"") and contains("Max-Age=0") and contains("Path=/api/conversations") and contains("HttpOnly")'
   control-agent-server api DELETE /api/auth/workspace-session --auth none --expect 401 --check detail eq Unauthorized
   control-agent-server exec --save F02.workspace-session-delete/jar-delete -- bash "$F02/jar.sh" DELETE /api/auth/workspace-session key 204 'has:max-age=0'
-  ! grep -q oh_workspace_session_key "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f02-cookies.txt"
+  if grep -q oh_workspace_session_key "$AGENT_SERVER_VERIFY_RUN/fixtures/qa-f02-cookies.txt"; then echo 'FAIL: cookie still in the jar' >&2; exit 1; fi
   control-agent-server exec --save F02.workspace-session-delete/file-after-delete -- bash "$F02/jar.sh" GET "/api/conversations/$CID/workspace/qa-f02.html" nokey 401
   ```
   The clearing cookie has an empty value, `Max-Age=0` and the same path, so
@@ -279,6 +296,7 @@ Preconditions:
   restart with a new one, and try the old key everywhere.
   ```sh
   control-agent-server exec -- bash "$F02/jar.sh" POST /api/auth/workspace-session key 204
+  control-agent-server exec -- bash "$F02/jar.sh" GET "/api/conversations/$CID/workspace/qa-f02.html" nokey 200 'has:qa-f02-workspace-file'
   control-agent-server restart --rotate-key
   OLD_KEY=$(cat "$AGENT_SERVER_VERIFY_RUN/private/previous_session_api_key")
   control-agent-server api GET /api/conversations/count --auth previous --expect 401 --save F02.rotate-key/old-key
@@ -290,18 +308,25 @@ Preconditions:
   control-agent-server doctor
   ```
   The old key is 401 on HTTP and 4001 on the socket, the cookie minted with
-  it no longer opens files, and the new key reads the same conversation.
+  it (which opened the file just before the restart) no longer opens files,
+  and the new key reads the same conversation.
   `doctor` confirms the rotated-out key is rejected.
 - **Keys stay out of commands (`F02.keys-hidden-from-commands`).** Run `env`
   through the server (the global bash route) with two indexed keys and a
   secret key configured.
   ```sh
+  KEY=$(cat "$AGENT_SERVER_VERIFY_RUN/private/session_api_key")
+  SECRET=$(cat "$AGENT_SERVER_VERIFY_RUN/private/secret_key")
   control-agent-server api POST /api/bash/execute_bash_command --json '{"command":"env"}' --expect 200 \
     --check exit_code eq 0 --check stdout contains PATH= \
     --check stdout not-contains OH_SESSION_API_KEYS --check stdout not-contains SESSION_API_KEY \
-    --check stdout not-contains OH_SECRET_KEY --check stdout not-contains qa-f02-second-key --save F02.keys-hidden-from-commands/env
+    --check stdout not-contains OH_SECRET_KEY --check stdout not-contains qa-f02-second-key \
+    --check stdout not-contains "$KEY" --check stdout not-contains "$SECRET" --save F02.keys-hidden-from-commands/env
+  unset KEY SECRET
   ```
-  The command's environment has none of the key variables or values.
+  The command's environment has none of the key variables or values (the
+  run's current key, the second key from `F02.multiple-keys` and the secret
+  key are all set on the server process at this point).
 - **Default CORS origins (`F02.cors-default-origins`).** Preflights from
   local origins, a foreign origin and `null`, then a simple request from the
   foreign origin.
@@ -389,13 +414,15 @@ Preconditions:
   DORMANT=$(control-agent-server launch --new --deferred-init --name f02-dormant --print-run)
   trap 'control-agent-server stop --run "$DORMANT" >/dev/null' EXIT
   control-agent-server api GET /api/init --run "$DORMANT" --auth none --expect 200 --check state eq dormant
-  control-agent-server api POST /api/auth/workspace-session --run "$DORMANT" --expect 503 --save F02.workspace-session-dormant/mint
+  control-agent-server api POST /api/auth/workspace-session --run "$DORMANT" --expect 503 --save F02.workspace-session-dormant/mint \
+    | jq -e '.response.headers["set-cookie"] == null'
   control-agent-server api DELETE /api/auth/workspace-session --run "$DORMANT" --expect 503 --save F02.workspace-session-dormant/delete
   control-agent-server api POST /api/auth/workspace-session --run "$DORMANT" --auth none --expect 401
+  control-agent-server api DELETE /api/auth/workspace-session --run "$DORMANT" --auth none --expect 401
   control-agent-server stop --run "$DORMANT"
   ```
-  With the launch key both routes are 503; without a key the auth check runs
-  first and answers 401. The 5xx handler rewrites the body (`detail` becomes
+  With the launch key both routes are 503 and no cookie is minted; without a
+  key the auth check runs first and both answer 401. The 5xx handler rewrites the body (`detail` becomes
   `Internal Server Error`, the reason moves to `exception`), so clients rely
   on the status code.
 - **JSON-list keys leak into commands (`F02.keys-json-form`), known bug.** A
@@ -420,12 +447,16 @@ Preconditions:
   trap 'control-agent-server stop --run "$EMPTYKEY" >/dev/null' EXIT
   control-agent-server api GET /api/conversations/count --run "$EMPTYKEY" --auth none --expect 401
   control-agent-server api GET /api/conversations/count --run "$EMPTYKEY" --auth none --header 'X-Session-API-Key: ' --expect 401
+  control-agent-server ws listen /sockets/bash-events --run "$EMPTYKEY" --auth none --send '{"type":"auth","session_api_key":"qa-f02-nonempty"}' --expect-close 4001 --duration 10
   control-agent-server ws listen /sockets/bash-events --run "$EMPTYKEY" --auth none --send '{"type":"auth","session_api_key":""}' --expect-close 4001 --duration 10 --save F02.empty-key-rejected/ws-empty-key
   ```
-  HTTP is closed to everyone (an empty header counts as missing). Expected:
-  the socket closes with 4001 as well. Today an auth frame with an empty key
-  is accepted and the bash socket runs commands, because `""` is in
-  `session_api_keys`.
+  HTTP is closed to everyone (an empty header counts as missing) and a
+  non-empty wrong key is refused on the socket, so authentication is on.
+  Expected: the empty key closes with 4001 as well. Today an auth frame with
+  an empty key (and likewise `?session_api_key=`) is accepted and the bash
+  socket runs any command sent next, because `""` is in `session_api_keys`.
+  The same list counts as "keys configured" for the bind address, so without
+  `--host` such a server listens on `0.0.0.0`.
 - **Cookie path ignores a prefix (`F02.workspace-cookie-root-path`), known bug.**
   A second server with `OH_WEB_URL=http://127.0.0.1/qa-f02-prefix`, used
   through its prefixed URLs like a browser behind a path-prefix proxy.
@@ -433,15 +464,39 @@ Preconditions:
   PREFIXED=$(control-agent-server launch --new --name f02-prefix --env OH_WEB_URL=http://127.0.0.1/qa-f02-prefix --print-run)
   trap 'control-agent-server stop --run "$PREFIXED" >/dev/null' EXIT
   PCID=$(control-agent-server conversation start --run "$PREFIXED" --no-run --tools none --no-autotitle --workspace "$F02/workspace" --print-id)
+  control-agent-server api GET /openapi.json --run "$PREFIXED" --auth none --max-chars 200 --check servers.0.url eq /qa-f02-prefix
   control-agent-server exec --run "$PREFIXED" -- bash "$F02/jar.sh" GET "/qa-f02-prefix/api/conversations/$PCID/workspace/qa-f02.html" key 200 'has:qa-f02-workspace-file'
   control-agent-server exec --run "$PREFIXED" --save F02.workspace-cookie-root-path/mint -- bash "$F02/jar.sh" POST /qa-f02-prefix/api/auth/workspace-session key 204
+  grep -q oh_workspace_session_key "$PREFIXED/fixtures/qa-f02-cookies.txt"
+  control-agent-server exec --run "$PREFIXED" -- bash "$F02/jar.sh" GET "/api/conversations/$PCID/workspace/qa-f02.html" nokey 200 'has:qa-f02-workspace-file'
   control-agent-server exec --run "$PREFIXED" --save F02.workspace-cookie-root-path/file-with-cookie -- bash "$F02/jar.sh" GET "/qa-f02-prefix/api/conversations/$PCID/workspace/qa-f02.html" nokey 200 'has:qa-f02-workspace-file'
   ```
-  The server serves the file under the prefix (and advertises
-  `servers: [{"url": "/qa-f02-prefix"}]` in its OpenAPI document). Expected:
-  the cookie minted there comes back on the prefixed file URL. Today it is
-  scoped to `Path=/api/conversations` regardless of the root path, so the
-  jar does not send it and the file is 401.
+  The server advertises `servers: [{"url": "/qa-f02-prefix"}]` and serves
+  the file under the prefix; the minted cookie lands in the second run's jar
+  and is a valid credential (the unprefixed URL, which a prefix-stripping
+  proxy would forward, loads the file with it). Expected: the cookie also
+  comes back on the prefixed file URL, the one the browser actually uses.
+  Today it is scoped to `Path=/api/conversations` regardless of the root
+  path (unlike `CORSDispatcher`, which strips `root_path`), so the jar does
+  not send it and the file is 401. The TypeScript client's
+  `startWorkspaceSession()` returns `${host}/api/conversations/{id}/workspace/`,
+  which carries the prefix whenever `host` does.
+- **IPv6 loopback is not a secure context (`F02.workspace-session-ipv6-loopback`), known bug.**
+  Mint as a browser at `http://[::1]:PORT` would, and compare with the
+  bracketed forwarded form.
+  ```sh
+  control-agent-server api POST /api/auth/workspace-session --header 'Host: qa-remote.example' --header 'X-Forwarded-Host: [::1]:3000' --expect 204 \
+    | jq -e '.response.headers["set-cookie"] | contains("Secure") and contains("Partitioned")'
+  control-agent-server api POST /api/auth/workspace-session --header 'Host: [::1]:8000' --expect 204 --save F02.workspace-session-ipv6-loopback/ipv6-host \
+    | jq -e '.response.headers["set-cookie"] | contains("SameSite=none") and contains("Secure") and contains("Partitioned")'
+  ```
+  `X-Forwarded-Host: [::1]:3000` is recognized as loopback. Expected: the
+  `Host: [::1]:8000` mint gets `Secure; Partitioned` too, since `::1` is in
+  the server's loopback list. Today it gets `SameSite=none` without
+  `Secure`, which browsers reject, so workspace embeds fail for a client at
+  `http://[::1]:PORT`: `_request_is_secure_context` handles brackets only in
+  `X-Forwarded-Host`, and splits the unbracketed `request.url.hostname`
+  (`::1`) on `:`, leaving an empty host.
 
 ## Gotchas
 

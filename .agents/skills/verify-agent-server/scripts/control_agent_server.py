@@ -53,7 +53,7 @@ HOME_ENV = "AGENT_SERVER_VERIFY_HOME"
 SESSION_HEADER = "X-Session-API-Key"
 FAMILY_FILE_RE = re.compile(r"^F(\d{2})-[a-z0-9-]+\.md$")
 SUB_FEATURE_RE = re.compile(r"^- `(F\d{2}\.[a-z0-9][a-z0-9-]*)`: \S")
-RESULTS = ("pass", "fail", "blocked", "not-run")
+RESULTS = ("pass", "fail", "xfail", "xpass", "blocked", "not-run")
 FERNET_TOKEN = re.compile(r"gAAAAA[A-Za-z0-9_\-]{40,}={0,2}")
 
 # Environment forwarded from the caller into a launched server. Everything
@@ -137,6 +137,17 @@ def emit(payload: dict[str, Any]) -> None:
 
 def now_iso() -> str:
     return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def parse_pairs(items: Sequence[str] | None, what: str) -> list[tuple[str, str]]:
+    """KEY=VALUE pairs in order, repeated keys kept (ids=A&ids=B)."""
+    pairs = []
+    for item in items or []:
+        if "=" not in item:
+            usage_error(f"{what} must look like KEY=VALUE, got {item!r}")
+        key, value = item.split("=", 1)
+        pairs.append((key, value))
+    return pairs
 
 
 def parse_kv(items: Sequence[str] | None, what: str) -> dict[str, str]:
@@ -314,6 +325,8 @@ def auth_headers(run: Run, mode: str = "header") -> dict[str, str]:
         return {}
     if mode == "bad":
         return {SESSION_HEADER: "qa-wrong-session-key"}
+    if mode == "init":
+        return {"X-Init-API-Key": (run.private / "secret_key").read_text().strip()}
     if mode == "bearer":
         return {"Authorization": f"Bearer {key}"}
     if mode == "bearer-bad":
@@ -397,7 +410,7 @@ def api_call(
     path: str,
     *,
     body: Any = None,
-    params: dict[str, str] | None = None,
+    params: list[tuple[str, str]] | dict[str, str] | None = None,
     auth: str = "header",
     headers: dict[str, str] | None = None,
     files: dict[str, tuple[str, bytes]] | None = None,
@@ -407,7 +420,9 @@ def api_call(
     request_headers = auth_headers(run, auth)
     request_headers.update(headers or {})
     with http_client(timeout) as client:
-        kwargs: dict[str, Any] = {"params": params, "headers": request_headers}
+        kwargs: dict[str, Any] = {"headers": request_headers}
+        if params:
+            kwargs["params"] = params
         if files or form:
             kwargs["files"] = files
             kwargs["data"] = form
@@ -445,6 +460,18 @@ def checkout_python(checkout: Path) -> list[str]:
     )
 
 
+def tmux_dir(run: Run) -> str:
+    """A short per-run tmux dir: sockets live at <dir>/tmux-<uid>/<name>, and a
+    Unix socket path must stay under 108 bytes, which <run>/tmux overflows."""
+    path = run.data.get("tmux_dir")
+    if not path:
+        path = f"/tmp/ohv-{secrets.token_hex(3)}"
+        run.data["tmux_dir"] = path
+        run.save()
+    Path(path).mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def server_env(
     run: Run, extra: dict[str, str], pass_env: Sequence[str]
 ) -> dict[str, str]:
@@ -460,7 +487,7 @@ def server_env(
             "HOME": str(home),
             "OH_PERSISTENCE_DIR": str(home / ".openhands"),
             "OPENHANDS_AGENT_SERVER_CONFIG_PATH": str(run.private / "config.json"),
-            "TMUX_TMPDIR": str(run.dir / "tmux"),
+            "TMUX_TMPDIR": tmux_dir(run),
             "GIT_CONFIG_GLOBAL": str(home / ".gitconfig"),
             "UV_CACHE_DIR": env.get("UV_CACHE_DIR", str(real_home / ".cache" / "uv")),
             "NPM_CONFIG_CACHE": str(real_home / ".npm"),
@@ -475,8 +502,9 @@ def server_env(
     key = run.session_key
     if key:
         env["OH_SESSION_API_KEYS_0"] = key
-    secret_key = (run.private / "secret_key").read_text().strip()
-    env["OH_SECRET_KEY"] = secret_key
+    secret_file = run.private / "secret_key"
+    if secret_file.exists():
+        env["OH_SECRET_KEY"] = secret_file.read_text().strip()
     env.update(extra)
     return env
 
@@ -636,7 +664,8 @@ def cmd_launch(args: argparse.Namespace) -> dict[str, Any]:
     }
     if not args.no_auth:
         (run.private / "session_api_key").write_text(secrets.token_urlsafe(24))
-    (run.private / "secret_key").write_text(secrets.token_urlsafe(32))
+    if not args.no_secret_key:
+        (run.private / "secret_key").write_text(secrets.token_urlsafe(32))
     run.register_secrets()
     write_git_identity(run.dir / "home")
     overrides = json.loads(args.config_json) if args.config_json else {}
@@ -773,6 +802,8 @@ def cmd_stop(args: argparse.Namespace) -> dict[str, Any]:
     result["orphans_reaped"] = reap_orphans(run)
     run.data["stopped_at"] = now_iso()
     run.save()
+    if run.data.get("tmux_dir"):
+        shutil.rmtree(run.data["tmux_dir"], ignore_errors=True)
     if args.purge_private:
         for sub in ("private", "home", "server", "tmux", "worktrees", "fixtures"):
             shutil.rmtree(run.dir / sub, ignore_errors=True)
@@ -797,6 +828,13 @@ def cmd_restart(args: argparse.Namespace) -> dict[str, Any]:
         (run.private / "previous_session_api_key").write_text(old)
         (run.private / "session_api_key").write_text(secrets.token_urlsafe(24))
         run.register_secrets()
+    if args.restore_secret_key:
+        previous = run.private / "previous_secret_key"
+        if not previous.exists():
+            usage_error("--restore-secret-key needs an earlier --rotate-secret-key")
+        current = (run.private / "secret_key").read_text()
+        (run.private / "secret_key").write_text(previous.read_text())
+        previous.write_text(current)
     if args.rotate_secret_key:
         old_secret = (run.private / "secret_key").read_text()
         (run.private / "previous_secret_key").write_text(old_secret)
@@ -851,8 +889,11 @@ def cmd_logs(args: argparse.Namespace) -> dict[str, Any]:
     if args.grep:
         pattern = re.compile(args.grep)
         lines = [line for line in lines if pattern.search(line)]
+    ok = args.expect_min is None or len(lines) >= args.expect_min
+    if args.expect_none:
+        ok = not lines
     return {
-        "ok": True,
+        "ok": ok,
         "log": str(run.log_path),
         "lines": [REDACT.text(line) for line in lines[-args.tail :]],
         "total_matching": len(lines),
@@ -1026,6 +1067,54 @@ def _dormant(run: Run) -> bool:
 # --------------------------------------------------------------------------
 
 
+class CookieJar:
+    """A small browser-like jar: Path and Max-Age/Expires honored, Secure
+    cookies sent to loopback (as browsers treat localhost), stored per run."""
+
+    def __init__(self, run: Run, name: str) -> None:
+        self.path = run.fixtures / "jars" / f"{name}.json"
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.cookies: dict[str, dict[str, Any]] = (
+            json.loads(self.path.read_text()) if self.path.exists() else {}
+        )
+
+    def header_for(self, request_path: str) -> str:
+        now = time.time()
+        pairs = [
+            f"{name}={c['value']}"
+            for name, c in self.cookies.items()
+            if request_path.split("?")[0].startswith(c["path"])
+            and (c["expires"] is None or c["expires"] > now)
+        ]
+        return "; ".join(pairs)
+
+    def store(self, set_cookies: list[str], request_path: str) -> None:
+        for header in set_cookies:
+            parts = [p.strip() for p in header.split(";")]
+            name, _, value = parts[0].partition("=")
+            attrs = {k.lower(): v for k, _, v in (p.partition("=") for p in parts[1:])}
+            expires: float | None = None
+            if "max-age" in attrs:
+                expires = time.time() + int(attrs["max-age"] or 0)
+            path = attrs.get("path") or request_path.rsplit("/", 1)[0] or "/"
+            if expires is not None and expires <= time.time():
+                self.cookies.pop(name, None)
+            else:
+                self.cookies[name] = {
+                    "value": value,
+                    "path": path,
+                    "expires": expires,
+                    "attributes": sorted(attrs),
+                }
+        self.path.write_text(json.dumps(self.cookies, indent=2))
+
+    def summary(self) -> dict[str, Any]:
+        return {
+            name: {"path": c["path"], "attributes": c["attributes"]}
+            for name, c in self.cookies.items()
+        }
+
+
 def read_body(args: argparse.Namespace) -> Any:
     sources = [s for s in (args.json, args.json_file, args.stdin) if s]
     if len(sources) > 1:
@@ -1144,8 +1233,17 @@ def cmd_api(args: argparse.Namespace) -> dict[str, Any]:
             usage_error("--header must look like 'Name: value'")
         key, value = item.split(":", 1)
         headers[key.strip()] = value.strip()
+    jar = CookieJar(run, args.jar) if args.jar else None
+    if jar:
+        jar_cookie = jar.header_for(args.path)
+        if jar_cookie:
+            headers["Cookie"] = "; ".join(
+                filter(None, [headers.get("Cookie"), jar_cookie])
+            )
     if args.cookie:
-        headers["Cookie"] = args.cookie
+        headers["Cookie"] = "; ".join(
+            filter(None, [headers.get("Cookie"), args.cookie])
+        )
     started = time.monotonic()
     attempts = 0
     while True:
@@ -1155,7 +1253,7 @@ def cmd_api(args: argparse.Namespace) -> dict[str, Any]:
             args.method,
             args.path,
             body=body,
-            params=parse_kv(args.query, "--query"),
+            params=parse_pairs(args.query, "--query"),
             auth=args.auth,
             headers=headers,
             files=files or None,
@@ -1176,7 +1274,7 @@ def cmd_api(args: argparse.Namespace) -> dict[str, Any]:
         "request": {
             "method": args.method.upper(),
             "path": args.path,
-            "query": parse_kv(args.query, "--query"),
+            "query": parse_pairs(args.query, "--query"),
             "auth": args.auth,
             "body": body,
             "files": sorted(files),
@@ -1208,13 +1306,31 @@ def cmd_api(args: argparse.Namespace) -> dict[str, Any]:
     }
     ok = status_matches(response.status_code, args.expect)
     checks = [evaluate_check(decoded, spec) for spec in args.check or []]
+    lowered = {k.lower(): v for k, v in response.headers.items()}
+    for spec in args.check_header or []:
+        name = spec[0].lower()
+        verdict = evaluate_check({name: lowered.get(name)}, [name, *spec[1:]])
+        checks.append({**verdict, "check": "header " + verdict["check"]})
     if any(not c["ok"] for c in checks):
         ok = False
+    if args.all_headers:
+        exchange["response"]["headers"] = dict(response.headers.items())
     result: dict[str, Any] = {"ok": ok, "status": response.status_code, **exchange}
     if checks:
         result["checks"] = checks
     if args.until_ok:
         result["attempts"] = attempts
+    if args.expect_max_ms is not None and elapsed > args.expect_max_ms:
+        result["ok"] = ok = False
+        result["hint"] = f"took {elapsed} ms, limit {args.expect_max_ms} ms"
+    if args.quiet:
+        result["request"] = {k: v for k, v in result["request"].items() if k != "body"}
+        result["response"] = {
+            k: v for k, v in result["response"].items() if k != "body"
+        }
+    if jar:
+        jar.store(response.headers.get_list("set-cookie"), args.path)
+        result["jar"] = jar.summary()
     if args.raw_out:
         Path(args.raw_out).write_bytes(response.content)
         result["raw_out"] = args.raw_out
@@ -1260,6 +1376,13 @@ def parse_sse(text: str) -> list[Any]:
     return frames
 
 
+def maybe_json(text: str) -> Any:
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
 def parse_headers(items: Sequence[str] | None) -> dict[str, str]:
     headers: dict[str, str] = {}
     for item in items or []:
@@ -1270,10 +1393,39 @@ def parse_headers(items: Sequence[str] | None) -> dict[str, str]:
     return headers
 
 
+WS_AUTH_MODES = [
+    "first-frame",
+    "query",
+    "header",
+    "none",
+    "bad",
+    "bad-query",
+    "bad-header",
+    "previous",
+    "key",
+]
+SESSION_FRAME_TYPES = {
+    "sync",
+    "durable",
+    "transient",
+    "item_started",
+    "delta",
+    "item_aborted",
+    "error",
+}
+
+
 def frame_kind(frame: Any) -> str:
-    if isinstance(frame, dict):
-        return str(frame.get("kind") or frame.get("type") or "?")
-    return type(frame).__name__
+    """Event kind for /sockets/events frames; envelope type for session frames
+    (`durable:MessageEvent` for durable and transient event envelopes)."""
+    if not isinstance(frame, dict):
+        return type(frame).__name__
+    if frame.get("type") in SESSION_FRAME_TYPES:
+        event = frame.get("event")
+        if isinstance(event, dict) and event.get("kind"):
+            return f"{frame['type']}:{event['kind']}"
+        return str(frame["type"])
+    return str(frame.get("kind") or frame.get("type") or "?")
 
 
 def frame_matches(frame: Any, conditions: dict[str, str]) -> bool:
@@ -1293,14 +1445,25 @@ def ws_session(
     count: int | None,
     sink: Callable[[dict[str, Any]], None],
     extra_headers: dict[str, str] | None = None,
+    explicit_key: str | None = None,
 ) -> dict[str, Any]:
     params = dict(query)
     headers: dict[str, str] = dict(extra_headers or {})
     key = run.session_key
+    if auth == "previous":
+        key = auth_headers(run, "previous")[SESSION_HEADER]
+        auth = "first-frame"
+    if auth == "key":
+        key = explicit_key or ""
+        auth = "first-frame"
     if auth == "query" and key:
         params["session_api_key"] = key
     if auth == "header" and key:
         headers[SESSION_HEADER] = key
+    if auth == "bad-query":
+        params["session_api_key"] = "qa-wrong-key"
+    if auth == "bad-header":
+        headers[SESSION_HEADER] = "qa-wrong-key"
     url = ws_url(run, path) + (f"?{urlencode(params)}" if params else "")
     frames = 0
     kinds: dict[str, int] = {}
@@ -1315,14 +1478,14 @@ def ws_session(
             additional_headers=headers,
             max_size=None,
         ) as ws:
-            if auth == "first-frame" and key:
+            if auth == "first-frame" and (key or explicit_key is not None):
                 ws.send(json.dumps({"type": "auth", "session_api_key": key}))
             elif auth == "bad":
                 ws.send(json.dumps({"type": "auth", "session_api_key": "qa-wrong-key"}))
             for message in sends:
                 ws.send(message)
                 sink(
-                    {"direction": "sent", "at": now_iso(), "frame": json.loads(message)}
+                    {"direction": "sent", "at": now_iso(), "frame": maybe_json(message)}
                 )
             while time.monotonic() < deadline:
                 try:
@@ -1379,19 +1542,39 @@ def cmd_ws_listen(args: argparse.Namespace) -> dict[str, Any]:
             out_file.write(json.dumps(REDACT.obj(entry), default=str) + "\n")
             out_file.flush()
 
-    summary = ws_session(
-        run,
-        args.path,
-        auth=args.auth,
-        query=parse_kv(args.query, "--query"),
-        sends=args.send or [],
-        duration=args.duration,
-        until_kind=args.until_kind,
-        until=parse_kv(args.until, "--until"),
-        count=args.count,
-        sink=sink,
-        extra_headers=parse_headers(args.header),
-    )
+    def stop_on_term(signum: int, frame: Any) -> None:
+        del signum, frame
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, stop_on_term)
+    try:
+        summary = ws_session(
+            run,
+            args.path,
+            auth=args.auth,
+            query=parse_kv(args.query, "--query"),
+            sends=args.send or [],
+            duration=args.duration,
+            until_kind=args.until_kind,
+            until=parse_kv(args.until, "--until"),
+            count=args.count,
+            sink=sink,
+            extra_headers=parse_headers(args.header),
+            explicit_key=args.key,
+        )
+        sink(
+            {
+                "direction": "closed" if summary["stopped"] == "closed" else "ended",
+                "at": now_iso(),
+                "stopped": summary["stopped"],
+                "close": summary["close"],
+            }
+        )
+    except KeyboardInterrupt:
+        sink({"direction": "stopped", "at": now_iso()})
+        if out_file:
+            out_file.close()
+        raise SystemExit(0) from None
     if out_file:
         out_file.close()
     result: dict[str, Any] = {"ok": True, "path": args.path, **summary}
@@ -1401,12 +1584,27 @@ def cmd_ws_listen(args: argparse.Namespace) -> dict[str, Any]:
     if args.expect_close is not None:
         code = (summary.get("close") or {}).get("code")
         result["ok"] = code == args.expect_close
+    if args.expect_reject is not None:
+        rejected = (summary.get("close") or {}).get("http_status")
+        result["ok"] = rejected == args.expect_reject
     if args.expect_open:
         result["ok"] = (
             result["ok"]
             and summary["stopped"] != "closed"
             and summary["stopped"] != "error"
         )
+    received = [e for e in captured if e["direction"] == "received"]
+    for kind in args.expect_kind or []:
+        if not any(e.get("kind") == kind for e in received):
+            result["ok"] = False
+            result.setdefault("missing_kinds", []).append(kind)
+    for kind in args.expect_no_kind or []:
+        if any(e.get("kind") == kind for e in received):
+            result["ok"] = False
+            result.setdefault("unexpected_kinds", []).append(kind)
+    if args.expect_frames is not None and len(received) != args.expect_frames:
+        result["ok"] = False
+        result["hint"] = f"expected {args.expect_frames} frames, got {len(received)}"
     if args.save:
         result["saved"] = str(
             save_evidence(run, args.save, {"summary": summary, "frames": captured})
@@ -1453,6 +1651,8 @@ def cmd_ws_start(args: argparse.Namespace) -> dict[str, Any]:
         command += ["--send", message]
     for header in args.header or []:
         command += ["--header", header]
+    if args.key is not None:
+        command += ["--key", args.key]
     log = (run.dir / "captures" / f"{name}.log").open("ab")
     process = subprocess.Popen(
         command,
@@ -1504,6 +1704,7 @@ def summarize_capture(
     show: int,
 ) -> dict[str, Any]:
     received = [e for e in entries if e.get("direction") == "received"]
+    closed = [e for e in entries if e.get("direction") == "closed"]
     kinds: dict[str, int] = {}
     for e in received:
         kinds[str(e.get("kind"))] = kinds.get(str(e.get("kind")), 0) + 1
@@ -1518,6 +1719,7 @@ def summarize_capture(
     return {
         "frames": len(received),
         "kinds": kinds,
+        "close": closed[-1].get("close") if closed else None,
         "matching": len(selected),
         "frames_shown": [
             {"kind": e.get("kind"), "frame": _brief(e.get("frame"))}
@@ -1526,21 +1728,41 @@ def summarize_capture(
     }
 
 
+def capture_verdict(args: argparse.Namespace, summary: dict[str, Any]) -> bool:
+    ok = True
+    if args.expect_kind:
+        ok = args.expect_kind in summary["kinds"]
+    filtered = bool(args.kinds or args.contains)
+    if args.expect_none:
+        ok = ok and summary["matching"] == 0
+    elif args.expect_min is not None:
+        ok = ok and summary["matching"] >= args.expect_min
+    elif filtered and args.expect_kind is None:
+        ok = ok and summary["matching"] > 0
+    close = summary.get("close")
+    if args.expect_close is not None:
+        ok = ok and (close or {}).get("code") == args.expect_close
+    if args.expect_open:
+        ok = ok and close is None
+    return ok
+
+
 def cmd_ws_read(args: argparse.Namespace) -> dict[str, Any]:
     run = resolve_run(args.run, require_alive=False)
     entry = _capture_entry(run, args.name)
-    entries = _read_capture(Path(entry["out"]))
-    summary = summarize_capture(entries, args.kinds, args.contains, args.show)
+    deadline = time.monotonic() + args.wait
+    while True:
+        entries = _read_capture(Path(entry["out"]))
+        summary = summarize_capture(entries, args.kinds, args.contains, args.show)
+        if capture_verdict(args, summary) or time.monotonic() >= deadline:
+            break
+        time.sleep(0.25)
     result: dict[str, Any] = {
-        "ok": True,
+        "ok": capture_verdict(args, summary),
         "capture": args.name,
         "out": entry["out"],
         **summary,
     }
-    if args.expect_kind:
-        result["ok"] = args.expect_kind in summary["kinds"]
-    if args.contains and args.expect_kind is None:
-        result["ok"] = summary["matching"] > 0
     if args.save:
         result["saved"] = str(
             save_evidence(run, args.save, {"capture": args.name, "frames": entries})
@@ -1551,6 +1773,15 @@ def cmd_ws_read(args: argparse.Namespace) -> dict[str, Any]:
 def cmd_ws_stop(args: argparse.Namespace) -> dict[str, Any]:
     run = resolve_run(args.run, require_alive=False)
     entry = _capture_entry(run, args.name)
+    deadline = time.monotonic() + args.wait
+    while args.wait and time.monotonic() < deadline:
+        summary = summarize_capture(
+            _read_capture(Path(entry["out"])), args.kinds, args.contains, 0
+        )
+        if capture_verdict(args, summary):
+            break
+        time.sleep(0.25)
+    args.wait = 0
     if not entry.get("stopped_at"):
         stop_process_group(int(entry["pgid"]), grace=3)
         entry["stopped_at"] = now_iso()
@@ -1738,6 +1969,17 @@ def build_start_body(run: Run, args: argparse.Namespace) -> dict[str, Any]:
     ):
         if args.agent_profile:
             body["agent_profile_id"] = resolve_agent_profile_id(run, args.agent_profile)
+        elif args.placeholder_agent:
+            body["agent_settings"] = {
+                "agent_kind": "openhands",
+                "llm": {
+                    "model": "openai/qa-placeholder",
+                    "api_key": "qa-placeholder",
+                    "base_url": "http://127.0.0.1:9/v1",
+                    "num_retries": 0,
+                },
+                "tools": [],
+            }
         else:
             settings = api_json(
                 run, "GET", "/api/settings", headers={"X-Expose-Secrets": "encrypted"}
@@ -1762,18 +2004,20 @@ def build_start_body(run: Run, args: argparse.Namespace) -> dict[str, Any]:
         working_dir.mkdir(parents=True)
     if "workspace" not in body or args.workspace:
         body["workspace"] = {"kind": "LocalWorkspace", "working_dir": str(working_dir)}
-    if args.prompt:
+    if args.prompt and not args.no_run:
+        # The server always runs initial_message; --no-run sends the prompt
+        # afterwards with POST /events run=false instead.
         body["initial_message"] = {
             "role": "user",
             "content": [{"type": "text", "text": args.prompt}],
-            "run": not args.no_run,
+            "run": True,
         }
-    if args.title:
-        body.setdefault("tags", {})
     for key, value in parse_kv(args.tag, "--tag").items():
         body.setdefault("tags", {})[key] = value
     if args.max_iterations:
         body["max_iterations"] = args.max_iterations
+    if args.llm_json and isinstance(body.get("agent_settings"), dict):
+        body["agent_settings"].setdefault("llm", {}).update(json.loads(args.llm_json))
     if args.tools is not None and isinstance(body.get("agent_settings"), dict):
         names = [t for t in args.tools.split(",") if t and t != "none"]
         body["agent_settings"]["tools"] = [{"name": name} for name in names]
@@ -1820,6 +2064,24 @@ def cmd_conversation_start(args: argparse.Namespace) -> dict[str, Any]:
             data={"status": response.status_code, "body": decoded},
         )
     conversation_id = str(dig(decoded, "id"))
+    if args.prompt and args.no_run:
+        api_json(
+            run,
+            "POST",
+            f"/api/conversations/{conversation_id}/events",
+            body={
+                "role": "user",
+                "content": [{"type": "text", "text": args.prompt}],
+                "run": False,
+            },
+        )
+    if args.title:
+        api_json(
+            run,
+            "PATCH",
+            f"/api/conversations/{conversation_id}",
+            body={"title": args.title},
+        )
     result: dict[str, Any] = {
         "ok": True,
         "id": conversation_id,
@@ -1923,9 +2185,13 @@ def cmd_conversation_events(args: argparse.Namespace) -> dict[str, Any]:
         else [],
     }
     if args.expect_kind:
-        result["ok"] = args.expect_kind in kinds
-    if args.contains and args.expect_kind is None:
+        result["ok"] = any(e.get("kind") == args.expect_kind for e in selected)
+    elif args.contains:
         result["ok"] = bool(selected)
+    if args.expect_count is not None:
+        result["ok"] = result["ok"] and len(selected) == args.expect_count
+    if args.expect_min is not None:
+        result["ok"] = result["ok"] and len(selected) >= args.expect_min
     if args.save:
         result["saved"] = str(save_evidence(run, args.save, {"events": selected}))
     return result
@@ -2549,8 +2815,13 @@ def cmd_state_ls(args: argparse.Namespace) -> dict[str, Any]:
     if args.conversation:
         pattern = f"{conversation_dir(args.conversation)}/{pattern}"
     files = sorted(p for p in run.dir.glob(pattern) if p.is_file())
+    ok = True
+    if args.expect_count is not None:
+        ok = len(files) == args.expect_count
+    if args.expect_min is not None:
+        ok = ok and len(files) >= args.expect_min
     return {
-        "ok": True,
+        "ok": ok,
         "pattern": args.pattern,
         "count": len(files),
         "files": [
@@ -2584,6 +2855,8 @@ def cmd_state_cat(args: argparse.Namespace) -> dict[str, Any]:
     if args.contains is not None and args.contains not in raw:
         ok = False
     if args.not_contains is not None and args.not_contains in raw:
+        ok = False
+    if args.mode and oct(target.stat().st_mode & 0o777)[2:] != args.mode.lstrip("0"):
         ok = False
     result: dict[str, Any] = {
         "ok": ok,
@@ -2880,9 +3153,11 @@ def cmd_exec(args: argparse.Namespace) -> dict[str, Any]:
         "stdout_tail": stdout[-args.tail_chars :],
         "stderr_tail": stderr[-args.tail_chars :],
     }
-    if args.expect_output and args.expect_output not in stdout + stderr:
+    missing = [t for t in args.expect_output or [] if t not in stdout + stderr]
+    present = [t for t in args.reject_output or [] if t in stdout + stderr]
+    if missing or present:
         result["ok"] = False
-        result["hint"] = f"output does not contain {args.expect_output!r}"
+        result["hint"] = {"missing": missing, "unexpected": present}
     if args.save:
         result["saved"] = str(save_evidence(run, args.save, transcript))
     return result
@@ -2952,7 +3227,7 @@ def cmd_evidence_report(args: argparse.Namespace) -> dict[str, Any]:
     )
     rows = [row | {"run_dir": str(r.dir)} for r in runs for row in read_ledger(r)]
     latest = latest_rows(rows)
-    order = {"fail": 0, "blocked": 1, "not-run": 2, "pass": 3}
+    order = {"fail": 0, "xpass": 1, "blocked": 2, "not-run": 3, "xfail": 4, "pass": 5}
     ordered = sorted(
         latest.values(), key=lambda r: (order.get(r["result"], 9), r["feature"])
     )
@@ -3092,7 +3367,9 @@ def runs_home_ensure() -> Path:
 
 
 ROUTE_LINE_RE = re.compile(r"`(GET|POST|PUT|PATCH|DELETE|WS) (/[^`\s]*)`")
-API_CMD_RE = re.compile(rf"{CLI} api (GET|POST|PUT|PATCH|DELETE) '?\"?(/[^\s'\"`]*)")
+API_CMD_RE = re.compile(
+    rf"{CLI} api (GET|POST|PUT|PATCH|DELETE|OPTIONS|HEAD) '?\"?(/[^\s'\"`]*)"
+)
 WS_CMD_RE = re.compile(rf"{CLI} ws (?:listen|start) '?\"?(/[^\s'\"`]*)")
 CMD_START_RE = re.compile(rf"(?:^|[`\s($|&;]){CLI} ")
 
@@ -3143,10 +3420,13 @@ def template_regex(template: str) -> re.Pattern[str]:
     return re.compile(f"^{pattern}/?$")
 
 
+SHELL_EXPANSION_RE = re.compile(r"\$\{[^}]*\}")
+
+
 def match_route(
     method: str, concrete: str, routes: Sequence[dict[str, Any]]
 ) -> dict[str, Any] | None:
-    concrete = concrete.split("?", 1)[0]
+    concrete = SHELL_EXPANSION_RE.sub("X", concrete.split("?", 1)[0])
     candidates = [
         r
         for r in routes
@@ -3185,16 +3465,34 @@ def driven_routes(path: Path, routes: Sequence[dict[str, Any]]) -> set[tuple[str
     return driven
 
 
+REDIRECT_RE = re.compile(r"^\d?>>?(&\d)?$|^\d?<$")
+REDIRECT_WITH_TARGET_RE = re.compile(r"^\d?>>?\S+$")
+
+
+def drop_redirections(argv: list[str]) -> list[str]:
+    """Remove shell redirections (`> file`, `2>&1`, `>/dev/null`) from argv."""
+    kept: list[str] = []
+    skip = False
+    for token in argv:
+        if skip:
+            skip = False
+        elif REDIRECT_RE.match(token):
+            skip = not token.endswith(("&1", "&2"))
+        elif not REDIRECT_WITH_TARGET_RE.match(token):
+            kept.append(token)
+    return kept
+
+
 def validate_command(command: str) -> str | None:
     """Parse one recipe command with the real parser, without executing it."""
     text = command.strip()
     if text.endswith("`"):
         text = text[:-1]
     try:
-        argv = shlex.split(text.replace("<", "").replace(">", ""))
+        argv = shlex.split(re.sub(r"<([A-Za-z_][\w-]*)>", r"\1", text))
     except ValueError as exc:
         return f"unparseable: {exc}"
-    argv = argv[1:]
+    argv = drop_redirections(argv[1:])
     parser = build_parser()
     stderr = io.StringIO()
     try:
@@ -3261,6 +3559,26 @@ def check_family(path: Path, routes: Sequence[dict[str, Any]] | None) -> list[st
         )
         if error:
             problems.append(f"Launch: flags do not parse: {error}")
+    in_driving = False
+    in_fence = False
+    for number, line in enumerate(lines, 1):
+        if line.startswith("## "):
+            in_driving = line == f"## Driving it with {CLI}"
+        if not in_driving:
+            continue
+        if FENCE_RE.match(line):
+            in_fence = not in_fence
+            continue
+        if in_fence and line.strip().startswith("! "):
+            problems.append(
+                f"line {number}: `! cmd` never fails under set -e; use "
+                "`if cmd; then exit 1; fi` or a --check/--expect assertion"
+            )
+        if not in_fence and line.startswith("- **") and line.count("**") < 2:
+            problems.append(
+                f"line {number}: bold bullet label is not closed on its own line; "
+                "map run would merge this bullet into the previous one"
+            )
     for bullet in driving_bullets(path):
         blocked = "blocked" in bullet.label.lower()
         if (
@@ -3818,7 +4136,7 @@ def replay_family(run: Run, path: Path, args: argparse.Namespace) -> dict[str, A
                 append_ledger(
                     run,
                     feature,
-                    "pass" if code == 0 else "fail",
+                    status,
                     f"map run {path.name}: {bullet.label}",
                     "every command in the bullet exits 0 (its --expect/--check assertions hold)",
                     f"exit {code}",
@@ -4079,6 +4397,11 @@ secret key all private to the run. Without --new, an already-live run
     p.add_argument("--name", help="label appended to the run directory name")
     p.add_argument("--no-auth", action="store_true", help="no session API key")
     p.add_argument(
+        "--no-secret-key",
+        action="store_true",
+        help="no OH_SECRET_KEY (with --no-auth: no cipher at all)",
+    )
+    p.add_argument(
         "--deferred-init", action="store_true", help="start dormant (OH_DEFERRED_INIT)"
     )
     p.add_argument(
@@ -4164,6 +4487,11 @@ secret key all private to the run. Without --new, an already-live run
         help="drop earlier --config-json/--env overrides (launch flags too) before applying new ones",
     )
     p.add_argument(
+        "--restore-secret-key",
+        action="store_true",
+        help="swap back to the secret key before the last --rotate-secret-key",
+    )
+    p.add_argument(
         "--rotate-secret-key",
         action="store_true",
         help="new OH_SECRET_KEY (cipher): what happens to secrets stored under the old one",
@@ -4200,6 +4528,10 @@ secret key all private to the run. Without --new, an already-live run
         cmd_logs,
     )
     p.add_argument("--tail", type=int, default=60)
+    p.add_argument(
+        "--expect-min", type=int, metavar="N", help="at least N matching lines"
+    )
+    p.add_argument("--expect-none", action="store_true", help="no matching lines")
     p.add_argument("--grep")
 
     p = sub(
@@ -4219,6 +4551,10 @@ secret key all private to the run. Without --new, an already-live run
   {CLI} api GET /server_info --auth none --check uptime lt "$U1" --check capabilities contains tool_catalog_v1
   {CLI} api GET /api/mcp/oauth/status/$JOB --check status eq callback_ready --until-ok 30
   {CLI} api GET /v1/models --auth bearer --check data len-ge 1
+  {CLI} api OPTIONS /api/settings --auth none --header 'Origin: http://localhost:3000' \
+      --header 'Access-Control-Request-Method: GET' --check-header access-control-allow-origin eq http://localhost:3000
+  {CLI} api POST /api/auth/workspace-session --jar browser --check-header set-cookie contains HttpOnly
+  {CLI} api GET "/api/conversations/$CID/workspace/index.html" --auth none --jar browser --expect 200
   CID=$({CLI} api POST /v1/chat/completions --auth bearer --json-file req.json --print-header X-OpenHands-ServerConversation-ID)
   {CLI} api POST /v1/chat/completions --auth bearer --json-file stream.json --sse --check frames.-1 eq '[DONE]'
 
@@ -4231,7 +4567,9 @@ under <run>/evidence/FEATURE/NAME.json.""",
         cmd_api,
     )
     p.add_argument(
-        "method", type=str.upper, choices=["GET", "POST", "PUT", "PATCH", "DELETE"]
+        "method",
+        type=str.upper,
+        choices=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
     )
     p.add_argument("path")
     p.add_argument("--json", help="JSON request body")
@@ -4248,7 +4586,7 @@ under <run>/evidence/FEATURE/NAME.json.""",
     p.add_argument("--cookie", help="raw Cookie header value")
     p.add_argument(
         "--auth",
-        choices=["header", "none", "bad", "previous", "bearer", "bearer-bad"],
+        choices=["header", "none", "bad", "previous", "bearer", "bearer-bad", "init"],
         default="header",
     )
     p.add_argument("--expect", help="expected status: 200, 2xx, 404,422")
@@ -4275,6 +4613,32 @@ under <run>/evidence/FEATURE/NAME.json.""",
         action="store_true",
         help="parse a text/event-stream body into {frames: [...]} for --check",
     )
+    p.add_argument(
+        "--check-header",
+        action="append",
+        nargs="+",
+        metavar="NAME OP [VALUE]",
+        help="assert on a response header (repeatable): set-cookie contains HttpOnly",
+    )
+    p.add_argument(
+        "--all-headers", action="store_true", help="show every response header"
+    )
+    p.add_argument(
+        "--quiet",
+        action="store_true",
+        help="omit request and response bodies from the output (checks still see them)",
+    )
+    p.add_argument(
+        "--expect-max-ms",
+        type=int,
+        metavar="MS",
+        help="fail when the call takes longer",
+    )
+    p.add_argument(
+        "--jar",
+        metavar="NAME",
+        help="browser-like cookie jar under the run: send matching cookies, store Set-Cookie",
+    )
     p.add_argument("--save", metavar="FEATURE/NAME")
     p.add_argument(
         "--raw-out", metavar="PATH", help="write the raw response body to PATH"
@@ -4293,6 +4657,7 @@ under <run>/evidence/FEATURE/NAME.json.""",
   {CLI} conversation send <id> --text 'say hi'
   {CLI} ws stop live --expect-kind MessageEvent
   {CLI} ws listen /sockets/bash-events --auth bad --expect-close 4001
+  {CLI} ws listen /sockets/bash-events --auth query --query session_api_key=wrong --expect-reject 403
   {CLI} ws listen /app-backends/qa-backend/ws --auth none --header 'Origin: http://127.0.0.1:8000' \
       --header "Cookie: oh_app_backend_session=$TOKEN" --send hello --count 1""",
     )
@@ -4316,7 +4681,7 @@ under <run>/evidence/FEATURE/NAME.json.""",
     wl.add_argument("path")
     wl.add_argument(
         "--auth",
-        choices=["first-frame", "query", "header", "none", "bad"],
+        choices=WS_AUTH_MODES,
         default="first-frame",
     )
     wl.add_argument("--query", "-q", action="append", metavar="K=V")
@@ -4332,6 +4697,20 @@ under <run>/evidence/FEATURE/NAME.json.""",
         metavar="JSON",
         help="frame to send after auth (repeatable)",
     )
+    wl.add_argument("--key", help="with --auth key: authenticate with this exact key")
+    wl.add_argument(
+        "--expect-kind",
+        action="append",
+        metavar="KIND",
+        help="this kind must arrive (repeatable)",
+    )
+    wl.add_argument(
+        "--expect-no-kind",
+        action="append",
+        metavar="KIND",
+        help="this kind must not arrive",
+    )
+    wl.add_argument("--expect-frames", type=int, metavar="N", help="exactly N frames")
     wl.add_argument("--duration", type=float, default=10)
     wl.add_argument("--until-kind")
     wl.add_argument("--until", action="append", metavar="FIELD=VALUE")
@@ -4341,6 +4720,12 @@ under <run>/evidence/FEATURE/NAME.json.""",
     )
     wl.add_argument(
         "--expect-open", action="store_true", help="pass only if the socket stayed open"
+    )
+    wl.add_argument(
+        "--expect-reject",
+        type=int,
+        metavar="STATUS",
+        help="pass only if the handshake is refused with this HTTP status (e.g. 403)",
     )
     wl.add_argument("--out", help=argparse.SUPPRESS)
     wl.add_argument("--save", metavar="FEATURE/NAME")
@@ -4360,12 +4745,13 @@ under <run>/evidence/FEATURE/NAME.json.""",
     wst.add_argument("--name")
     wst.add_argument(
         "--auth",
-        choices=["first-frame", "query", "header", "none", "bad"],
+        choices=WS_AUTH_MODES,
         default="first-frame",
     )
     wst.add_argument("--query", "-q", action="append", metavar="K=V")
     wst.add_argument("--send", action="append", metavar="JSON")
     wst.add_argument("--header", action="append", metavar="'Name: value'")
+    wst.add_argument("--key", help="with --auth key: authenticate with this exact key")
     wst.add_argument("--duration", type=float, default=600)
     wst.add_argument(
         "--settle", type=float, default=1.0, help="seconds to wait after connecting"
@@ -4385,6 +4771,35 @@ under <run>/evidence/FEATURE/NAME.json.""",
         wr.add_argument("--kinds", help="comma-separated kinds to show")
         wr.add_argument("--contains", help="only frames whose JSON contains this text")
         wr.add_argument("--expect-kind", help="pass only if this kind was received")
+        wr.add_argument(
+            "--expect-min",
+            type=int,
+            metavar="N",
+            help="pass only with at least N frames matching --kinds/--contains",
+        )
+        wr.add_argument(
+            "--expect-none",
+            action="store_true",
+            help="pass only if no frame matches --kinds/--contains",
+        )
+        wr.add_argument(
+            "--expect-close",
+            type=int,
+            metavar="CODE",
+            help="pass only if the socket closed with this code",
+        )
+        wr.add_argument(
+            "--expect-open",
+            action="store_true",
+            help="pass only if the socket was still open",
+        )
+        wr.add_argument(
+            "--wait",
+            type=float,
+            default=0,
+            metavar="SECONDS",
+            help="poll up to SECONDS until the expectations hold",
+        )
         wr.add_argument("--show", type=int, default=5)
         wr.add_argument("--save", metavar="FEATURE/NAME")
 
@@ -4493,6 +4908,15 @@ Without --body-json agent fields, the agent comes from GET /api/settings
     cs.add_argument("--tag", action="append", metavar="K=V")
     cs.add_argument("--max-iterations", type=int)
     cs.add_argument(
+        "--llm-json",
+        help="merge these fields into agent_settings.llm, e.g. '{\"stream\": true}'",
+    )
+    cs.add_argument(
+        "--placeholder-agent",
+        action="store_true",
+        help="an agent whose model is never reachable: a workspace without an LLM profile",
+    )
+    cs.add_argument(
         "--tools", help="comma-separated tool names for agent_settings, or 'none'"
     )
     cs.add_argument("--no-autotitle", action="store_true")
@@ -4557,7 +4981,13 @@ Without --body-json agent fields, the agent comes from GET /api/settings
         "--key",
         help="only ConversationStateUpdateEvent rows with this key (goal, execution_status, ...)",
     )
-    ce.add_argument("--expect-kind")
+    ce.add_argument("--expect-kind", help="pass only if a selected event has this kind")
+    ce.add_argument(
+        "--expect-count", type=int, metavar="N", help="exactly N selected events"
+    )
+    ce.add_argument(
+        "--expect-min", type=int, metavar="N", help="at least N selected events"
+    )
     ce.add_argument(
         "--show", type=int, default=10, help="show the last N matching events"
     )
@@ -4675,6 +5105,12 @@ bash_events, default project), fixtures/, worktrees/. Output is redacted.""",
     stl.set_defaults(func=cmd_state_ls)
     stl.add_argument("pattern", nargs="?", default="home/.openhands/*")
     stl.add_argument(
+        "--expect-count", type=int, metavar="N", help="exactly N matching files"
+    )
+    stl.add_argument(
+        "--expect-min", type=int, metavar="N", help="at least N matching files"
+    )
+    stl.add_argument(
         "--conversation", metavar="ID", help="relative to this conversation's directory"
     )
     stg = st_sub.add_parser(
@@ -4714,6 +5150,7 @@ never searched.""",
     stc.add_argument("--contains", help="pass only if the raw file contains this text")
     stc.add_argument("--not-contains", help="pass only if the raw file lacks this text")
     stc.add_argument("--max-chars", type=int, default=6000)
+    stc.add_argument("--mode", help="expected octal permissions, e.g. 600")
 
     sub(
         commands,
@@ -4754,7 +5191,12 @@ of running them.""",
     )
     p.add_argument("--timeout", type=float, default=600)
     p.add_argument(
-        "--expect-output", help="pass only if stdout/stderr contains this text"
+        "--expect-output",
+        action="append",
+        help="stdout/stderr must contain this (repeatable)",
+    )
+    p.add_argument(
+        "--reject-output", action="append", help="stdout/stderr must not contain this"
     )
     p.add_argument("--tail-chars", type=int, default=1500)
     p.add_argument("--save", metavar="FEATURE/NAME")

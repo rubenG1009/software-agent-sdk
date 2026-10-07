@@ -43,8 +43,8 @@ Routes: `GET /api/conversations/{conversation_id}/events/search`,
 - `F06.ws-live`: a socket opened before the run receives each event live, every live frame is persisted, and a closing `full_state` snapshot follows the run.
 - `F06.send-resets-finished`: a message appended to a `finished` conversation sets it back to `idle` with a persisted `execution_status` update.
 - `F06.ws-snapshot`: the first frame after authentication is a transient `full_state` `ConversationStateUpdateEvent` that never appears in search; without `resend_mode` nothing else is replayed.
-- `F06.ws-auth`: the socket accepts first-frame, deprecated query and deprecated header keys; a wrong first-frame key or no auth frame within 10 s closes with 4001, a wrong deprecated query key is refused at the handshake (HTTP 403).
-- `F06.ws-unknown`: a socket for an unknown conversation closes with 4004 `Conversation not found`.
+- `F06.ws-handshake`: the socket accepts first-frame, deprecated query and deprecated header keys; a wrong first-frame key or no auth frame within 10 s closes with 4001, a wrong deprecated query key is refused at the upgrade (HTTP 403), and an unknown conversation closes with 4004.
+- `F06.ws-delete-close`: deleting a conversation closes the sockets that follow it.
 - `F06.ws-replay-all`: `resend_mode=all` (and the deprecated `resend_all=true`) replays the persisted log in search order after the snapshot.
 - `F06.ws-replay-since`: `resend_mode=since` with `after_timestamp` replays exactly the events at or after that timestamp; without `after_timestamp` it replays nothing.
 - `F06.ws-bad-frame`: an invalid inbound frame returns a `ServerErrorEvent` (`ValidationError`, `AssertionError`), appends nothing and leaves the socket open; a redundant auth frame is ignored.
@@ -82,9 +82,9 @@ Routes: `GET /api/conversations/{conversation_id}/events/search`,
   `ConversationEventStream` authenticate with the first frame
   `{"type": "auth", "session_api_key": "..."}` and treat the first
   `ConversationStateUpdateEvent` as "ready"; the SDK stops reconnecting on 4001
-  and 4004. Agent Canvas follows conversations through the same socket.
-  Recipes use `ws listen` (one connection, optional `--send` frames) and
-  `ws start`/`ws stop` (a background capture around a REST action).
+  and 4004 and reconnects with backoff after any other close. Recipes use
+  `ws listen` (one connection, optional `--send` frames) and `ws start`/
+  `ws stop` (a background capture around a REST action).
 - Config: `max_concurrent_runs` (`OH_MAX_CONCURRENT_RUNS`) bounds runs and so
   the 429 path; the server's local time zone (`TZ`) is the zone of every event
   timestamp and of naive filter values.
@@ -308,25 +308,41 @@ Preconditions:
   "key": "full_state", "value": {...whole state, execution_status idle...}}`
   with a fresh id; it is not persisted, and without `resend_mode` no history
   is replayed.
-- **Socket authentication (`F06.ws-auth`).** The 10-second first-frame
-  timeout is the server's own timer, so one capture waits for it.
+- **Handshake: auth and close codes (`F06.ws-handshake`).** The 10-second
+  first-frame timeout is the server's own timer, so one capture waits for it.
   ```sh
-  control-agent-server ws listen "/sockets/events/$CID" --auth bad --expect-close 4001 --duration 10 --save F06.ws-auth/bad-key
-  control-agent-server ws listen "/sockets/events/$CID" --auth none --expect-close 4001 --duration 15 --save F06.ws-auth/no-frame
+  control-agent-server ws listen "/sockets/events/$CID" --auth bad --expect-close 4001 --duration 10 --save F06.ws-handshake/bad-key
+  control-agent-server ws listen "/sockets/events/$CID" --auth none --expect-close 4001 --duration 15 --save F06.ws-handshake/no-frame
   control-agent-server ws listen "/sockets/events/$CID" --auth query --until-kind ConversationStateUpdateEvent --until key=full_state --duration 10
   control-agent-server ws listen "/sockets/events/$CID" --auth header --until-kind ConversationStateUpdateEvent --until key=full_state --duration 10
   control-agent-server ws listen "/sockets/events/$CID" --auth none --query session_api_key=qa-wrong-key --duration 5 \
-    --save F06.ws-auth/bad-query-key | jq -e '.close.http_status == 403'
+    --save F06.ws-handshake/bad-query-key | jq -e '.close.http_status == 403'
+  control-agent-server ws listen "/sockets/events/$QA_UNKNOWN" --expect-close 4004 --duration 10 --save F06.ws-handshake/unknown
   ```
   A wrong first-frame key and silence both close with 4001
   `Authentication failed`; the deprecated query and header keys are accepted
   (the server logs a deprecation warning), and a wrong query key is refused
-  before the upgrade with HTTP 403, so that client sees no close code.
-- **Unknown conversation on the socket (`F06.ws-unknown`).**
+  before the upgrade with HTTP 403, so that client sees no close code. A
+  valid key on an unknown conversation authenticates, then closes with 4004
+  `Conversation not found`.
+- **Deleting a conversation closes its sockets (`F06.ws-delete-close`), known bug.**
+  The delete runs in the background two seconds after the socket connects,
+  only to order it after the subscription.
   ```sh
-  control-agent-server ws listen "/sockets/events/$QA_UNKNOWN" --expect-close 4004 --duration 10 --save F06.ws-unknown/close
+  QA_DEL=$(control-agent-server conversation start --no-autotitle --tools none --print-id)
+  (sleep 2 && control-agent-server api DELETE "/api/conversations/$QA_DEL" --expect 200 --save F06.ws-delete-close/delete) & QA_DELETER=$!
+  control-agent-server ws listen "/sockets/events/$QA_DEL" --duration 10 --save F06.ws-delete-close/socket \
+    | jq -e '.stopped == "closed"'
+  wait "$QA_DELETER"
+  control-agent-server ws listen "/sockets/events/$QA_DEL" --expect-close 4004 --duration 5
   ```
-  The socket authenticates, then closes with 4004 `Conversation not found`.
+  Correct behavior: the server closes the open socket once the conversation
+  is gone. Today the socket stays open with no close frame until the client
+  gives up (`stopped: duration` after 10 s), although a new socket gets 4004
+  and REST answers 404: `PubSub.close()` calls `Subscriber.close()`, which
+  `_WebSocketSubscriber` does not implement (`pub_sub.py`, `sockets.py`), so
+  an SDK or TypeScript client keeps waiting on a conversation that no longer
+  exists.
 - **Replay everything (`F06.ws-replay-all`).**
   ```sh
   IDS=$(control-agent-server api GET "/api/conversations/$CID/events/search" --field items | jq -c '[.[].id]')
@@ -394,8 +410,8 @@ Preconditions:
     --json '{"content":[{"type":"text","text":"Create qa.txt containing exactly: QA_F06_LIVE"}],"run":true}' \
     --expect 200 --check success eq true --save F06.send-run/post
   control-agent-server conversation wait "$LIVE" --until finished --timeout 240
-  LIVE_IDS=$(control-agent-server api GET "/api/conversations/$LIVE/events/search" --field items | jq -c '[.[].id]')
   control-agent-server ws stop f06-live --expect-kind ActionEvent --save F06.ws-live/frames
+  LIVE_IDS=$(control-agent-server api GET "/api/conversations/$LIVE/events/search" --field items | jq -c '[.[].id]')
   control-agent-server ws read f06-live --kinds MessageEvent --contains QA_F06_LIVE
   control-agent-server ws read f06-live --kinds ConversationStateUpdateEvent --contains '"value": "running"'
   control-agent-server ws read f06-live --kinds ObservationEvent --contains '"tool_name": "file_editor"'
@@ -415,8 +431,10 @@ Preconditions:
   POST returns 200 at once and the run reaches `finished`. The socket shows
   the user message, `execution_status` `running`, `ActionEvent`s with their
   `file_editor` `ObservationEvent`s, `finished` and a second `full_state`
-  snapshot after the run; every live frame id is in the persisted log, which
-  also has `stats` updates, and the agent wrote `qa.txt`. A typical log:
+  snapshot after the run; every live frame id is in the persisted log (read
+  after the capture stops, because an event is persisted before it is
+  published), which also has `stats` updates, and the agent wrote `qa.txt`.
+  A typical log:
   `SystemPromptEvent`, `MessageEvent` (user), state updates
   `last_user_message_id` and `execution_status=running`, then per step
   `ActionEvent`, `ObservationEvent` and `stats`, ending with the `finish`
@@ -502,9 +520,9 @@ Preconditions:
 - Timestamps are naive server-local ISO strings compared as strings. Recipes
   run the server with `TZ=UTC`; a value with an offset is converted to server
   time first. Search is in log order, which is not strictly timestamp order:
-  a `stats` update is appended after the observation it follows but carries
-  an earlier timestamp, so a `timestamp__gte` or `resend_mode=since` cut taken
-  at an observation's timestamp can skip that `stats` update.
+  a `stats` update is appended after an action and its observation but
+  carries a timestamp from before the action, so a `timestamp__gte` or
+  `resend_mode=since` cut taken at that observation's timestamp skips it.
 - Search drops `null` fields (`exclude_none`); get-one and batch-get keep
   them. Compare ids, not raw JSON.
 - An unknown event id is a 500 today, and one missing id fails a whole batch
@@ -532,10 +550,18 @@ Preconditions:
   after the upgrade; a wrong deprecated query or header key is refused before
   the upgrade (HTTP 403, no close code), which the SDK does not treat as
   fatal.
-- Deleting a conversation does not close its open sockets; they stay open
-  and later sends return `ServerErrorEvent` `inactive_service`.
+- Deleting a conversation does not close its open sockets
+  (`F06.ws-delete-close`); they stay open with no further frames, while a
+  new connection gets 4004.
 - `StreamingDeltaEvent` frames reach this socket only when the agent's LLM
   has `stream: true`; they are never persisted, so search never returns them.
-- Harness: a long `launch --name` can push the run's tmux socket path over
-  the 107-byte Unix socket limit (`File name too long` when the agent first
-  uses the terminal), which is why these recipes use only the file editor.
+- A per-field `execution_status=finished` frame is a hint, not the end of
+  the run: a stop hook can set it back to `running`. The `full_state`
+  snapshot published after the run is authoritative (the SDK waits for it);
+  recipes that stop at `finished` re-read the status over REST.
+- Harness: the run's tmux socket path is
+  `<run dir>/tmux/tmux-<uid>/openhands-<32 hex>`; under
+  `/tmp/agent-server-verify` a fresh `map run` (run name `map-fNN`) makes it
+  108 bytes, over the 107-byte Unix socket limit, so the terminal tool fails
+  with `File name too long` and `POST .../events` with `run: true` answers
+  500. These recipes therefore give the agent only the file editor.

@@ -191,6 +191,29 @@ the next agent will run them that way:
   `state cat ... --not-contains "$SECRET"` for storage at rest) and never print a
   real key.
 
+### Recipe pitfalls that reviews keep finding
+
+- `! cmd` never fails under `set -e`. Write `if cmd; then exit 1; fi`, or
+  assert with `--check`/`--expect` (`map check` flags it).
+- A bold label must close on its own line; a wrapped `- **...` silently
+  merges the bullet into the previous one (`map check` flags it).
+- A negative assertion needs a positive control on the same server: show the
+  check can pass (the right key gets in, the cookie loads the file) before
+  showing the wrong input is refused.
+- "Stayed open" proves nothing when the server waits for a frame. Send the
+  frame that would be refused if the behavior were wrong, and wait for the
+  reply (`--until-kind`, `--expect-kind`).
+- Timing needs both bounds: a timeout check with only a lower bound passes
+  for any longer timeout (`--expect-max-ms`, or `test $((SECONDS - T0)) -le N`).
+- A refused request must also leave no trace: no `Set-Cookie` on a 401
+  (`--check-header set-cookie missing`), no new file, no event.
+- A mutation is proven by a second read, not by its own response.
+- Long or racy waits use the CLI's waits (`conversation wait`,
+  `ws stop --wait`, `api --until-ok`, `sink read --expect-min`), never a bare
+  `sleep` before an assertion.
+- Large bodies: `--quiet` keeps output small while `--check` still sees the
+  whole body; `--raw-out` keeps the bytes.
+
 ## 4. Prove every recipe live
 
 Execute every command you wrote, in order, on a fresh `launch --new` (or a run

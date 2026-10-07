@@ -191,6 +191,10 @@ Preconditions:
     --json '{"command": "echo QA_F13_LIVE"}' --field id)
   control-agent-server ws listen /sockets/bash-events --query resend_mode=all --until-kind BashOutput \
     --until command_id="$LIVE_CMD" --duration 20 --show 0
+  for i in $(seq 1 20); do
+    control-agent-server ws read f13-live --kinds BashOutput --contains "$LIVE_CMD" --show 0 && break
+    sleep 0.25
+  done
   control-agent-server ws stop f13-live --kinds BashCommand --contains "$LIVE_CMD" --save F13.ws-live/live
   control-agent-server ws read f13-live --kinds BashOutput --contains QA_F13_LIVE
   control-agent-server ws listen /sockets/bash-events --query resend_mode=all --until-kind BashOutput \
@@ -198,7 +202,9 @@ Preconditions:
   ```
   The live capture holds the `BashCommand` and the `BashOutput`
   (`QA_F13_LIVE`); the replay connection receives the output of the first
-  command of this run, stored before it connected.
+  command of this run, stored before it connected. The `ws read` loop only
+  gives the background capture time to write the last frame before it is
+  stopped.
 - **Commands over the socket (`F13.ws-command`).** An invalid frame, then a
   valid one on the same connection.
   ```sh
@@ -441,6 +447,10 @@ Preconditions:
     --json "{\"command\": \"echo $MARK\"}" --check exit_code eq 0 --field command_id)
   FLUSH_CMD=$(control-agent-server api POST /api/bash/execute_bash_command \
     --json '{"command": "echo QA_F13_FLUSH"}' --field command_id)
+  for i in $(seq 1 20); do
+    control-agent-server ws read f13-iso --kinds BashOutput --contains "$FLUSH_CMD" --show 0 && break
+    sleep 0.25
+  done
   control-agent-server ws stop f13-iso --kinds BashOutput --contains "$FLUSH_CMD" --save F13.scoped-isolation/global-socket
   test "$(control-agent-server ws read f13-iso --contains "$MARK" --show 0 | jq .matching)" = 0
   control-agent-server api GET /api/bash/bash_events/search --query kind__eq=BashCommand \
@@ -536,9 +546,9 @@ Preconditions:
   it reads `request.state.runtime_event_service`, which was never set.
   Nothing runs. Run `doctor` before this bullet, not after (it fails on the
   logged tracebacks).
-- **Idle eviction with a running command (`F13.scoped-idle-eviction`), known
-  bug.** A second run with a 5 s idle TTL; the eviction loop wakes every
-  60 s, so this bullet sleeps 75 s without touching the conversation.
+- **Idle eviction kills a running command (`F13.scoped-idle-eviction`), known bug.**
+  A second run with a 5 s idle TTL; the eviction loop wakes every 60 s, so
+  this bullet sleeps 75 s without touching the conversation.
   ```sh
   EV=$(control-agent-server launch --new --name f13-evict --config-json '{"conversation_idle_ttl_seconds": 5}' --print-run)
   trap 'control-agent-server stop --run "$EV" > /dev/null 2>&1 || true' EXIT
@@ -574,7 +584,10 @@ Preconditions:
   the command (a `BashOutput` with `exit_code` 0 comes back) and the marker
   file exists: `bash_events_socket` falls back to the module-level
   `BashEventService` when `app.state.bash_event_service` is unset, and
-  `/sockets/*` is outside the `require_initialized` gate.
+  `/sockets/*` is outside the `require_initialized` gate. With session keys
+  configured before init (plain `--deferred-init`), the socket still checks
+  the key but then runs commands for a valid one; the config documents that
+  the bash routers return 503 until `POST /api/init`.
 
 ## Gotchas
 
@@ -613,9 +626,10 @@ Preconditions:
   outputs are still written.
 - Retention (`bash_events_retention_seconds`) applies to the global store
   only, runs at startup and then every `max(60, N/2)` seconds.
-- In Docker runtime mode the scoped routes are proxied into the
-  conversation's container (cwd values are container paths under
-  `/workspace`), while `/api/bash` still runs on the outer host. This map
-  covers the local runtime only.
+- In Docker runtime mode (`OH_CONVERSATION_RUNTIME=docker`) the
+  `/api/conversations/{id}/...` routes are proxied into the conversation's
+  container (`docker_runtime/routers.py`), so scoped cwd values are container
+  paths, while `/api/bash` still runs on the outer host. This map covers the
+  local runtime only.
 - A 5xx body is masked to `{"detail": "Internal Server Error", "exception":
   "..."}`; assert on `exception` for 500 and 503.

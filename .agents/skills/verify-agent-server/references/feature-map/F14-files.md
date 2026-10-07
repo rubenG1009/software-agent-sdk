@@ -418,9 +418,9 @@ Preconditions:
   control-agent-server api GET /api/file/download-trajectory/qa-f14-not-a-uuid --expect 422
   ```
   404 for an unknown id, 422 for a malformed one.
-- **Concurrent trajectory downloads (`F14.trajectory-concurrent`), known
-  bug.** Six parallel downloads of the same conversation (two browser tabs or
-  a retry are enough in practice).
+- **Concurrent trajectory downloads (`F14.trajectory-concurrent`), known bug.**
+  Six parallel downloads of the same conversation (two browser tabs or a retry
+  are enough in practice).
   ```sh
   CC="$F/concurrent"
   mkdir -p "$CC"
@@ -531,8 +531,8 @@ Preconditions:
   as many events as before) are all served after the restart, the restored
   conversation still binds its scope (the guard still refuses `WS` through
   `CID2`), and `doctor` is ok.
-- **Trajectory under an init-time `conversations_path`
-  (`F14.trajectory-init-path`), known bug.** A second server starts dormant;
+- **Init-time conversations path (`F14.trajectory-init-path`), known bug.**
+  A second server starts dormant;
   `POST /api/init` (authenticated with that run's secret key in
   `X-Init-API-Key`) moves its conversations to a fixture directory. The trap
   stops the second server even when an assertion fails; its evidence stays in
